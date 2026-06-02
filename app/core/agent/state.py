@@ -1,60 +1,117 @@
-"""Orchestrator state + the structured result of one turn.
+"""Agent turn state + the context bundle nodes operate on.
 
-ChatState mirrors the LangGraph state schema in plan Appendix B so the migration
-to a compiled graph is mechanical. AgentTurn is what the API returns and what the
-SSE streamer serializes.
+State is a plain ``dict`` (typed by :class:`ChatState`) so the SAME node
+functions run under both the built-in engine and real LangGraph — nodes take a
+state dict and return a partial-update dict, which each engine merges.
 """
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
+from app.core.contracts import Chunk, CoreDeps, ToolContext
+from app.core.security.context import SecurityContext
+
+# Node names (single source of truth; shared by both engines).
+N_INPUT_GUARD = "input_guardrail"
+N_ROUTE = "route"
+N_GATHER = "gather_context"
+N_ANSWER = "answer"
+N_OUTPUT_GUARD = "output_guardrail"
+
 
 class ChatState(TypedDict, total=False):
-    session_id: str
-    user_id: str
+    # identity / request
     org_id: str
+    user_id: str
+    roles: tuple[str, ...]
+    session_id: str
     trace_id: str
-    user_message: str
-    rewritten_query: str
-    route_module_ids: list[str]
-    route_tool_names: list[str]
+    request_id: str
+    # input
+    question: str
+    history: list[dict[str, Any]]
+    summary: str
+    # guardrail
+    safe_question: str
+    blocked: bool
+    block_reason: str
+    # routing
+    route_modules: list[str]
+    route_debug: dict[str, Any]
+    # retrieval / tools
+    context_chunks: list[Chunk]
+    context_block: str
+    tool_events: list[dict[str, Any]]
+    # answer
+    answer: str
+    citations: list[dict[str, Any]]
+    output_flags: dict[str, Any]
     lane: str
-    tool_calls: list[dict[str, Any]]
-    retrieved: list[dict[str, Any]]
-    citations: list[str]
-    final_answer: str
-    guardrail_violations: list[str]
-    refused: bool
-    error: str | None
+    error: str
+
+
+def make_initial_state(
+    *,
+    sc: SecurityContext,
+    question: str,
+    session_id: str,
+    trace_id: str,
+    request_id: str,
+    history: list[dict[str, Any]] | None = None,
+    summary: str = "",
+) -> ChatState:
+    return ChatState(
+        org_id=sc.org_id, user_id=sc.user_id, roles=sc.roles, session_id=session_id,
+        trace_id=trace_id, request_id=request_id, question=question,
+        history=history or [], summary=summary, blocked=False,
+        route_modules=[], context_chunks=[], context_block="", tool_events=[],
+        answer="", citations=[], output_flags={},
+    )
+
+
+# Streaming event passed to ctx.emit (mirrors SSE event types).
+@dataclass
+class AgentEvent:
+    type: str                       # status | route | tool | token | citation | error | done
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+EmitFn = Callable[[AgentEvent], Awaitable[None]]
 
 
 @dataclass
-class AgentTurn:
-    status: str  # "ok" | "refused" | "error"
-    answer: str = ""
-    citations: list[str] = field(default_factory=list)
-    module_ids: list[str] = field(default_factory=list)
-    tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    retrieved: list[dict[str, Any]] = field(default_factory=list)
-    lane: str = "standard"
-    trace_id: str = ""
-    session_id: str = ""
-    tokens: dict[str, int] = field(default_factory=dict)
-    error: str | None = None
+class AgentContext:
+    """Everything nodes need — services, identity, and an optional event sink."""
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "answer": self.answer,
-            "citations": self.citations,
-            "module_ids": self.module_ids,
-            "tool_calls": self.tool_calls,
-            "retrieved": self.retrieved,
-            "lane": self.lane,
-            "trace_id": self.trace_id,
-            "session_id": self.session_id,
-            "tokens": self.tokens,
-            "error": self.error,
-        }
+    deps: CoreDeps
+    sc: SecurityContext
+    tool_ctx: ToolContext
+    mcp: Any                        # MCPClient
+    registry: Any                   # CapabilityRegistry
+    input_guard: Any
+    output_guard: Any
+    settings: Any
+    supervisor: Any = None          # app.core.agent.supervisor.Supervisor
+    emit: EmitFn | None = None
+    stream_tokens: bool = False
+
+    async def fire(self, type: str, **data: Any) -> None:
+        if self.emit is not None:
+            await self.emit(AgentEvent(type=type, data=data))
+
+
+__all__ = [
+    "ChatState",
+    "AgentContext",
+    "AgentEvent",
+    "EmitFn",
+    "make_initial_state",
+    "N_INPUT_GUARD",
+    "N_ROUTE",
+    "N_GATHER",
+    "N_ANSWER",
+    "N_OUTPUT_GUARD",
+]

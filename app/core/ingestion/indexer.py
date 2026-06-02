@@ -1,84 +1,70 @@
-"""Production ingestion: embed documents and upsert them into Qdrant for RAG.
+"""Ingestion service — the org-scoped write path into the retrieval corpus.
 
-This is the write side of the vector path (the read side is RetrievalPipeline's
-qdrant backend). Text is chunked, embedded with the configured provider (TEI in
-prod), and upserted with `organization_id` stamped on every point — the mandatory
-tenant tag the retriever filters on. The same embedder is used for indexing and
-querying so vectors are comparable. See plan §7.1.
-
-Wire to a Temporal worker or call from the /ingest API for event-driven ingestion.
+Backs the ``/ingest`` endpoint and dev seeders. Embedding + upsert go through the
+shared RAG pipeline (``deps.rag``); ``org_id`` always comes from the trusted
+context, never the payload, so a tenant can only ever write into its own slice.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from uuid import uuid4
+from collections.abc import Sequence
+from typing import Any
 
-from app.config import settings
-from app.core.ingestion.connectors import IngestStats
-from app.core.rag.pipeline import _default_embedder
-from app.core.rag.qdrant_backend import QdrantRetriever
+from pydantic import BaseModel, Field
 
-
-def _window_chunks(text: str, size: int = 350, overlap: int = 50) -> list[str]:
-    """Generic word-window chunker for arbitrary production text (the section
-    chunker is contract-specific). ~size words per chunk with overlap."""
-
-    words = text.split()
-    if not words:
-        return []
-    chunks: list[str] = []
-    start = 0
-    step = max(1, size - overlap)
-    while start < len(words):
-        chunks.append(" ".join(words[start : start + size]))
-        start += step
-    return chunks
+from app.core.contracts import IngestStats, ToolContext
+from app.core.rag.chunking import chunk_document
+from app.core.rag.pipeline import IndexItem
 
 
-@dataclass
-class QdrantIngestionService:
-    collection: str | None = None
-    embedder: object = None
-    retriever: QdrantRetriever | None = None
+class IngestDocument(BaseModel):
+    doc_id: str
+    title: str = ""
+    text: str
+    source: str = "reports"
+    published_at: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
-    def __post_init__(self):
-        self.collection = self.collection or settings.qdrant_collection
-        self.embedder = self.embedder or _default_embedder()
-        self.retriever = self.retriever or QdrantRetriever(collection=self.collection)
 
-    def index_documents(self, organization_id: str, documents: list[dict]) -> IngestStats:
-        """documents: [{contract_id, title, text, tags?, doc_type?, metadata?}].
-        org comes from the caller's trusted context, never from the payload."""
+class IngestionService:
+    def __init__(self, deps) -> None:
+        self.deps = deps
 
-        self.retriever.ensure_collection(self.embedder.dimensions)
-        points: list[dict] = []
-        for document in documents:
-            contract_id = str(document.get("contract_id") or uuid4())
-            title = document.get("title", contract_id)
-            tags = list(document.get("tags") or [])
-            base_payload = {
-                "organization_id": organization_id,  # MANDATORY tenant tag
-                "contract_id": contract_id,
-                "title": title,
-                "tags": tags,
-                "doc_type": document.get("doc_type"),
-                **(document.get("metadata") or {}),
-            }
-            for index, chunk_text in enumerate(_window_chunks(str(document.get("text", "")))):
-                vector = self.embedder.embed(chunk_text)
-                points.append(
-                    {
-                        "id": str(uuid4()),
-                        "vector": vector,
-                        "payload": {
-                            **base_payload,
-                            "section_number": str(index),
-                            "section_title": "",
-                            "text": chunk_text,
-                        },
-                    }
-                )
-        if points:
-            self.retriever.upsert(points)
-        return IngestStats(documents=len(documents), chunks=len(points))
+    async def ingest_documents(
+        self, ctx: ToolContext, collection: str, docs: Sequence[IngestDocument], *, chunk: bool = True
+    ) -> IngestStats:
+        items: list[IndexItem] = []
+        for d in docs:
+            if chunk:
+                for piece in chunk_document(d.text):
+                    items.append(IndexItem(
+                        id=f"{d.doc_id}::{piece.ordinal}", text=piece.text, source=d.source,
+                        doc_id=d.doc_id, title=d.title, section=piece.section,
+                        published_at=d.published_at, metadata=d.metadata,
+                    ))
+            else:
+                items.append(IndexItem(
+                    id=f"{d.doc_id}::0", text=d.text, source=d.source, doc_id=d.doc_id,
+                    title=d.title, published_at=d.published_at, metadata=d.metadata,
+                ))
+        n = await self.deps.rag.index(collection, ctx.org_id, items)
+        return IngestStats(documents=len(docs), chunks=n)
+
+    async def ingest_raw(
+        self, ctx: ToolContext, collection: str, *, doc_id: str, title: str,
+        data: bytes, content_type: str = "", filename: str = "",
+        source: str = "reports", published_at: str | None = None,
+    ) -> IngestStats:
+        from app.core.ingestion.parsers import parse
+
+        text = parse(data, content_type=content_type, filename=filename)
+        return await self.ingest_documents(
+            ctx, collection,
+            [IngestDocument(doc_id=doc_id, title=title, text=text, source=source, published_at=published_at)],
+        )
+
+    async def delete_document(self, ctx: ToolContext, collection: str, doc_id: str) -> int:
+        return await self.deps.rag.store.delete_by_doc(collection, ctx.org_id, doc_id)
+
+
+__all__ = ["IngestDocument", "IngestionService"]

@@ -1,170 +1,152 @@
-"""Chat persistence: sessions + messages (source of truth for the UI) and
-cross-session recall.
+"""Chat persistence: sessions + messages, with cross-session recall.
 
-Increment 1 keeps this in-memory; the production target is PostgreSQL
-(sessions/messages) as source of truth plus a per-user Qdrant collection
-(`conversations_kb`) for semantic cross-session search. Every read is scoped by
-org_id AND user_id — chat history is PRIVATE to its owner (plan §9.1-§9.2).
+This is the ChatGPT/Claude-style memory: durable sessions per (org, user),
+full message history, titles, rolling summaries, and a search across a user's
+past chats. Everything is **org-scoped** — every method takes ``org_id`` and the
+store refuses to return another org's rows. In-memory by default; the Postgres
+backend (``pg_conversations``) enforces the same isolation via RLS.
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
+import re
+import uuid
 from datetime import UTC, datetime
-from threading import RLock
-from uuid import uuid4
+from typing import Any, Protocol
 
-from app.config import settings
-from app.domain import User
+from pydantic import BaseModel, Field
 
 
-def _now() -> datetime:
-    return datetime.now(UTC)
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
-@dataclass
-class ChatMessage:
+def _uid(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:24]}"
+
+
+class Message(BaseModel):
     id: str
     session_id: str
     org_id: str
-    user_id: str
-    role: str  # "user" | "assistant" | "tool"
-    content: str
-    citations: list[str] = field(default_factory=list)
-    created_at: datetime = field(default_factory=_now)
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "session_id": self.session_id,
-            "role": self.role,
-            "content": self.content,
-            "citations": self.citations,
-            "created_at": self.created_at.isoformat(),
-        }
+    role: str                       # user | assistant | system | tool
+    content: str = ""
+    created_at: str = Field(default_factory=_now)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 
-@dataclass
-class ChatSession:
+class Session(BaseModel):
     id: str
     org_id: str
     user_id: str
-    title: str
-    created_at: datetime = field(default_factory=_now)
-    rolling_summary: str = ""
-    messages: list[ChatMessage] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "title": self.title,
-            "created_at": self.created_at.isoformat(),
-            "message_count": len(self.messages),
-        }
+    title: str = "New chat"
+    created_at: str = Field(default_factory=_now)
+    updated_at: str = Field(default_factory=_now)
+    summary: str = ""
+    message_count: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ConversationStore:
-    def __init__(self):
-        self._lock = RLock()
-        self._sessions: dict[str, ChatSession] = {}
-
-    def _owned(self, session: ChatSession, user: User) -> bool:
-        return session.org_id == user.organization_id and session.user_id == user.id
-
-    def start_session(self, user: User, title: str = "New chat") -> ChatSession:
-        with self._lock:
-            session = ChatSession(
-                id=str(uuid4()), org_id=user.organization_id, user_id=user.id, title=title,
-            )
-            self._sessions[session.id] = session
-            return session
-
-    def append(
-        self,
-        user: User,
-        session_id: str | None,
-        role: str,
-        content: str,
-        citations: list[str] | None = None,
-    ) -> ChatMessage:
-        with self._lock:
-            session = self._sessions.get(session_id) if session_id else None
-            if session is None:
-                session = ChatSession(
-                    id=session_id or str(uuid4()),
-                    org_id=user.organization_id,
-                    user_id=user.id,
-                    title=(content[:40] or "New chat"),
-                )
-                self._sessions[session.id] = session
-            elif not self._owned(session, user):
-                raise PermissionError("session does not belong to the requesting user")
-            message = ChatMessage(
-                id=str(uuid4()), session_id=session.id, org_id=user.organization_id,
-                user_id=user.id, role=role, content=content, citations=list(citations or []),
-            )
-            session.messages.append(message)
-            return message
-
-    def get_messages(self, user: User, session_id: str) -> list[ChatMessage]:
-        with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None or not self._owned(session, user):
-                return []
-            return list(session.messages)
-
-    def recent_history(self, user: User, session_id: str, k: int = 6) -> list[ChatMessage]:
-        return self.get_messages(user, session_id)[-k:]
-
-    def list_sessions(self, user: User) -> list[ChatSession]:
-        with self._lock:
-            return [s for s in self._sessions.values() if self._owned(s, user)]
-
-    def search_past(self, user: User, query: str, since: str | None = None) -> list[dict]:
-        """Cross-session recall over the user's OWN chats. Naive substring match
-        today; the production path embeds turns into a per-user Qdrant collection
-        and does semantic search with an org_id+user_id payload filter."""
-
-        needle = (query or "").lower()
-        out: list[dict] = []
-        with self._lock:
-            for session in self._sessions.values():
-                if not self._owned(session, user):
-                    continue
-                for message in session.messages:
-                    if needle and needle in message.content.lower():
-                        out.append(
-                            {
-                                "session_id": session.id,
-                                "role": message.role,
-                                "content": message.content[:300],
-                                "created_at": message.created_at.isoformat(),
-                            }
-                        )
-        return out[:20]
+class ConversationStore(Protocol):
+    async def create_session(self, org_id: str, user_id: str, title: str = "New chat") -> Session: ...
+    async def get_session(self, org_id: str, session_id: str) -> Session | None: ...
+    async def list_sessions(self, org_id: str, user_id: str, *, limit: int = 50, offset: int = 0) -> list[Session]: ...
+    async def update_session(self, org_id: str, session_id: str, *, title: str | None = None, summary: str | None = None) -> Session | None: ...
+    async def delete_session(self, org_id: str, session_id: str) -> bool: ...
+    async def append_message(self, org_id: str, session_id: str, role: str, content: str, *, citations=None, tool_calls=None, meta=None) -> Message: ...
+    async def get_messages(self, org_id: str, session_id: str, *, limit: int | None = None) -> list[Message]: ...
+    async def search_messages(self, org_id: str, user_id: str, query: str, *, limit: int = 20) -> list[Message]: ...
+    async def aclose(self) -> None: ...
 
 
-_store: ConversationStore | None = None
+_WORD = re.compile(r"[a-z0-9]+")
 
 
-def get_conversation_store():
-    """Return the chat store for the configured backend. Default "memory" (no
-    driver needed); "postgres" returns the RLS-backed store. The Postgres module
-    is imported lazily so the default path never requires psycopg."""
+class InMemoryConversationStore:
+    backend = "memory"
 
-    global _store
-    if _store is None:
-        backend = os.getenv("STORE_BACKEND", settings.store_backend).lower()
-        if backend == "postgres":
-            from app.core.memory.pg_conversations import PostgresConversationStore
+    def __init__(self) -> None:
+        self._sessions: dict[str, Session] = {}
+        self._messages: dict[str, list[Message]] = {}
 
-            _store = PostgresConversationStore()
-        else:
-            _store = ConversationStore()
-    return _store
+    def _own(self, org_id: str, session_id: str) -> Session | None:
+        s = self._sessions.get(session_id)
+        if s and s.org_id == org_id:
+            return s
+        return None
+
+    async def create_session(self, org_id: str, user_id: str, title: str = "New chat") -> Session:
+        s = Session(id=_uid("sess"), org_id=org_id, user_id=user_id, title=title)
+        self._sessions[s.id] = s
+        self._messages[s.id] = []
+        return s
+
+    async def get_session(self, org_id: str, session_id: str) -> Session | None:
+        return self._own(org_id, session_id)
+
+    async def list_sessions(self, org_id: str, user_id: str, *, limit: int = 50, offset: int = 0) -> list[Session]:
+        rows = [s for s in self._sessions.values() if s.org_id == org_id and s.user_id == user_id]
+        rows.sort(key=lambda s: s.updated_at, reverse=True)
+        return rows[offset: offset + limit]
+
+    async def update_session(self, org_id: str, session_id: str, *, title=None, summary=None) -> Session | None:
+        s = self._own(org_id, session_id)
+        if not s:
+            return None
+        if title is not None:
+            s.title = title
+        if summary is not None:
+            s.summary = summary
+        s.updated_at = _now()
+        return s
+
+    async def delete_session(self, org_id: str, session_id: str) -> bool:
+        s = self._own(org_id, session_id)
+        if not s:
+            return False
+        self._sessions.pop(session_id, None)
+        self._messages.pop(session_id, None)
+        return True
+
+    async def append_message(self, org_id, session_id, role, content, *, citations=None, tool_calls=None, meta=None) -> Message:
+        s = self._own(org_id, session_id)
+        if not s:
+            raise KeyError("session not found for org")
+        m = Message(
+            id=_uid("msg"), session_id=session_id, org_id=org_id, role=role, content=content,
+            citations=citations or [], tool_calls=tool_calls or [], meta=meta or {},
+        )
+        self._messages[session_id].append(m)
+        s.message_count += 1
+        s.updated_at = _now()
+        if s.title == "New chat" and role == "user" and content.strip():
+            s.title = content.strip()[:60]
+        return m
+
+    async def get_messages(self, org_id, session_id, *, limit=None) -> list[Message]:
+        if not self._own(org_id, session_id):
+            return []
+        msgs = self._messages.get(session_id, [])
+        return msgs[-limit:] if limit else list(msgs)
+
+    async def search_messages(self, org_id, user_id, query, *, limit=20) -> list[Message]:
+        q = set(_WORD.findall(query.lower()))
+        if not q:
+            return []
+        owned = {sid for sid, s in self._sessions.items() if s.org_id == org_id and s.user_id == user_id}
+        scored: list[tuple[int, Message]] = []
+        for sid in owned:
+            for m in self._messages.get(sid, []):
+                overlap = len(q & set(_WORD.findall(m.content.lower())))
+                if overlap:
+                    scored.append((overlap, m))
+        scored.sort(key=lambda t: (t[0], t[1].created_at), reverse=True)
+        return [m for _s, m in scored[:limit]]
+
+    async def aclose(self) -> None:
+        return None
 
 
-def reset_conversation_store() -> None:
-    global _store
-    _store = None
+__all__ = ["Message", "Session", "ConversationStore", "InMemoryConversationStore"]

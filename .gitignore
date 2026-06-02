@@ -1,9 +1,35 @@
-.venv/
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
 .pytest_cache/
 .ruff_cache/
-*.pyc
-.DS_Store
+.mypy_cache/
+
+# Env / secrets
 .env
-dist/
-build/
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Data / local stores
+data/
+*.sqlite
+*.db
+.qdrant/
+storage/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/

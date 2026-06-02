@@ -1,25 +1,37 @@
-"""Manifest for the <feature> capability. Rename to manifest.py."""
+"""Manifest for the <FEATURE> capability module.
+
+Copy this directory to `capabilities/<feature>/`, rename the .template files to
+.py, fill in below, add a settings flag `cap_<feature>_enabled`, and you're done —
+no core file is touched. The platform discovers and wires this at boot.
+"""
 
 from __future__ import annotations
 
-from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
 from app.capabilities.<feature>.tools import TOOLS
-
+from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
+# from app.core.rag.pipeline import CollectionRetriever   # if this feature has a corpus
 
 MANIFEST = CapabilityManifest(
-    id="<feature>",                         # must be a valid python identifier
+    id="<feature>",
     version="0.1.0",
-    display_name="<Human Readable Name>",
-    tools=TOOLS,                            # 3-6 typed tools
-    routing_hints=[
+    display_name="<Feature display name>",
+    description="<one line: what this feature answers>",
+    license_tiers=("platform", "<feature>"),
+    enabled_flag="cap_<feature>_enabled",     # add this bool to app/config.py Settings
+    enabled_default=False,
+
+    tools=TOOLS,
+    # retrievers=(CollectionRetriever(id="<feature>_retriever", collection="<feature>_kb"),),
+    system_prompt="prompts/v1.md",
+    routing_hints=(
         RoutingHint(
-            intents=["<keyword>", "<keyword>"],
-            examples=["<example user question>"],
-        )
-    ],
-    license_tiers=["<feature>", "platform"],
-    default_autonomy=Autonomy.READ,         # READ for query-only modules
-    rbac={"<tool_name>": "analyst"},        # min role per tool
-    owners=["team-<feature>"],
-    min_core_version="1.0.0",
+            intents=("<intent phrase>", "<another>"),
+            examples=("<example user question>",),
+        ),
+    ),
+    default_autonomy=Autonomy.READ,           # READ | SUGGEST | AUTO
+    rbac={"<tool_name>": "viewer"},           # min role per tool
+    owners=("team-<feature>",),
 )
+
+__all__ = ["MANIFEST"]

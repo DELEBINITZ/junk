@@ -1,50 +1,53 @@
-"""Reports capability manifest — the first drop-in module.
+"""Reports capability manifest — the first (and reference) module.
 
-The platform discovers this file at boot and derives routing, the tool registry,
-RBAC, and autonomy from it. Adding EASM/BP/ACI later means adding sibling
-directories each with their own manifest — no core change. See plan §5.
+Everything the platform needs to wire report-chat is declared here. With only
+this module registered, the supervisor behaves like today's single agent; adding
+EASM/Brand/ACI later changes nothing in core.
 """
 
 from __future__ import annotations
 
-from app.capabilities.reports.ingestion import ReportConnector
-from app.capabilities.reports.retrievers import reports_retriever
-from app.capabilities.reports.tools import REPORT_TOOLS
-from app.core.contracts import Autonomy, CapabilityManifest, GenericSpecialist, RoutingHint
+from app.capabilities.reports.tools import TOOLS
+from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
+from app.core.rag.pipeline import CollectionRetriever
 
+REPORTS_COLLECTION = "reports_kb"
+
+_retriever = CollectionRetriever(
+    id="reports_kb_retriever", collection=REPORTS_COLLECTION, source="reports"
+)
 
 MANIFEST = CapabilityManifest(
     id="reports",
     version="1.0.0",
-    display_name="Security & Contract Reports",
-    tools=REPORT_TOOLS,
-    routing_hints=[
-        RoutingHint(
-            intents=[
-                "report", "contract", "agreement", "clause", "termination",
-                "liability", "renewal", "expiry", "expiring", "expire", "risk",
-                "obligation", "notice", "compare", "metadata", "value",
-            ],
-            examples=[
-                "what does the termination clause say?",
-                "which contracts expire next quarter?",
-                "compare the liability clauses across our vendors",
-                "summarize the obligations in this agreement",
-                "what is the contract value and notice period?",
-            ],
-        )
-    ],
-    license_tiers=["reports", "platform"],
-    specialist=GenericSpecialist(
-        id="reports",
-        tools=REPORT_TOOLS,
-        system_prompt="app/capabilities/reports/prompts/v1.md",
+    display_name="Security Reports",
+    description=(
+        "Q&A over analyst- and AI-generated security reports — EASM scan results, "
+        "brand-protection findings, threat-intel write-ups, and executive briefings."
     ),
-    system_prompt="app/capabilities/reports/prompts/v1.md",
-    retrievers=[reports_retriever],
-    ingestion=[ReportConnector()],
+    license_tiers=("platform", "reports"),
+    enabled_flag="cap_reports_enabled",
+    tools=TOOLS,
+    retrievers=(_retriever,),
+    system_prompt="prompts/v1.md",
+    routing_hints=(
+        RoutingHint(
+            intents=(
+                "report", "finding", "summary", "analyst", "briefing", "scan result",
+                "executive summary", "remediation", "vulnerability", "what does the report say",
+                "top risks", "credential leak", "phishing", "threat intel",
+            ),
+            examples=(
+                "summarize the latest report",
+                "what did the EASM scan find on our confluence server?",
+                "what are our top risks this quarter?",
+                "were any of our credentials leaked?",
+            ),
+        ),
+    ),
     default_autonomy=Autonomy.READ,
-    rbac={tool.name: "analyst" for tool in REPORT_TOOLS},
-    owners=["team-reports"],
-    min_core_version="1.0.0",
+    rbac={"get_report_metadata": "viewer", "find_expiring_items": "viewer"},
+    owners=("team-reports",),
 )
+
+__all__ = ["MANIFEST", "REPORTS_COLLECTION"]

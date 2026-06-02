@@ -1,3 +1,14 @@
-"""Observability (plan §12). Structured logging already lives in
-app/observability; this package adds lightweight in-process metrics now and is
-the home for Langfuse tracing + Prometheus export later."""
+"""Observability: structured logging, tracing (Langfuse seam), metrics."""
+
+from app.core.observability.logging import configure_logging, get_logger
+from app.core.observability.metrics import Metrics, get_metrics
+from app.core.observability.tracing import NoOpTracer, build_tracer
+
+__all__ = [
+    "configure_logging",
+    "get_logger",
+    "Metrics",
+    "get_metrics",
+    "NoOpTracer",
+    "build_tracer",
+]

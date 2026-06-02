@@ -1,34 +1,56 @@
-"""Multi-format text extraction for ingestion (plan §7.1).
+"""Document parsers for the local ingest path (PDF/DOCX/text/markdown/html).
 
-PDF via pypdf, DOCX via python-docx (both lazy, in the `prod` extra), everything
-else read as UTF-8 text. Returns plain text that the indexer then chunks +
-embeds. Unstructured/Surya OCR can replace this later behind the same signature.
+Lazy-imports pypdf / python-docx so they're only needed when actually parsing
+those types. In production the external cron typically delivers pre-extracted
+text; these support direct uploads via ``/ingest``.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import re
 
 
-def extract_text(path: str | Path) -> str:
-    path = Path(path)
-    suffix = path.suffix.lower()
-    if suffix == ".pdf":
-        return _pdf_text(path)
-    if suffix in (".docx", ".doc"):
-        return _docx_text(path)
-    return path.read_text(encoding="utf-8", errors="ignore")
+def parse_text(data: bytes | str) -> str:
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
 
 
-def _pdf_text(path: Path) -> str:
+def parse_html(data: bytes | str) -> str:
+    text = parse_text(data)
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_pdf(data: bytes) -> str:
+    from io import BytesIO
+
     from pypdf import PdfReader  # lazy
 
-    reader = PdfReader(str(path))
-    return "\n".join((page.extract_text() or "") for page in reader.pages)
+    reader = PdfReader(BytesIO(data))
+    return "\n\n".join((page.extract_text() or "") for page in reader.pages)
 
 
-def _docx_text(path: Path) -> str:
-    import docx  # lazy (python-docx)
+def parse_docx(data: bytes) -> str:
+    from io import BytesIO
 
-    document = docx.Document(str(path))
-    return "\n".join(paragraph.text for paragraph in document.paragraphs)
+    import docx  # python-docx, lazy
+
+    document = docx.Document(BytesIO(data))
+    return "\n".join(p.text for p in document.paragraphs)
+
+
+def parse(data: bytes, *, content_type: str = "", filename: str = "") -> str:
+    name = (filename or "").lower()
+    ct = (content_type or "").lower()
+    if name.endswith(".pdf") or "pdf" in ct:
+        return parse_pdf(data)
+    if name.endswith(".docx") or "wordprocessingml" in ct:
+        return parse_docx(data)
+    if name.endswith((".html", ".htm")) or "html" in ct:
+        return parse_html(data)
+    return parse_text(data)
+
+
+__all__ = ["parse", "parse_text", "parse_html", "parse_pdf", "parse_docx"]

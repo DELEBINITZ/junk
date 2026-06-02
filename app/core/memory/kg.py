@@ -1,83 +1,78 @@
-"""Long-term entity knowledge graph (plan §9.3).
+"""Long-term entity memory — the seam for the shared knowledge graph.
 
-NoOp by default; Zep adapter when KG_PROVIDER=zep (lazy `zep_python`). Strictly
-org+user scoped — a cross-org leak here is worse than a chat leak. Modules
-contribute entity/edge types (OntologyContribution); this is the cross-pillar
-join that later powers "what's my biggest risk and who's behind it?".
-
-When enabled, a `recall_memory` core tool exposes `search` to the agent.
+v1 ships a NoOp (chat memory is enough for report Q&A). When the platform grows
+cross-pillar (EASM↔ACI↔Brand), flip ``kg_provider=zep`` to back this with Zep +
+Graphiti — a temporal entity graph, strictly tenant-isolated. The agent gets a
+``recall_memory`` core tool only when a real KG is configured.
 """
 
 from __future__ import annotations
 
-import logging
-import os
 from typing import Protocol
-
-from app.config import settings
-
-logger = logging.getLogger(__name__)
 
 
 class KnowledgeGraph(Protocol):
-    def add_facts(self, org_id: str, user_id: str, facts: list[str]) -> None: ...
-    def search(self, org_id: str, user_id: str, query: str, limit: int = 5) -> list[str]: ...
+    provider: str
+
+    async def add_observation(self, org_id: str, user_id: str, text: str, metadata: dict | None = None) -> None: ...
+    async def recall(self, org_id: str, user_id: str, query: str, *, limit: int = 5) -> list[str]: ...
+    async def aclose(self) -> None: ...
 
 
 class NoOpKnowledgeGraph:
-    def add_facts(self, org_id: str, user_id: str, facts: list[str]) -> None:
+    provider = "none"
+
+    async def add_observation(self, org_id, user_id, text, metadata=None) -> None:
         return None
 
-    def search(self, org_id: str, user_id: str, query: str, limit: int = 5) -> list[str]:
+    async def recall(self, org_id, user_id, query, *, limit=5) -> list[str]:
         return []
 
+    async def aclose(self) -> None:
+        return None
 
-class ZepKnowledgeGraph:  # pragma: no cover - needs a Zep server
-    """Per-(org,user) graph in Zep. Session/graph id namespaced by org+user so
-    memory never crosses tenants."""
 
-    def __init__(self):
-        from zep_python.client import Zep  # lazy
+class ZepKnowledgeGraph:
+    """Zep-backed temporal KG. Namespaces every session by ``org:user`` so a
+    tenant can never read another's graph. Lazy-imports ``zep_python``."""
 
-        self._client = Zep(api_key=settings.zep_api_key, base_url=settings.zep_api_url or None)
+    provider = "zep"
 
-    def _gid(self, org_id: str, user_id: str) -> str:
-        return f"{org_id}:{user_id}"
+    def __init__(self, api_url: str, api_key: str) -> None:
+        from zep_python.client import AsyncZep  # lazy
 
-    def add_facts(self, org_id: str, user_id: str, facts: list[str]) -> None:
+        self._client = AsyncZep(api_key=api_key, base_url=api_url or None)
+
+    @staticmethod
+    def _ns(org_id: str, user_id: str) -> str:
+        return f"{org_id}::{user_id}"
+
+    async def add_observation(self, org_id, user_id, text, metadata=None) -> None:
         try:
-            for fact in facts:
-                self._client.graph.add(user_id=self._gid(org_id, user_id), type="text", data=fact)
-        except Exception as exc:
-            logger.warning("kg.add_failed", extra={"error": str(exc)})
+            await self._client.memory.add(
+                session_id=self._ns(org_id, user_id),
+                messages=[{"role": "system", "content": text, "metadata": metadata or {}}],
+            )
+        except Exception:
+            return None
 
-    def search(self, org_id: str, user_id: str, query: str, limit: int = 5) -> list[str]:
+    async def recall(self, org_id, user_id, query, *, limit=5) -> list[str]:
         try:
-            results = self._client.graph.search(user_id=self._gid(org_id, user_id), query=query, limit=limit)
-            return [getattr(e, "fact", str(e)) for e in (results.edges or [])]
-        except Exception as exc:
-            logger.warning("kg.search_failed", extra={"error": str(exc)})
+            res = await self._client.memory.search(
+                session_id=self._ns(org_id, user_id), text=query, limit=limit
+            )
+            return [r.message.content for r in (res or []) if getattr(r, "message", None)]
+        except Exception:
             return []
 
-
-_kg: KnowledgeGraph | None = None
-
-
-def get_kg() -> KnowledgeGraph:
-    global _kg
-    if _kg is None:
-        provider = os.getenv("KG_PROVIDER", settings.kg_provider).lower()
-        if provider == "zep":
-            try:
-                _kg = ZepKnowledgeGraph()
-            except Exception as exc:  # pragma: no cover
-                logger.warning("kg.zep_unavailable", extra={"error": str(exc)})
-                _kg = NoOpKnowledgeGraph()
-        else:
-            _kg = NoOpKnowledgeGraph()
-    return _kg
+    async def aclose(self) -> None:
+        return None
 
 
-def reset_kg() -> None:
-    global _kg
-    _kg = None
+def build_kg(settings) -> KnowledgeGraph:
+    if settings.kg_provider == "zep" and settings.zep_api_url:
+        return ZepKnowledgeGraph(settings.zep_api_url, settings.zep_api_key)
+    return NoOpKnowledgeGraph()
+
+
+__all__ = ["KnowledgeGraph", "NoOpKnowledgeGraph", "ZepKnowledgeGraph", "build_kg"]

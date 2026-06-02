@@ -1,43 +1,84 @@
-"""Minimal in-process counters (no external dependency).
-
-Increment 1 keeps a tiny counter registry so the agent/MCP paths can record
-volume and the /metrics endpoint can expose it. The production target is a
-Prometheus client + Grafana dashboards (plan §12); the call sites (`metrics.incr`)
-stay the same.
-"""
+"""Lightweight metrics: in-memory counters/histograms, Prometheus when available."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-from threading import Lock
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 
-class _Metrics:
-    def __init__(self):
-        self._lock = Lock()
-        self._counters: dict[str, int] = defaultdict(int)
+class Metrics:
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._counters: dict[str, float] = {}
+        self._hist: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+        self._prom = None
+        if enabled:
+            try:
+                import prometheus_client as prom  # noqa: F401
 
-    def incr(self, name: str, amount: int = 1) -> None:
+                self._prom = prom
+                self._prom_counters: dict[str, object] = {}
+                self._prom_hist: dict[str, object] = {}
+            except Exception:
+                self._prom = None
+
+    def inc(self, name: str, value: float = 1.0) -> None:
+        if not self.enabled:
+            return
         with self._lock:
-            self._counters[name] += amount
+            self._counters[name] = self._counters.get(name, 0.0) + value
+        if self._prom is not None:
+            c = self._prom_counters.get(name)
+            if c is None:
+                c = self._prom.Counter(name, name)
+                self._prom_counters[name] = c
+            c.inc(value)
 
-    def snapshot(self) -> dict[str, int]:
+    def observe(self, name: str, value: float) -> None:
+        if not self.enabled:
+            return
         with self._lock:
-            return dict(self._counters)
+            self._hist.setdefault(name, []).append(value)
+        if self._prom is not None:
+            h = self._prom_hist.get(name)
+            if h is None:
+                h = self._prom.Histogram(name, name)
+                self._prom_hist[name] = h
+            h.observe(value)
 
-    def render_prometheus(self) -> str:
-        """Render counters in Prometheus exposition format (no external dep)."""
+    @contextmanager
+    def timer(self, name: str) -> Iterator[None]:
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.observe(name, (time.perf_counter() - start) * 1000.0)
 
-        lines: list[str] = []
-        for name, value in sorted(self.snapshot().items()):
-            metric = name.replace(".", "_").replace("-", "_")
-            lines.append(f"# TYPE {metric} counter")
-            lines.append(f"{metric} {value}")
-        return "\n".join(lines) + "\n"
-
-    def reset(self) -> None:
+    def snapshot(self) -> dict:
         with self._lock:
-            self._counters.clear()
+            hist = {
+                k: {"count": len(v), "avg_ms": (sum(v) / len(v)) if v else 0.0}
+                for k, v in self._hist.items()
+            }
+            return {"counters": dict(self._counters), "histograms": hist}
+
+    def render_prometheus(self) -> bytes | None:
+        if self._prom is None:
+            return None
+        return self._prom.generate_latest()
 
 
-metrics = _Metrics()
+_metrics: Metrics | None = None
+
+
+def get_metrics(settings=None) -> Metrics:
+    global _metrics
+    if _metrics is None:
+        _metrics = Metrics(enabled=(settings.metrics_enabled if settings else True))
+    return _metrics
+
+
+__all__ = ["Metrics", "get_metrics"]

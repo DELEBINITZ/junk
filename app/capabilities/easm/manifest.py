@@ -1,36 +1,48 @@
-"""EASM manifest. enabled_by_default=False — ships dark; activate with
-CAP_EASM_ENABLED=true. Discovered and routable with no core change once enabled."""
+"""EASM (External Attack Surface Management) capability manifest.
+
+The second module — proof that adding a feature is just a manifest + tools, no
+core edit. Data comes from typed tools (its 'MCP surface'), not a RAG corpus, so
+it shows the tool-backed module shape alongside the corpus-backed reports module.
+"""
 
 from __future__ import annotations
 
-from app.capabilities.easm.tools import EASM_TOOLS
+from app.capabilities.easm.tools import TOOLS
 from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
-
 
 MANIFEST = CapabilityManifest(
     id="easm",
-    version="0.1.0",
+    version="1.0.0",
     display_name="External Attack Surface Management",
-    tools=EASM_TOOLS,
-    routing_hints=[
+    description=(
+        "Query the organization's external attack surface — exposed assets, "
+        "exposures/findings, and surface changes — and request rescans (gated)."
+    ),
+    license_tiers=("platform", "easm"),
+    enabled_flag="cap_easm_enabled",
+    tools=TOOLS,
+    system_prompt="prompts/v1.md",
+    routing_hints=(
         RoutingHint(
-            intents=[
-                "asset", "assets", "exposed", "exposure", "attack surface",
-                "subdomain", "domain", "ip", "port", "certificate", "cve",
-                "vulnerability", "vulnerabilities", "misconfiguration", "shadow it",
-            ],
-            examples=[
-                "what assets are exposed on the internet?",
-                "which critical vulnerabilities should we patch first?",
-                "what changed in our attack surface this week?",
-                "are we affected by CVE-2026-12345?",
-            ],
-        )
-    ],
-    license_tiers=["easm", "platform"],
-    default_autonomy=Autonomy.READ,
-    rbac={tool.name: "analyst" for tool in EASM_TOOLS},
-    owners=["team-easm"],
-    min_core_version="1.0.0",
-    enabled_by_default=False,
+            intents=(
+                "attack surface", "exposed asset", "exposure", "open port", "asset inventory",
+                "external scan", "what's exposed", "subdomain", "shadow IT", "internet-facing",
+                "rescan", "surface change",
+            ),
+            examples=(
+                "what assets do we have exposed to the internet?",
+                "show me our current exposures",
+                "what changed on our attack surface this week?",
+                "rescan admin.acme.test",
+            ),
+        ),
+    ),
+    default_autonomy=Autonomy.SUGGEST,
+    rbac={
+        "query_assets": "viewer", "get_exposures": "viewer", "get_asset_changes": "viewer",
+        "trigger_rescan": "analyst",
+    },
+    owners=("team-easm",),
 )
+
+__all__ = ["MANIFEST"]

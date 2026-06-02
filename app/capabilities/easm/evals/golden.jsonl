@@ -1,5 +1,4 @@
-{"id": "easm-001", "query": "What new assets were discovered in the last 7 days?", "expect_route": "easm", "expect_tools": ["get_asset_changes"]}
-{"id": "easm-002", "query": "Which critical vulnerabilities should we patch first this week?", "expect_route": "easm", "expect_tools": ["get_vulnerabilities"]}
-{"id": "easm-003", "query": "Show me exposed assets with open port 22 and no WAF", "expect_route": "easm", "expect_tools": ["query_assets"]}
-{"id": "easm-004", "query": "What changed in our attack surface since last Monday?", "expect_route": "easm", "expect_tools": ["get_asset_changes"]}
-{"id": "easm-005", "query": "Are we affected by CVE-2026-12345?", "expect_route": "easm", "expect_tools": ["query_assets"]}
+{"id": "easm-001", "org_id": "org_acme", "question": "What assets do we have exposed to the internet on our attack surface?", "expect_route": ["easm"], "expect_citation": true}
+{"id": "easm-002", "org_id": "org_acme", "question": "Show me our current external exposures and open ports.", "expect_route": ["easm"], "expect_citation": true, "expect_substring": "exposure"}
+{"id": "easm-003", "org_id": "org_acme", "question": "What changed on our attack surface recently?", "expect_route": ["easm"], "expect_citation": true}
+{"id": "easm-004", "org_id": "org_globex", "question": "What is exposed on our external attack surface?", "expect_route": ["easm"], "expect_citation": true, "expect_substring": "RDP"}

@@ -1,115 +1,149 @@
-"""Qdrant retrieval backend (plan §7).
+"""Qdrant vector store (``retrieval_backend=qdrant``).
 
-Selected when RETRIEVAL_BACKEND=qdrant. The `organization_id` payload filter is
-MANDATORY on every query — org isolation at the vector layer, not a tool arg the
-model can omit (plan §8.2). `qdrant-client` is lazy-imported so the default
-in-memory path needs no driver.
+Same contract as the in-memory store, with the **mandatory org_id filter applied
+at the database layer** (a ``must`` match), payload indexes for fast filtered
+hybrid search, and datetime range filters that fix the "last year returns old
+data" bug at the DB instead of in post-ranking. Lazy-imports ``qdrant-client``.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Any
+import uuid
+from collections.abc import Sequence
 
-from app.config import settings
+from app.core.contracts import Chunk
+from app.core.rag.vector_store import SearchFilters, VectorRecord
+
+_NS = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 
 
-logger = logging.getLogger(__name__)
+def _point_id(rid: str) -> str:
+    try:
+        return str(uuid.UUID(rid))
+    except (ValueError, AttributeError):
+        return str(uuid.uuid5(_NS, rid))
 
 
-class QdrantRetriever:
-    def __init__(self, url: str | None = None, collection: str | None = None, client: Any = None):
-        self.url = url or settings.qdrant_url
-        self.collection = collection or settings.qdrant_collection
-        self._client = client  # injectable for tests
+class QdrantVectorStore:
+    backend = "qdrant"
 
-    def _qdrant(self):
-        if self._client is not None:
-            return self._client
-        from qdrant_client import QdrantClient  # lazy
+    def __init__(self, url: str, api_key: str = "", timeout: float = 30.0) -> None:
+        from qdrant_client import AsyncQdrantClient  # lazy
 
-        self._client = QdrantClient(url=self.url)
-        return self._client
+        self._client = AsyncQdrantClient(url=url, api_key=api_key or None, timeout=timeout)
 
-    # ---- ingestion side (create collection + upsert embedded points) ------------
-    def ensure_collection(self, vector_size: int) -> None:
-        """Create the collection (cosine) + payload indexes if absent. Idempotent."""
+    async def ensure_collection(self, collection: str, dim: int) -> None:
+        from qdrant_client import models as qm
 
-        from qdrant_client import models  # lazy
-
-        client = self._qdrant()
-        names = {c.name for c in client.get_collections().collections}
-        if self.collection not in names:
-            client.create_collection(
-                collection_name=self.collection,
-                vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE),
+        exists = await self._client.collection_exists(collection)
+        if not exists:
+            await self._client.create_collection(
+                collection_name=collection,
+                vectors_config=qm.VectorParams(size=dim, distance=qm.Distance.COSINE),
             )
-        # Payload indexes for filtered retrieval. organization_id is the tenant key.
-        for field, schema in (
-            ("organization_id", "keyword"), ("contract_id", "keyword"),
-            ("tags", "keyword"), ("doc_type", "keyword"), ("year", "integer"),
-        ):
+        # Payload indexes (idempotent; ignore if already present).
+        for field, schema in [
+            ("org_id", qm.PayloadSchemaType.KEYWORD),
+            ("source", qm.PayloadSchemaType.KEYWORD),
+            ("doc_id", qm.PayloadSchemaType.KEYWORD),
+            ("published_at", qm.PayloadSchemaType.DATETIME),
+        ]:
             try:
-                client.create_payload_index(self.collection, field_name=field, field_schema=schema)
-            except Exception:
-                pass  # index already exists
+                await self._client.create_payload_index(collection, field_name=field, field_schema=schema)
+            except Exception:  # noqa: BLE001 - already exists
+                pass
 
-    def upsert(self, points: list[dict]) -> int:
-        """Upsert points: each {id, vector, payload}. payload MUST carry
-        organization_id (the tenant tag every query filters on)."""
+    async def upsert(self, collection: str, records: Sequence[VectorRecord]) -> int:
+        from qdrant_client import models as qm
 
-        from qdrant_client import models  # lazy
-
-        client = self._qdrant()
-        client.upsert(
-            collection_name=self.collection,
-            points=[
-                models.PointStruct(id=p["id"], vector=p["vector"], payload=p["payload"])
-                for p in points
-            ],
-        )
+        points = []
+        for r in records:
+            if not r.org_id:
+                raise ValueError("VectorRecord.org_id is required (tenant isolation)")
+            points.append(qm.PointStruct(
+                id=_point_id(r.id),
+                vector=r.vector,
+                payload={
+                    "rid": r.id, "org_id": r.org_id, "text": r.text, "source": r.source,
+                    "doc_id": r.doc_id, "title": r.title, "section": r.section,
+                    "published_at": r.published_at, "metadata": r.metadata,
+                },
+            ))
+        if points:
+            await self._client.upsert(collection_name=collection, points=points)
         return len(points)
 
-    def search(
-        self,
-        organization_id: str,
-        query_vector: list[float],
-        top_k: int = 8,
-        filters: dict[str, Any] | None = None,
-    ) -> list[dict]:
-        from qdrant_client import models  # lazy
+    def _filter(self, org_id: str, f: SearchFilters | None):
+        from qdrant_client import models as qm
 
-        must = [
-            models.FieldCondition(
-                key="organization_id",
-                match=models.MatchValue(value=organization_id),
-            )
-        ]
-        if filters and filters.get("tags"):
-            must.append(
-                models.FieldCondition(key="tags", match=models.MatchAny(any=list(filters["tags"])))
-            )
-        result = self._qdrant().query_points(
-            collection_name=self.collection,
-            query=query_vector,
-            query_filter=models.Filter(must=must),
-            limit=top_k,
+        must = [qm.FieldCondition(key="org_id", match=qm.MatchValue(value=org_id))]
+        if f:
+            if f.source:
+                must.append(qm.FieldCondition(key="source", match=qm.MatchValue(value=f.source)))
+            if f.doc_ids:
+                must.append(qm.FieldCondition(key="doc_id", match=qm.MatchAny(any=list(f.doc_ids))))
+            if f.date_from or f.date_to:
+                must.append(qm.FieldCondition(
+                    key="published_at",
+                    range=qm.DatetimeRange(gte=f.date_from or None, lte=f.date_to or None),
+                ))
+            for k, v in (f.extra or {}).items():
+                must.append(qm.FieldCondition(key=f"metadata.{k}", match=qm.MatchValue(value=v)))
+        return qm.Filter(must=must)
+
+    async def search(
+        self,
+        collection: str,
+        query_vector: Sequence[float],
+        *,
+        org_id: str,
+        top_k: int,
+        filters: SearchFilters | None = None,
+    ) -> list[Chunk]:
+        if not org_id:
+            raise ValueError("search requires org_id (tenant isolation)")
+        res = await self._client.query_points(
+            collection_name=collection,
+            query=list(query_vector),
+            query_filter=self._filter(org_id, filters),
+            limit=max(1, top_k),
             with_payload=True,
         )
-        hits = []
-        for point in result.points:
-            payload = point.payload or {}
-            contract_id = payload.get("contract_id")
-            section = payload.get("section_number")
-            hits.append(
-                {
-                    "contract_id": contract_id,
-                    "title": payload.get("title"),
-                    "section_number": section,
-                    "section_title": payload.get("section_title"),
-                    "snippet": (payload.get("text") or "")[:600],
-                    "score": round(float(point.score), 4),
-                    "citation": f"[{contract_id}, Section {section}]",
-                }
-            )
-        return hits
+        out: list[Chunk] = []
+        for p in res.points:
+            pl = p.payload or {}
+            out.append(Chunk(
+                id=pl.get("rid", str(p.id)), text=pl.get("text", ""), score=float(p.score or 0.0),
+                org_id=pl.get("org_id", org_id), source=pl.get("source", ""),
+                doc_id=pl.get("doc_id", ""), title=pl.get("title", ""),
+                section=pl.get("section", ""), published_at=pl.get("published_at"),
+                metadata=pl.get("metadata", {}) or {},
+            ))
+        return out
+
+    async def delete_by_doc(self, collection: str, org_id: str, doc_id: str) -> int:
+        from qdrant_client import models as qm
+
+        await self._client.delete(
+            collection_name=collection,
+            points_selector=qm.FilterSelector(filter=qm.Filter(must=[
+                qm.FieldCondition(key="org_id", match=qm.MatchValue(value=org_id)),
+                qm.FieldCondition(key="doc_id", match=qm.MatchValue(value=doc_id)),
+            ])),
+        )
+        return 0  # qdrant delete does not return a precise count here
+
+    async def count(self, collection: str, org_id: str | None = None) -> int:
+        from qdrant_client import models as qm
+
+        flt = None
+        if org_id:
+            flt = qm.Filter(must=[qm.FieldCondition(key="org_id", match=qm.MatchValue(value=org_id))])
+        res = await self._client.count(collection_name=collection, count_filter=flt, exact=True)
+        return int(res.count)
+
+    async def aclose(self) -> None:
+        await self._client.close()
+
+
+__all__ = ["QdrantVectorStore"]

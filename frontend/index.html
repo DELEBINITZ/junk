@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Agentic Security Intelligence</title>
+<style>
+  :root { --bg:#0f1117; --panel:#171a23; --panel2:#1f2330; --line:#2a2f3e; --tx:#e6e8ee; --mut:#8b93a7; --acc:#4f8cff; --ok:#3ad29f; --warn:#ffb454; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--tx); height:100vh; display:flex; }
+  button { cursor:pointer; border:0; border-radius:8px; padding:8px 12px; background:var(--acc); color:#fff; font-weight:600; }
+  button.ghost { background:var(--panel2); color:var(--tx); border:1px solid var(--line); }
+  input,textarea { background:var(--panel2); border:1px solid var(--line); color:var(--tx); border-radius:8px; padding:10px; font:inherit; width:100%; }
+  /* login */
+  #login { margin:auto; width:340px; background:var(--panel); padding:28px; border-radius:14px; border:1px solid var(--line); }
+  #login h1 { font-size:18px; margin:0 0 4px; } #login p { color:var(--mut); margin:0 0 18px; font-size:13px; }
+  #login label { font-size:12px; color:var(--mut); } #login input { margin:6px 0 14px; }
+  .err { color:#ff6b6b; font-size:13px; min-height:18px; }
+  /* app */
+  #app { display:none; width:100%; height:100%; }
+  #side { width:280px; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; }
+  #side .top { padding:14px; border-bottom:1px solid var(--line); }
+  #side .who { font-size:12px; color:var(--mut); margin-bottom:8px; }
+  #caps { display:flex; flex-wrap:wrap; gap:5px; margin-top:8px; }
+  .chip { font-size:11px; background:var(--panel2); border:1px solid var(--line); border-radius:20px; padding:2px 9px; color:var(--mut); }
+  #sessions { flex:1; overflow:auto; padding:8px; }
+  .sess { padding:9px 10px; border-radius:8px; cursor:pointer; color:var(--tx); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sess:hover { background:var(--panel2); } .sess.active { background:var(--panel2); border:1px solid var(--line); }
+  #main { flex:1; display:flex; flex-direction:column; }
+  #log { flex:1; overflow:auto; padding:24px; max-width:860px; width:100%; margin:0 auto; }
+  .msg { margin-bottom:20px; } .msg .role { font-size:11px; color:var(--mut); text-transform:uppercase; letter-spacing:.5px; margin-bottom:5px; }
+  .bubble { white-space:pre-wrap; }
+  .user .bubble { background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:10px 14px; display:inline-block; }
+  .status { color:var(--mut); font-size:12px; font-style:italic; }
+  .cites { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; }
+  .cite { font-size:12px; color:var(--mut); margin:3px 0; }
+  .cite b { color:var(--acc); }
+  .route { font-size:11px; color:var(--ok); margin-top:6px; }
+  #composer { border-top:1px solid var(--line); padding:14px; display:flex; gap:10px; max-width:860px; width:100%; margin:0 auto; }
+  #q { resize:none; height:46px; }
+  .pill{font-size:11px;background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:2px 8px;color:var(--warn);}
+</style>
+</head>
+<body>
+<!-- LOGIN -->
+<div id="login">
+  <h1>Agentic Security Intelligence</h1>
+  <p>Chat across your reports, attack surface, brand &amp; adversaries.</p>
+  <label>Email</label><input id="email" value="alice@acme.test"/>
+  <label>Password</label><input id="password" type="password" value="password"/>
+  <button id="loginBtn" style="width:100%">Sign in</button>
+  <div class="err" id="loginErr"></div>
+  <p style="margin-top:14px">Demo users: alice@acme.test (admin), bob@acme.test (analyst), carol@acme.test (viewer), dave@globex.test. Password: <code>password</code>.</p>
+</div>
+
+<!-- APP -->
+<div id="app">
+  <div id="side">
+    <div class="top">
+      <div class="who" id="who"></div>
+      <button id="newChat" style="width:100%">+ New chat</button>
+      <div id="caps"></div>
+    </div>
+    <div id="sessions"></div>
+    <div class="top"><button class="ghost" id="logout" style="width:100%">Sign out</button></div>
+  </div>
+  <div id="main">
+    <div id="log"></div>
+    <div id="composer">
+      <textarea id="q" placeholder="Ask about exposures, threats, reports… (Enter to send)"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = location.origin;
+let token = null, user = null, sessionId = null, streaming = false;
+
+const $ = s => document.querySelector(s);
+const el = (t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;};
+
+async function api(path, opts={}) {
+  opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers||{}, token?{'Authorization':'Bearer '+token}:{});
+  const r = await fetch(API+path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(()=>({}))).error?.message || r.status);
+  return r.json();
+}
+
+$('#loginBtn').onclick = async () => {
+  $('#loginErr').textContent='';
+  try {
+    const r = await fetch(API+'/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:$('#email').value, password:$('#password').value})});
+    if(!r.ok) throw new Error('invalid credentials');
+    const d = await r.json(); token=d.access_token; user=d.user;
+    $('#login').style.display='none'; $('#app').style.display='flex';
+    $('#who').textContent = `${user.email} · ${user.org_id} · ${user.roles.join('/')}`;
+    await loadCaps(); await loadSessions(); newChat();
+  } catch(e){ $('#loginErr').textContent = e.message; }
+};
+$('#logout').onclick = async ()=>{ try{await api('/v1/auth/logout',{method:'POST'});}catch{} location.reload(); };
+$('#newChat').onclick = newChat;
+function newChat(){ sessionId=null; $('#log').innerHTML=''; setActive(null);
+  addMsg('assistant','<span class="status">Ask me about your exposures, threat actors, brand abuse, or any report.</span>'); }
+
+async function loadCaps(){
+  try{ const c = await api('/v1/capabilities'); const box=$('#caps'); box.innerHTML='';
+    c.modules.forEach(m=> box.appendChild(el('span','chip',m.display_name))); }catch{}
+}
+async function loadSessions(){
+  const box=$('#sessions'); box.innerHTML='';
+  try{ const list = await api('/v1/sessions');
+    list.forEach(s=>{ const d=el('div','sess'+(s.id===sessionId?' active':''), s.title||'New chat');
+      d.onclick=()=>openSession(s.id); d.dataset.id=s.id; box.appendChild(d); }); }catch{}
+}
+function setActive(id){ document.querySelectorAll('.sess').forEach(d=> d.classList.toggle('active', d.dataset.id===id)); }
+async function openSession(id){
+  sessionId=id; setActive(id); $('#log').innerHTML='';
+  const d = await api('/v1/sessions/'+id);
+  d.messages.forEach(m=> addMsg(m.role, escapeHtml(m.content), m.citations));
+}
+
+function addMsg(role, html, citations){
+  const m = el('div','msg '+role); m.appendChild(el('div','role',role));
+  const b = el('div','bubble'); b.innerHTML=html; m.appendChild(b);
+  if(citations&&citations.length) m.appendChild(renderCites(citations));
+  $('#log').appendChild(m); $('#log').scrollTop=$('#log').scrollHeight; return {m,b};
+}
+function renderCites(cs){ const d=el('div','cites'); cs.forEach(c=> d.appendChild(
+  el('div','cite',`<b>[${c.n||''}]</b> ${escapeHtml(c.title||c.doc_id)} <span style="opacity:.6">(${c.source||''} ${c.doc_id})</span>`))); return d; }
+function escapeHtml(s){ return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+$('#q').addEventListener('keydown', e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); }});
+$('#send').onclick = send;
+
+function send(){
+  const text = $('#q').value.trim(); if(!text||streaming) return;
+  $('#q').value=''; addMsg('user', escapeHtml(text));
+  const am = addMsg('assistant','<span class="status">…thinking</span>');
+  streaming=true;
+  const params = new URLSearchParams({message:text, access_token:token});
+  if(sessionId) params.set('session_id', sessionId);
+  const es = new EventSource(API+'/v1/chat/stream?'+params.toString());
+  let buf=''; let started=false;
+  const setStatus = t => { if(!started) am.b.innerHTML='<span class="status">'+t+'</span>'; };
+  es.addEventListener('session', e=>{ const d=JSON.parse(e.data); sessionId=d.session_id; });
+  es.addEventListener('status', e=>{ const d=JSON.parse(e.data); setStatus(d.stage||'working'); });
+  es.addEventListener('route', e=>{ const d=JSON.parse(e.data); setStatus('routing → '+(d.modules||[]).join(', ')); });
+  es.addEventListener('tool', e=>{ const d=JSON.parse(e.data); setStatus('calling '+d.name+'…'); });
+  es.addEventListener('token', e=>{ started=true; buf+=JSON.parse(e.data).text; am.b.textContent=buf; $('#log').scrollTop=$('#log').scrollHeight; });
+  es.addEventListener('done', e=>{ const d=JSON.parse(e.data);
+    am.b.textContent = d.answer || buf;
+    if(d.route&&d.route.length) am.m.appendChild(el('div','route','routed: '+d.route.join(', ')));
+    if(d.citations&&d.citations.length) am.m.appendChild(renderCites(d.citations));
+    if(d.flags&&d.flags.ungrounded) am.m.appendChild(el('span','pill','⚠ low groundedness'));
+    es.close(); streaming=false; loadSessions(); });
+  es.addEventListener('error', e=>{ let msg='stream error'; try{msg=JSON.parse(e.data).message;}catch{}
+    am.b.innerHTML='<span class="status">⚠ '+escapeHtml(msg)+'</span>'; es.close(); streaming=false; });
+}
+</script>
+</body>
+</html>

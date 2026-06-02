@@ -1,65 +1,83 @@
-"""OIDC token verification (production auth, plan §8.1).
+"""OIDC token verification (``auth_provider=oidc``).
 
-Verifies an IdP-issued JWT against the provider's JWKS (RS256) and maps standard
-claims to our `User`. Active when AUTH_PROVIDER=oidc. `PyJWKClient` (PyJWT +
-cryptography, in the `prod` extra) is imported lazily, so the default local
-HS256 path needs no extra dependency.
-
-Org and role come from configurable claims; do not build your own user store —
-the IdP is the source of identity.
+Verifies an RS256/ES256 access token against the IdP's JWKS and projects the
+configured claims into a :class:`SecurityContext`. Used in production when an
+external IdP (Keycloak, Auth0, Entra, …) owns identity. The local JWT path
+(``jwt.py``) is the zero-infra default.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import jwt
-
-from app.config import settings
-from app.domain import User
-
-
-_jwks_client = None
+from app.config import Settings
+from app.core.errors import AuthError, ConfigError
+from app.core.security.context import SecurityContext
 
 
-def _client():
-    global _jwks_client
-    if _jwks_client is None:
-        from jwt import PyJWKClient  # lazy (needs cryptography)
+class OIDCVerifier:
+    def __init__(self, settings: Settings) -> None:
+        if not settings.oidc_jwks_url:
+            raise ConfigError("auth_provider=oidc requires OIDC_JWKS_URL")
+        self.settings = settings
+        self._jwk_client = None  # lazy
 
-        _jwks_client = PyJWKClient(settings.oidc_jwks_url)
-    return _jwks_client
+    def _client(self):
+        if self._jwk_client is None:
+            import jwt  # lazy
+
+            self._jwk_client = jwt.PyJWKClient(self.settings.oidc_jwks_url)
+        return self._jwk_client
+
+    def verify(self, token: str) -> SecurityContext:
+        import jwt  # lazy
+
+        s = self.settings
+        try:
+            signing_key = self._client().get_signing_key_from_jwt(token)
+            claims: dict[str, Any] = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256", "ES256"],
+                audience=s.oidc_audience or None,
+                issuer=s.oidc_issuer or None,
+                options={"verify_aud": bool(s.oidc_audience)},
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize to AuthError
+            raise AuthError(f"oidc verification failed: {exc}") from exc
+
+        org_id = str(claims.get(s.oidc_org_claim, "") or "")
+        if not org_id:
+            raise AuthError(f"oidc token missing org claim '{s.oidc_org_claim}'")
+        roles = _coerce_roles(claims.get(s.oidc_roles_claim))
+        return SecurityContext(
+            org_id=org_id,
+            user_id=str(claims.get("sub", "")),
+            roles=roles,
+            email=str(claims.get("email", "")),
+            token_id=str(claims.get("jti", "")),
+            claims=claims,
+        )
 
 
-def verify_oidc_token(token: str) -> dict[str, Any]:
-    signing_key = _client().get_signing_key_from_jwt(token)
-    return jwt.decode(
-        token,
-        signing_key.key,
-        algorithms=["RS256"],
-        audience=settings.oidc_audience or None,
-        issuer=settings.oidc_issuer or None,
-        options={"verify_aud": bool(settings.oidc_audience)},
-    )
+def _coerce_roles(raw: object) -> tuple[str, ...]:
+    if raw is None:
+        return ("viewer",)
+    if isinstance(raw, str):
+        return tuple(r.strip() for r in raw.split(",") if r.strip()) or ("viewer",)
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(r) for r in raw) or ("viewer",)
+    return ("viewer",)
 
 
-def user_from_claims(claims: dict[str, Any]) -> User:
-    org = claims.get("org") or claims.get("organization_id") or claims.get("tenant_id")
-    role = claims.get("role")
-    if not role:
-        roles = claims.get("roles") or []
-        role = roles[0] if roles else "viewer"
-    return User(
-        id=str(claims["sub"]),
-        organization_id=str(org),
-        email=claims.get("email", ""),
-        name=claims.get("name", ""),
-        role=role,
-        password_hash="",
-        is_active=True,
-    )
+_verifier: OIDCVerifier | None = None
 
 
-def reset_jwks_client() -> None:
-    global _jwks_client
-    _jwks_client = None
+def get_oidc_verifier(settings: Settings) -> OIDCVerifier:
+    global _verifier
+    if _verifier is None:
+        _verifier = OIDCVerifier(settings)
+    return _verifier
+
+
+__all__ = ["OIDCVerifier", "get_oidc_verifier"]

@@ -1,151 +1,192 @@
-"""Capability registry: discover module manifests at boot, then compute the
-per-organization / per-user tool views. No feature is named here — everything is
-derived from manifests. Cross-cutting "core" tools (date, past-chat search) are
-registered alongside and are available to every module. See plan §5.
+"""Capability registry — the heart of the extensibility chassis.
+
+At boot it **discovers** capability modules (``app/capabilities/*/manifest.py``),
+validates their contracts, and assembles the running system from their
+manifests. The supervisor's routing, each org's visible tools, RBAC, and the
+merged ontology are all *computed here*, never hardcoded. Adding a feature =
+dropping in a module dir; no core edit. (Blueprint file 15.)
 """
 
 from __future__ import annotations
 
 import importlib
-import logging
-import os
 import pkgutil
-from typing import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from app.core.contracts import CapabilityManifest, Tool, role_allows
-from app.domain import User
-
-
-logger = logging.getLogger(__name__)
+from app.core.contracts import (
+    CONTRACTS_VERSION,
+    CapabilityManifest,
+    OntologyContribution,
+    Retriever,
+    RoutingHint,
+    Tool,
+    role_satisfies,
+)
+from app.core.errors import RegistryError
+from app.core.security.context import SecurityContext
 
 CAPABILITIES_PACKAGE = "app.capabilities"
-CORE_MODULE_ID = "core"
 
 
-class RegistryError(Exception):
-    """Raised on a registry-level conflict (e.g. duplicate tool name)."""
+def _version_tuple(v: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+
+@dataclass
+class RegisteredModule:
+    manifest: CapabilityManifest
+    enabled: bool
+    tools: dict[str, Tool] = field(default_factory=dict)
+    retrievers: dict[str, Retriever] = field(default_factory=dict)
+    prompt_text: str = ""
+
+    @property
+    def id(self) -> str:
+        return self.manifest.id
+
+    def required_role(self, tool_name: str) -> str:
+        t = self.tools.get(tool_name)
+        return self.manifest.rbac.get(tool_name, t.rbac_role if t else "viewer")
+
+
+@dataclass
+class CapabilityView:
+    """What one org/user can see and do — computed, cached per (org, roles)."""
+
+    module_ids: list[str]
+    tools: list[Tool]
+    routing: list[tuple[str, RoutingHint]]  # (module_id, hint)
 
 
 class CapabilityRegistry:
-    def __init__(self, entitlements: Callable[[str], set[str]] | None = None):
-        self.modules: dict[str, CapabilityManifest] = {}
-        self.tools: dict[str, tuple[str, Tool]] = {}  # tool_name -> (module_id, Tool)
-        self.core_tools: list[Tool] = []
-        # Org entitlement hook. Default: every org is entitled to every loaded
-        # module (no license store yet). Swap for a real per-org lookup later.
-        self._entitlements = entitlements
+    def __init__(self) -> None:
+        self._modules: dict[str, RegisteredModule] = {}
+        self._ontology_nodes: dict[str, tuple[str, ...]] = {}
+        self._ontology_edges: list[tuple[str, str, str]] = []
 
-    # ---- discovery / registration -------------------------------------------
-    def discover(self, package: str = CAPABILITIES_PACKAGE) -> "CapabilityRegistry":
-        pkg = importlib.import_module(package)
+    # -- registration --------------------------------------------------------
+    def register(self, manifest: CapabilityManifest, *, enabled: bool, module_pkg: str = "") -> RegisteredModule:
+        if _version_tuple(manifest.min_core_version) > _version_tuple(CONTRACTS_VERSION):
+            raise RegistryError(
+                f"module '{manifest.id}' needs core >= {manifest.min_core_version}, have {CONTRACTS_VERSION}"
+            )
+        if manifest.id in self._modules:
+            raise RegistryError(f"duplicate module id '{manifest.id}'")
+
+        tools: dict[str, Tool] = {}
+        for t in manifest.tools:
+            stamped = Tool(
+                name=t.name, description=t.description, handler=t.handler,
+                args_schema=t.args_schema, returns_schema=t.returns_schema,
+                side_effecting=t.side_effecting, rbac_role=t.rbac_role,
+                autonomy=t.autonomy, module_id=manifest.id,
+            )
+            if stamped.name in tools:
+                raise RegistryError(f"duplicate tool '{stamped.name}' in module '{manifest.id}'")
+            tools[stamped.name] = stamped
+
+        # RBAC keys must reference real tools.
+        for tname in manifest.rbac:
+            if tname not in tools:
+                raise RegistryError(f"module '{manifest.id}' rbac references unknown tool '{tname}'")
+
+        retrievers = {r.id: r for r in manifest.retrievers}
+        prompt_text = self._load_prompt(manifest, module_pkg)
+        if manifest.ontology:
+            self._merge_ontology(manifest.id, manifest.ontology)
+
+        mod = RegisteredModule(manifest=manifest, enabled=enabled, tools=tools,
+                               retrievers=retrievers, prompt_text=prompt_text)
+        self._modules[manifest.id] = mod
+        return mod
+
+    def _load_prompt(self, manifest: CapabilityManifest, module_pkg: str) -> str:
+        if not manifest.system_prompt:
+            return f"You are the {manifest.display_name} specialist. Answer only from retrieved, cited sources."
+        try:
+            base = Path(importlib.import_module(module_pkg).__file__).parent if module_pkg else Path(".")
+            p = base / manifest.system_prompt
+            if p.exists():
+                return p.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        return f"You are the {manifest.display_name} specialist. Answer only from retrieved, cited sources."
+
+    def _merge_ontology(self, module_id: str, contrib: OntologyContribution) -> None:
+        for n in contrib.nodes:
+            existing = self._ontology_nodes.get(n.name)
+            if existing is not None and existing != n.keys:
+                raise RegistryError(
+                    f"ontology collision on node '{n.name}' (module '{module_id}'): keys differ"
+                )
+            self._ontology_nodes[n.name] = n.keys
+        for e in contrib.edges:
+            self._ontology_edges.append((e.src, e.relation, e.dst))
+
+    # -- discovery -----------------------------------------------------------
+    def discover(self, settings) -> CapabilityRegistry:
+        pkg = importlib.import_module(CAPABILITIES_PACKAGE)
         for info in pkgutil.iter_modules(pkg.__path__):
-            if not info.ispkg:
+            if not info.ispkg or info.name.startswith("_"):
                 continue
-            module_name = f"{package}.{info.name}.manifest"
+            module_pkg = f"{CAPABILITIES_PACKAGE}.{info.name}"
             try:
-                mod = importlib.import_module(module_name)
+                man_mod = importlib.import_module(f"{module_pkg}.manifest")
             except ModuleNotFoundError:
-                # A directory without a manifest (e.g. _template) is not a module.
-                logger.info("capability.no_manifest", extra={"capability": info.name})
                 continue
-            manifest = getattr(mod, "MANIFEST", None)
-            if manifest is None:
-                logger.warning("capability.manifest_missing_symbol", extra={"capability": info.name})
+            manifest = getattr(man_mod, "MANIFEST", None)
+            if not isinstance(manifest, CapabilityManifest):
                 continue
-            # Deployment-composition gate: a module with enabled_by_default=False
-            # is only loaded when CAP_<ID>_ENABLED=true (ship dark -> canary).
-            opt_in = os.getenv(f"CAP_{manifest.id.upper()}_ENABLED", "").lower() == "true"
-            if not manifest.enabled_by_default and not opt_in:
-                logger.info("capability.disabled", extra={"capability": manifest.id})
-                continue
-            self.register(manifest)
-        self._register_core_tools()
-        logger.info(
-            "registry.discovered",
-            extra={"modules": list(self.modules), "tools": len(self.tools)},
-        )
+            enabled = (
+                getattr(settings, manifest.enabled_flag, manifest.enabled_default)
+                if manifest.enabled_flag else manifest.enabled_default
+            )
+            self.register(manifest, enabled=bool(enabled), module_pkg=module_pkg)
         return self
 
-    def register(self, manifest: CapabilityManifest) -> None:
-        manifest.validate()
-        if manifest.id in self.modules:
-            raise RegistryError(f"Duplicate module id: {manifest.id}")
-        for tool in manifest.tools:
-            # The manifest is the source of truth for the coarse role gate.
-            if tool.name in manifest.rbac:
-                tool.rbac_role = manifest.rbac[tool.name]
-            if tool.name in self.tools:
-                other = self.tools[tool.name][0]
-                raise RegistryError(
-                    f"Tool name collision: '{tool.name}' in '{manifest.id}' and '{other}'"
-                )
-            self.tools[tool.name] = (manifest.id, tool)
-        self.modules[manifest.id] = manifest
+    # -- accessors -----------------------------------------------------------
+    def modules(self, *, include_disabled: bool = True) -> list[RegisteredModule]:
+        return [m for m in self._modules.values() if include_disabled or m.enabled]
 
-    def _register_core_tools(self) -> None:
-        # Local import avoids an import-time cycle (core_tools imports contracts
-        # + memory, registry imports core_tools only at discovery time).
-        from app.core.agent.core_tools import build_core_tools
+    def module(self, module_id: str) -> RegisteredModule | None:
+        return self._modules.get(module_id)
 
-        for tool in build_core_tools():
-            if tool.name in self.tools:
-                raise RegistryError(f"Core tool '{tool.name}' collides with a module tool")
-            self.core_tools.append(tool)
-            self.tools[tool.name] = (CORE_MODULE_ID, tool)
+    def find_tool(self, tool_name: str) -> tuple[RegisteredModule, Tool] | None:
+        for m in self._modules.values():
+            if tool_name in m.tools:
+                return m, m.tools[tool_name]
+        return None
 
-    # ---- per-org / per-user views -------------------------------------------
-    def org_entitlements(self, org_id: str) -> set[str]:
-        if self._entitlements is not None:
-            return self._entitlements(org_id)
-        return set(self.modules)  # default-allow until a license store exists
+    @property
+    def ontology(self) -> dict:
+        return {"nodes": dict(self._ontology_nodes), "edges": list(self._ontology_edges)}
 
-    def _module_enabled(self, manifest: CapabilityManifest) -> bool:
-        return True  # enabled_flag wired to a feature-flag service later
+    # -- per-org view (entitlement + RBAC, computed not coded) ---------------
+    def _entitled(self, module: RegisteredModule, sc: SecurityContext) -> bool:
+        if not module.enabled:
+            return False
+        # Default entitlement: every loaded module is visible to every org. Wire a
+        # license/entitlement store here to gate by tenant tier (manifest.license_tiers).
+        return True
 
-    def modules_for_user(self, user: User) -> list[CapabilityManifest]:
-        entitled = self.org_entitlements(user.organization_id)
-        return [
-            m for m in self.modules.values()
-            if m.id in entitled and self._module_enabled(m)
-        ]
-
-    def tools_for_user(self, user: User) -> list[Tool]:
-        out: list[Tool] = [t for t in self.core_tools if role_allows(user.role, t.rbac_role)]
-        for manifest in self.modules_for_user(user):
-            for tool in manifest.tools:
-                if role_allows(user.role, tool.rbac_role):
-                    out.append(tool)
-        return out
-
-    def module_tools_for_user(self, user: User) -> list[Tool]:
-        """Tools that belong to an actual capability module (excludes core)."""
-
-        return [t for t in self.tools_for_user(user) if self.module_of(t.name) != CORE_MODULE_ID]
-
-    def tool(self, name: str) -> Tool | None:
-        entry = self.tools.get(name)
-        return entry[1] if entry else None
-
-    def module_of(self, tool_name: str) -> str | None:
-        entry = self.tools.get(tool_name)
-        return entry[0] if entry else None
-
-    def list_tool_definitions(self, user: User) -> list[dict]:
-        return [t.mcp_definition() for t in self.tools_for_user(user)]
+    def capability_view(self, sc: SecurityContext) -> CapabilityView:
+        module_ids: list[str] = []
+        tools: list[Tool] = []
+        routing: list[tuple[str, RoutingHint]] = []
+        for m in self._modules.values():
+            if not self._entitled(m, sc):
+                continue
+            module_ids.append(m.id)
+            for hint in m.manifest.routing_hints:
+                routing.append((m.id, hint))
+            for tname, tool in m.tools.items():
+                if role_satisfies(sc.roles, m.required_role(tname)):
+                    tools.append(tool)
+        return CapabilityView(module_ids=module_ids, tools=tools, routing=routing)
 
 
-_registry: CapabilityRegistry | None = None
-
-
-def get_registry() -> CapabilityRegistry:
-    global _registry
-    if _registry is None:
-        _registry = CapabilityRegistry().discover()
-    return _registry
-
-
-def reset_registry() -> None:
-    """Test hook to force re-discovery."""
-
-    global _registry
-    _registry = None
+__all__ = ["CapabilityRegistry", "RegisteredModule", "CapabilityView"]

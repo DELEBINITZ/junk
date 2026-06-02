@@ -1,25 +1,47 @@
 # Capability module template
 
-Target: ship a working, evaluated, permission-gated feature in ~1 day, touching
-no file under `app/core/`.
+Add a product feature in ~1 day **without opening any file under `app/core/`**.
 
-## Steps
-1. `cp -r app/capabilities/_template app/capabilities/<feature>`
-2. Rename `manifest.py.template` -> `manifest.py`, `tools.py.template` -> `tools.py`.
-   Replace every `<feature>` placeholder.
-3. Write 3-6 typed tools (rich docstrings, structured returns, errors-as-data via
-   `ToolException`; mark `side_effecting=True` for actions).
-4. Optional: add `retrievers.py` (bind a corpus to the shared pipeline),
-   `ingestion.py` (a connector), `ontology.py` (KG node/edge types).
-5. Add `prompts/v1.md` and `evals/golden.jsonl`.
-6. Fill the manifest (id, tiers, routing_hints, rbac, autonomy, min_core_version).
-7. The registry discovers the module at boot. Ship behind a flag → canary → promote.
+## Recipe
 
-## Contract tests a module must pass (plan §5.5)
-schema validity · errors-as-data · ORG ISOLATION · gate enforcement ·
-ontology merge · routing · prompt-injection resistance.
+1. **Copy** this directory:
+   ```bash
+   cp -r app/capabilities/_template app/capabilities/<feature>
+   cd app/capabilities/<feature>
+   mv manifest.py.template manifest.py
+   mv tools.py.template tools.py
+   ```
+2. **Write the tools** (`tools.py`) — typed args, a docstring the LLM reads,
+   structured `ToolResult`/`ToolError`. Mark side-effecting tools
+   (`side_effecting=True`) — they auto-route through the human-approval gate.
+3. **Write the prompt** at `prompts/v1.md` (persona + few-shots).
+4. **Fill the manifest** (`manifest.py`): id, routing hints, RBAC, autonomy.
+   If the feature has a corpus, bind a `CollectionRetriever`; if it has its own
+   data feed, add an `IngestionConnector`; if it adds entities, declare an
+   `OntologyContribution`. All optional.
+5. **Add a flag** `cap_<feature>_enabled: bool = False` to `app/config.py`.
+6. **Add evals** at `evals/golden.jsonl` (golden questions + expected routing).
+   CI runs them.
+7. **Enable + ship**: set `CAP_<FEATURE>_ENABLED=true`, canary, promote.
 
-## Promoting to a standalone MCP server (plan §6.4)
-When the module needs independent ownership/scale or a hard boundary around
-adversary-controlled data, package its tools as an MCP server and point the
-tool handlers at a remote MCP client. The Tool contract is unchanged.
+The supervisor will route to it, RBAC + the action gate will apply, and it will
+appear in `/v1/capabilities` — all derived from your manifest. No core edit.
+
+## What a module may contain
+
+| File | Required? | Purpose |
+|------|-----------|---------|
+| `manifest.py` | yes | declarative wiring (`MANIFEST`) |
+| `tools.py` | yes (or a retriever) | the typed tools |
+| `prompts/v1.md` | recommended | specialist persona |
+| `evals/golden.jsonl` | yes (CI gate) | golden questions |
+| `retrievers` (in manifest) | if it has a corpus | RAG binding |
+| `ingestion.py` | if it has a data feed | event → corpus/KG |
+| `ontology` (in manifest) | if it adds entities | KG slice |
+| `seed.py` (`seed_demo`) | dev only | demo data |
+
+## Promote to a standalone MCP server (later)
+
+When the feature needs its own deploy/scale or a hard security boundary, package
+its tools as a standalone MCP server (`app/core/mcp/server.py:make_mcp_app`) and
+point a `RemoteMCPClient` at it. The tool contracts don't change.

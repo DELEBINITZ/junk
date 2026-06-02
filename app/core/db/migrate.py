@@ -1,56 +1,53 @@
-"""Forward-only SQL migration runner.
+"""Migration runner (``asi-migrate`` console script).
 
-Applies every `migrations/*.sql` not yet recorded in `schema_migrations`, in
-filename order, each in its own transaction. Run with:
-
-    .venv/bin/python -m app.core.db.migrate
-
-Requires the psycopg driver (the 'prod' extra) and a reachable DATABASE_URL.
-Statements are split on ';' (the migration SQL contains no semicolons inside
-string literals).
+Applies ``migrations/*.sql`` in order, idempotently, tracking applied versions in
+``schema_migrations``. Uses a synchronous psycopg connection — run once at deploy.
 """
 
 from __future__ import annotations
 
-import logging
+import sys
 from pathlib import Path
-
-from app.config import settings
-
-
-logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 
 
-def _statements(sql: str) -> list[str]:
-    return [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
+def run_migrations(dsn: str) -> list[str]:
+    import psycopg  # lazy
 
-
-def run_migrations(database_url: str | None = None) -> list[str]:
-    import psycopg
-
-    url = database_url or settings.database_url
     applied: list[str] = []
-    with psycopg.connect(url, autocommit=True) as conn:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_migrations ("
-            "version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
-        )
-        done = {row[0] for row in conn.execute("SELECT version FROM schema_migrations").fetchall()}
-        for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            version = path.name
-            if version in done:
-                continue
-            with conn.transaction():
-                for statement in _statements(path.read_text()):
-                    conn.execute(statement)
-                conn.execute("INSERT INTO schema_migrations (version) VALUES (%s)", (version,))
-            applied.append(version)
-            logger.info("migration.applied", extra={"version": version})
+    with psycopg.connect(dsn, autocommit=False) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS schema_migrations "
+                "(version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+            conn.commit()
+            cur.execute("SELECT version FROM schema_migrations")
+            done = {r[0] for r in cur.fetchall()}
+            for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                version = path.stem
+                if version in done:
+                    continue
+                sql = path.read_text(encoding="utf-8")
+                cur.execute(sql)
+                cur.execute("INSERT INTO schema_migrations(version) VALUES (%s)", (version,))
+                conn.commit()
+                applied.append(version)
     return applied
 
 
-if __name__ == "__main__":  # pragma: no cover
-    result = run_migrations()
-    print("applied:", ", ".join(result) if result else "none (up to date)")
+def main() -> int:
+    from app.config import get_settings
+
+    settings = get_settings()
+    if not settings.database_url:
+        print("DATABASE_URL not set", file=sys.stderr)
+        return 2
+    applied = run_migrations(settings.database_url)
+    print(f"migrations applied: {applied or '(none — up to date)'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

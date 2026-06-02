@@ -1,23 +1,53 @@
-"""SSE typed events (plan §11).
+"""Server-Sent Events: typed event framing for the streaming chat endpoint.
 
-`stream_turn` maps the orchestrator's semantic event stream 1:1 onto the SSE wire
-format (status / tool_call / tool_result / token / citation / done). Token events
-now carry real per-token output when a streaming LLM is configured; otherwise the
-grounded summary is chunked — same wire format either way.
+The orchestrator yields :class:`AgentEvent`s; this turns them into the SSE wire
+format. Typed events (status, route, tool, token, citation, done, error) let the
+UI render progressively — exactly the ChatGPT/Claude streaming UX.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Iterator
+from collections.abc import AsyncIterator
 
-from app.core.agent.orchestrator import Orchestrator
+from app.core.agent.state import AgentEvent
+
+# event types (documented contract for clients)
+EV_SESSION = "session"
+EV_STATUS = "status"
+EV_ROUTE = "route"
+EV_TOOL = "tool"
+EV_TOKEN = "token"
+EV_CITATION = "citation"
+EV_DONE = "done"
+EV_ERROR = "error"
 
 
-def sse_event(event: str, data: dict) -> str:
-    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+def format_sse(event_type: str, data: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
 
 
-def stream_turn(orchestrator: Orchestrator, message: str, session_id: str | None = None) -> Iterator[str]:
-    for kind, payload in orchestrator.stream_events(message, session_id=session_id):
-        yield sse_event(kind, payload)
+def comment(text: str) -> str:
+    """SSE comment line (used as keep-alive)."""
+    return f": {text}\n\n"
+
+
+async def sse_from_events(events: AsyncIterator[AgentEvent]) -> AsyncIterator[str]:
+    yield comment("stream open")
+    async for ev in events:
+        yield format_sse(ev.type, ev.data)
+
+
+__all__ = [
+    "format_sse",
+    "comment",
+    "sse_from_events",
+    "EV_SESSION",
+    "EV_STATUS",
+    "EV_ROUTE",
+    "EV_TOOL",
+    "EV_TOKEN",
+    "EV_CITATION",
+    "EV_DONE",
+    "EV_ERROR",
+]

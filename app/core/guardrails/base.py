@@ -1,22 +1,39 @@
-"""Guardrail verdict + interfaces."""
+"""Guardrail primitives: detectors return verdicts; pipelines compose them."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
+from enum import Enum
+from typing import Any, Protocol
+
+from pydantic import BaseModel, Field
 
 
-@dataclass(slots=True)
-class GuardrailVerdict:
-    allowed: bool
-    category: str = "safe"
+class Action(str, Enum):
+    ALLOW = "allow"
+    REDACT = "redact"   # transform text, continue
+    BLOCK = "block"     # stop; caller returns a safe response
+
+
+class GuardrailVerdict(BaseModel):
+    detector: str
+    action: Action = Action.ALLOW
     reason: str = ""
-    redacted_text: str | None = None
+    text: str | None = None  # transformed text when action == REDACT
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class InputGuardrail(Protocol):
-    def run(self, text: str, ctx=None) -> GuardrailVerdict: ...
+class GuardrailResult(BaseModel):
+    blocked: bool = False
+    text: str = ""                      # possibly redacted/replaced
+    reasons: list[str] = Field(default_factory=list)
+    verdicts: list[GuardrailVerdict] = Field(default_factory=list)
+    flags: dict[str, Any] = Field(default_factory=dict)
 
 
-class OutputGuardrail(Protocol):
-    def run(self, answer: str, citations: list[str], ctx=None) -> GuardrailVerdict: ...
+class Detector(Protocol):
+    name: str
+
+    async def check(self, text: str, ctx: Any) -> GuardrailVerdict: ...
+
+
+__all__ = ["Action", "GuardrailVerdict", "GuardrailResult", "Detector"]

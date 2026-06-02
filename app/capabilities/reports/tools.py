@@ -1,47 +1,67 @@
 """Reports module tools.
 
-Increment 1 wraps the existing, security-reviewed MCP tool functions
-(app/mcp_server/tools.py) as chassis Tool objects. The legacy implementations —
-RBAC checks, citations, PII redaction — are reused unchanged; only the boundary
-is adapted: a raised legacy ToolError becomes a chassis ToolException, which
-Tool.run() turns into a ToolError value (errors-as-data). See plan §16.
+Retrieval (RAG) is provided by the module's retriever; these are *targeted*
+structured tools over the same org-scoped corpus. They pull the live pipeline
+from ``ctx.deps.rag`` — no global state, fully tenant-isolated.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from pydantic import BaseModel, Field
 
-from app.core.contracts import Tool, ToolContext, ToolException
-from app.mcp_server import tools as legacy
-
-
-def _adapt(name: str) -> Callable[[dict[str, Any], ToolContext], dict[str, Any]]:
-    def handler(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-        try:
-            return legacy.call_tool(name, args, ctx.user, ctx.store)
-        except legacy.ToolError as exc:
-            raise ToolException(str(exc), code=exc.code) from exc
-
-    return handler
+from app.core.contracts import ToolContext, ToolError, ToolResult, tool
+from app.core.rag.vector_store import SearchFilters
 
 
-def _build_tools() -> list[Tool]:
-    definitions = {d["name"]: d for d in legacy.tool_definitions()}
-    tools: list[Tool] = []
-    for name in legacy.TOOL_ORDER:
-        definition = definitions[name]
-        tools.append(
-            Tool(
-                name=definition["name"],
-                description=definition["description"],
-                input_schema=definition["inputSchema"],
-                handler=_adapt(name),
-                # Every current report tool needs AI/RAG query access, which is
-                # analyst+ in the RBAC model (viewers may read but not query).
-                rbac_role="analyst",
-            )
-        )
-    return tools
+class MetadataArgs(BaseModel):
+    doc_id: str = Field(description="The report/document id, e.g. 'R-1042'.")
 
 
-REPORT_TOOLS: list[Tool] = _build_tools()
+class ExpiringArgs(BaseModel):
+    query: str = Field(default="expiring certificate renewal deadline", description="What to scan for.")
+    horizon_days: int = Field(default=90, description="Look-ahead window in days.")
+
+
+@tool(
+    name="get_report_metadata",
+    description="Fetch metadata (title, date, section count) for a specific report by its doc_id.",
+    args_schema=MetadataArgs,
+    rbac_role="viewer",
+)
+async def get_report_metadata(args: MetadataArgs, ctx: ToolContext):
+    chunks = await ctx.deps.rag.retrieve(
+        args.doc_id, collection="reports_kb", ctx=ctx, top_k=25,
+        filters=SearchFilters(doc_ids=[args.doc_id]), apply_time_filters=False,
+    )
+    if not chunks:
+        return ToolError(code="not_found", message=f"no report '{args.doc_id}' for this org")
+    first = chunks[0]
+    return ToolResult(
+        data={"doc_id": args.doc_id, "title": first.title,
+              "published_at": first.published_at, "sections": len(chunks),
+              "source": first.source},
+        citations=[first.to_citation()],
+    )
+
+
+@tool(
+    name="find_expiring_items",
+    description="Surface time-sensitive items (e.g. expiring certificates, deadlines) from the reports corpus.",
+    args_schema=ExpiringArgs,
+    rbac_role="viewer",
+)
+async def find_expiring_items(args: ExpiringArgs, ctx: ToolContext):
+    chunks = await ctx.deps.rag.retrieve(
+        args.query, collection="reports_kb", ctx=ctx, top_k=6, apply_time_filters=False,
+    )
+    items = [{"doc_id": c.doc_id, "title": c.title, "snippet": c.text[:200],
+              "published_at": c.published_at} for c in chunks]
+    return ToolResult(
+        data={"items": items, "count": len(items), "horizon_days": args.horizon_days},
+        citations=[c.to_citation() for c in chunks[:3]],
+    )
+
+
+TOOLS = (get_report_metadata, find_expiring_items)
+
+__all__ = ["TOOLS", "get_report_metadata", "find_expiring_items"]

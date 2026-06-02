@@ -1,42 +1,100 @@
-"""Lane router: maps fast/standard/deep to LLM clients (plan §14).
+"""Lane router + LLM factory.
 
-The planner emits a `lane`; this returns the client for it. With the default
-deterministic provider all lanes share one client (local dev). With
-LLM_PROVIDER=sglang each lane maps to its model (Qwen 7B / Qwen 72B /
-DeepSeek-V3.1). The deep lane is opt-in and should be quota-capped in admission
-control (plan §13.3).
+``LaneRouter`` is the single handle the agent uses; it forwards to the configured
+client and picks a lane per task (route/summarize -> fast, answer -> standard,
+deep analysis -> deep). ``build_llm(settings)`` wires the provider.
 """
 
 from __future__ import annotations
 
-from app.config import settings
-from app.llm.client import LLMClient, get_llm_client
+from collections.abc import AsyncIterator, Sequence
 
-
-class Lane:
-    FAST = "fast"
-    STANDARD = "standard"
-    DEEP = "deep"
-
-
-def _build_clients() -> dict[str, LLMClient]:
-    provider = settings.llm_provider.lower()
-    if provider == "sglang":
-        from app.core.llm.sglang_client import SGLangClient
-
-        return {
-            Lane.FAST: SGLangClient(settings.sglang_base_url, settings.sglang_model_fast),
-            Lane.STANDARD: SGLangClient(settings.sglang_base_url, settings.sglang_model_standard),
-            Lane.DEEP: SGLangClient(settings.sglang_base_url, settings.sglang_model_deep),
-        }
-    # deterministic / ollama / vllm: one client serves every lane
-    client = get_llm_client()
-    return {Lane.FAST: client, Lane.STANDARD: client, Lane.DEEP: client}
+from app.config import Settings
+from app.core.llm.base import ChatMessage, Lane, LLMClient, LLMResponse, LLMToolSpec
 
 
 class LaneRouter:
-    def __init__(self, clients: dict[str, LLMClient] | None = None):
-        self._clients = clients or _build_clients()
+    def __init__(self, client: LLMClient) -> None:
+        self.client = client
+        self.provider = getattr(client, "provider", "unknown")
 
-    def client_for(self, lane: str) -> LLMClient:
-        return self._clients.get(lane, self._clients[Lane.STANDARD])
+    @staticmethod
+    def choose_lane(task: str) -> Lane:
+        return {
+            "route": Lane.FAST,
+            "rewrite": Lane.FAST,
+            "summarize": Lane.FAST,
+            "answer": Lane.STANDARD,
+            "deep": Lane.DEEP,
+        }.get(task, Lane.STANDARD)
+
+    async def complete(
+        self, messages: Sequence[ChatMessage], *, lane: Lane = Lane.STANDARD, **kw
+    ) -> LLMResponse:
+        return await self.client.complete(messages, lane=lane, **kw)
+
+    def stream(
+        self, messages: Sequence[ChatMessage], *, lane: Lane = Lane.STANDARD, **kw
+    ) -> AsyncIterator[str]:
+        return self.client.stream(messages, lane=lane, **kw)
+
+    async def complete_with_tools(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[LLMToolSpec],
+        *,
+        lane: Lane = Lane.STANDARD,
+        tool_choice: str = "auto",
+        **kw,
+    ) -> LLMResponse:
+        return await self.client.complete_with_tools(
+            messages, tools, lane=lane, tool_choice=tool_choice, **kw
+        )
+
+    async def aclose(self) -> None:
+        await self.client.aclose()
+
+
+def build_llm(settings: Settings) -> LaneRouter:
+    provider = settings.llm_provider
+    if provider == "deterministic":
+        from app.core.llm.deterministic import DeterministicLLM
+
+        return LaneRouter(DeterministicLLM(settings))
+
+    from app.core.llm.openai_compat import OpenAICompatClient
+
+    if provider == "sglang":
+        client = OpenAICompatClient(
+            base_url=settings.sglang_base_url,
+            api_key=settings.sglang_api_key,
+            lane_models={
+                Lane.FAST: settings.model_fast,
+                Lane.STANDARD: settings.model_standard,
+                Lane.DEEP: settings.model_deep,
+            },
+            provider="sglang",
+            default_temperature=settings.llm_temperature,
+            default_max_tokens=settings.llm_max_tokens,
+            timeout=settings.llm_timeout_seconds,
+        )
+        return LaneRouter(client)
+
+    if provider == "openai":
+        client = OpenAICompatClient(
+            base_url=settings.openai_base_url,
+            api_key=settings.openai_api_key,
+            lane_models={lane: settings.openai_model for lane in Lane},
+            provider="openai",
+            default_temperature=settings.llm_temperature,
+            default_max_tokens=settings.llm_max_tokens,
+            timeout=settings.llm_timeout_seconds,
+        )
+        return LaneRouter(client)
+
+    from app.core.errors import ConfigError
+
+    raise ConfigError(f"unknown llm_provider: {provider}")
+
+
+__all__ = ["LaneRouter", "build_llm"]

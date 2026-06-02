@@ -1,2 +1,22 @@
-"""Inference lanes (plan §14). Self-hosted SGLang clients (OpenAI-compatible)
-behind a lane router (fast/standard/deep); deterministic default for local dev."""
+"""LLM lanes: provider-agnostic client contract + deterministic / SGLang / OpenAI."""
+
+from app.core.llm.base import (
+    ChatMessage,
+    Lane,
+    LLMClient,
+    LLMResponse,
+    LLMToolCall,
+    LLMToolSpec,
+)
+from app.core.llm.lanes import LaneRouter, build_llm
+
+__all__ = [
+    "ChatMessage",
+    "Lane",
+    "LLMClient",
+    "LLMResponse",
+    "LLMToolCall",
+    "LLMToolSpec",
+    "LaneRouter",
+    "build_llm",
+]

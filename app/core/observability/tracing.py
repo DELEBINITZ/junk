@@ -1,72 +1,71 @@
-"""Tracing (plan §12). No-op by default; Langfuse adapter when
-OBSERVABILITY_PROVIDER=langfuse (lazy-imported, fails open to no-op).
+"""Tracing seam — NoOp by default, Langfuse when configured.
 
-Usage:
-    with get_tracer().span("agent.query", org_id=..., trace_id=...):
-        ...
-Every span carries org_id so per-org cost/usage can be rolled up later.
+Every turn/tool/LLM call can open a span; in prod Langfuse records the full
+trace. The NoOp keeps the hot path dependency-free.
 """
 
 from __future__ import annotations
 
-import logging
-import os
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
-
-from app.config import settings
+from typing import Any
 
 
-logger = logging.getLogger(__name__)
+class NoOpSpan:
+    def set(self, **_: Any) -> None: ...
+    def event(self, *_: Any, **__: Any) -> None: ...
 
 
 class NoOpTracer:
+    provider = "none"
+
     @contextmanager
-    def span(self, name: str, **attrs) -> Iterator[None]:
-        yield None
+    def span(self, name: str, **attrs: Any) -> Iterator[NoOpSpan]:
+        yield NoOpSpan()
+
+    def event(self, name: str, **attrs: Any) -> None: ...
+
+    async def aclose(self) -> None: ...
 
 
-class LangfuseTracer:  # pragma: no cover - exercised only when configured
-    def __init__(self):
+class LangfuseTracer:
+    provider = "langfuse"
+
+    def __init__(self, host: str, public_key: str, secret_key: str) -> None:
         from langfuse import Langfuse  # lazy
 
-        self._client = Langfuse()
+        self._lf = Langfuse(host=host or None, public_key=public_key, secret_key=secret_key)
 
     @contextmanager
-    def span(self, name: str, **attrs) -> Iterator[None]:
-        trace = None
+    def span(self, name: str, **attrs: Any) -> Iterator[Any]:
+        span = None
         try:
-            trace = self._client.trace(name=name, metadata=attrs)
-        except Exception as exc:
-            logger.warning("tracing.langfuse_failed", extra={"error": str(exc)})
-        try:
-            yield None
+            span = self._lf.span(name=name, metadata=attrs)
+            yield span
         finally:
-            if trace is not None:
-                try:
-                    trace.update(output="ok")
-                except Exception:
-                    pass
-
-
-_tracer = None
-
-
-def get_tracer():
-    global _tracer
-    if _tracer is None:
-        provider = os.getenv("OBSERVABILITY_PROVIDER", settings.observability_provider).lower()
-        if provider == "langfuse":
             try:
-                _tracer = LangfuseTracer()
-            except Exception as exc:  # pragma: no cover
-                logger.warning("tracing.langfuse_unavailable", extra={"error": str(exc)})
-                _tracer = NoOpTracer()
-        else:
-            _tracer = NoOpTracer()
-    return _tracer
+                if span:
+                    span.end()
+            except Exception:
+                pass
+
+    def event(self, name: str, **attrs: Any) -> None:
+        try:
+            self._lf.event(name=name, metadata=attrs)
+        except Exception:
+            pass
+
+    async def aclose(self) -> None:
+        try:
+            self._lf.flush()
+        except Exception:
+            pass
 
 
-def reset_tracer() -> None:
-    global _tracer
-    _tracer = None
+def build_tracer(settings):
+    if settings.tracing_provider == "langfuse" and settings.langfuse_public_key:
+        return LangfuseTracer(settings.langfuse_host, settings.langfuse_public_key, settings.langfuse_secret_key)
+    return NoOpTracer()
+
+
+__all__ = ["NoOpTracer", "LangfuseTracer", "build_tracer"]

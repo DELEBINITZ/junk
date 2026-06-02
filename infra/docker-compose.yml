@@ -1,0 +1,105 @@
+# Local/self-hosted stack. Profiles let you bring up only what you need:
+#   docker compose up                          -> app + postgres + redis + qdrant (CPU, no GPU)
+#   docker compose --profile rag up            -> + TEI embeddings & reranker
+#   docker compose --profile gpu up            -> + SGLang (Qwen) — needs NVIDIA GPUs
+#   docker compose --profile observability up  -> + Langfuse
+#
+# The app runs fully without any of these (deterministic path); turn providers on
+# via the env below as each backend comes up.
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    ports: ["8000:8000"]
+    environment:
+      ENVIRONMENT: prod
+      # --- stores ---
+      STORE_BACKEND: postgres
+      DATABASE_URL: postgresql://asi:asi@postgres:5432/asi
+      CACHE_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+      # --- retrieval ---
+      RETRIEVAL_BACKEND: qdrant
+      QDRANT_URL: http://qdrant:6333
+      # --- providers (flip on when rag/gpu profiles are up) ---
+      LLM_PROVIDER: deterministic        # set 'sglang' with the gpu profile
+      SGLANG_BASE_URL: http://sglang:30000/v1
+      EMBEDDING_PROVIDER: deterministic  # set 'tei' with the rag profile
+      TEI_EMBED_URL: http://tei-embed:80
+      RERANK_ENABLED: "false"            # set true + RERANK_PROVIDER=tei with rag profile
+      TEI_RERANK_URL: http://tei-rerank:80
+      AGENT_ENGINE: langgraph
+      # --- security (CHANGE THESE) ---
+      JWT_SECRET: change-me-in-prod-use-a-32-byte-secret-value
+      CAP_REPORTS_ENABLED: "true"
+      CAP_EASM_ENABLED: "true"
+      SEED_DEMO_DATA: "false"
+    depends_on: [postgres, redis, qdrant]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: asi
+      POSTGRES_PASSWORD: asi
+      POSTGRES_DB: asi
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U asi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["6333:6333"]
+    volumes: ["qdrantdata:/qdrant/storage"]
+
+  # ---- RAG model servers (profile: rag) ----
+  tei-embed:
+    profiles: ["rag"]
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    command: ["--model-id", "Qwen/Qwen3-Embedding-0.6B"]   # swap to 8B on GPU image
+    ports: ["8080:80"]
+
+  tei-rerank:
+    profiles: ["rag"]
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    command: ["--model-id", "BAAI/bge-reranker-base"]      # swap to Qwen3-Reranker on GPU
+    ports: ["8081:80"]
+
+  # ---- LLM (profile: gpu) ----
+  sglang:
+    profiles: ["gpu"]
+    image: lmsysorg/sglang:latest
+    command: >
+      python3 -m sglang.launch_server
+      --model-path Qwen/Qwen2.5-7B-Instruct
+      --host 0.0.0.0 --port 30000
+    ports: ["30000:30000"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: all, capabilities: [gpu] }]
+
+  # ---- Observability (profile: observability) ----
+  langfuse:
+    profiles: ["observability"]
+    image: langfuse/langfuse:2
+    environment:
+      DATABASE_URL: postgresql://asi:asi@postgres:5432/asi
+      NEXTAUTH_SECRET: change-me
+      SALT: change-me
+      NEXTAUTH_URL: http://localhost:3000
+    ports: ["3000:3000"]
+    depends_on: [postgres]
+
+volumes:
+  pgdata:
+  qdrantdata:

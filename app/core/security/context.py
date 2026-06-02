@@ -1,22 +1,36 @@
-"""Build the trusted per-call ToolContext from the authenticated user.
+"""The trusted per-request identity.
 
-org_id always comes from the verified User (derived from the JWT), never from
-request/tool arguments — the single rule that keeps tenancy safe (plan §8.2).
+A :class:`SecurityContext` is built once, from a *verified* token (local JWT or
+OIDC), and threaded everywhere. Tools receive a derived ``ToolContext`` whose
+``org_id`` comes from here — never from tool arguments — so a prompt can never
+talk the agent into crossing tenants.
 """
 
 from __future__ import annotations
 
-from uuid import uuid4
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
 
-from app.core.contracts import ToolContext
-from app.domain import User
+from app.core.contracts import role_satisfies
 
 
-def build_tool_context(user: User, store, trace_id: str | None = None, kg=None) -> ToolContext:
-    return ToolContext(
-        org_id=user.organization_id,
-        user=user,
-        trace_id=trace_id or str(uuid4()),
-        store=store,
-        kg=kg,
-    )
+@dataclass(frozen=True)
+class SecurityContext:
+    org_id: str
+    user_id: str
+    roles: tuple[str, ...]
+    email: str = ""
+    token_id: str = ""  # jti, for revocation / audit
+    claims: Mapping[str, Any] = field(default_factory=dict)
+
+    def has_role(self, minimum: str) -> bool:
+        return role_satisfies(self.roles, minimum)
+
+    def require_org(self) -> str:
+        if not self.org_id:
+            raise ValueError("security context has no org_id")
+        return self.org_id
+
+
+__all__ = ["SecurityContext"]

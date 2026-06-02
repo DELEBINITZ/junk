@@ -1,137 +1,207 @@
-"""The agent graph's nodes (plan §6).
+"""The agent graph nodes (engine-agnostic).
 
-Pipeline: load_session_state -> input_guardrail -> persist_user ->
-(refusal | plan_route) -> retrieve -> answer -> output_guardrail ->
-persist_assistant -> END.
+Flow: input_guardrail -> route -> dispatch -> synthesize(answer) -> output_guardrail.
 
-Nodes are closures over an AgentContext. Behavior matches the original
-orchestrator (refusal on injection, no-access for viewers, grounded cited
-answers); answer composition is shared with the streaming path via answering.py.
+``route`` (the supervisor) picks the relevant module(s) from manifest hints.
+``dispatch`` runs ONE specialist per routed module **in parallel**, each scoped
+to its own module's tools (so tool schemas never co-locate — this is what lets
+the platform scale to many modules / hundreds of tools). ``answer`` is the single
+synthesize step that joins the specialists' findings and cites across pillars.
+
+Each node takes the shared state dict + the bound :class:`AgentContext` and
+returns a partial update; the same functions back both engines.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
 from typing import Any
 
-from app.core.agent.answering import (
-    NO_ACCESS_MESSAGE,
-    REFUSAL_MESSAGE,
-    compose_grounded,
-    finalize_answer,
+from app.core.agent.graph import END, StateGraph
+from app.core.agent.specialist import build_specialist, relevance_rank
+from app.core.agent.state import (
+    N_ANSWER,
+    N_GATHER,
+    N_INPUT_GUARD,
+    N_OUTPUT_GUARD,
+    N_ROUTE,
+    AgentContext,
+    ChatState,
 )
-from app.core.agent.graph import END, Graph
-from app.core.contracts import ToolContext, ToolResult, is_error
-from app.core.guardrails.pipeline import InputGuardrailPipeline, OutputGuardrailPipeline
-from app.core.llm.lanes import LaneRouter
-from app.core.registry import CapabilityRegistry
-from app.core.router import Router
-from app.db.repository import DataStore
-from app.domain import User
+from app.core.contracts import Chunk
+from app.core.llm.base import CONTEXT_MARKER, ChatMessage, Lane
+
+MAX_CONTEXT_ENTRIES = 8
+BASE_SYSTEM = (
+    "You are a security-intelligence analyst assistant. Answer the user's "
+    "question USING ONLY the retrieved context below. Cite every claim with its "
+    "source marker like [1]. If the context does not contain the answer, say you "
+    "don't have enough grounded information — never guess. Be concise and precise."
+)
 
 
-@dataclass
-class AgentContext:
-    user: User
-    store: DataStore
-    registry: CapabilityRegistry
-    router: Router
-    conversations: Any
-    input_guard: InputGuardrailPipeline
-    output_guard: OutputGuardrailPipeline
-    lanes: LaneRouter
-    trace_id: str
-    max_top_k: int = 5
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+def build_answer_messages(state: ChatState, ctx: AgentContext) -> list[ChatMessage]:
+    persona = BASE_SYSTEM
+    routed = state.get("route_modules") or []
+    # prepend the first routed module's persona for tone/domain
+    for mid in routed:
+        mod = ctx.registry.module(mid)
+        if mod and mod.prompt_text:
+            persona = f"{BASE_SYSTEM}\n\n{mod.prompt_text}"
+            break
 
-    def tool_context(self) -> ToolContext:
-        return ToolContext(
-            org_id=self.user.organization_id, user=self.user,
-            trace_id=self.trace_id, store=self.store,
-        )
+    messages = [ChatMessage(role="system", content=persona)]
+    if state.get("summary"):
+        messages.append(ChatMessage(role="system", content=f"Conversation summary so far: {state['summary']}"))
+    for turn in (state.get("history") or [])[-6:]:
+        role = turn.get("role", "user")
+        if role in ("user", "assistant"):
+            messages.append(ChatMessage(role=role, content=turn.get("content", "")))
+
+    context_block = state.get("context_block") or "(no sources retrieved)"
+    # Context goes in its own system message; the user message is the bare
+    # question — keeps instruction/data separation clean and prevents the answer
+    # model from treating retrieved text as part of the question.
+    messages.append(ChatMessage(
+        role="system",
+        content=f"{CONTEXT_MARKER} (cite as [n]; if it lacks the answer, say so):\n{context_block}",
+    ))
+    messages.append(ChatMessage(role="user", content=state.get("safe_question") or state.get("question", "")))
+    return messages
 
 
-def build_report_graph(ctx: AgentContext) -> Graph:
-    def load_session_state(state):
-        session_id = state.get("session_id")
-        history = ctx.conversations.recent_history(ctx.user, session_id, k=6) if session_id else []
-        return {"history": [m.role for m in history]}
+# --------------------------------------------------------------------------- #
+# nodes
+# --------------------------------------------------------------------------- #
+async def input_guardrail_node(state: ChatState, ctx: AgentContext) -> dict:
+    await ctx.fire("status", stage="input_guardrail")
+    res = await ctx.input_guard.run(state.get("question", ""), ctx.sc)
+    if res.blocked:
+        await ctx.fire("status", stage="blocked", reason=(res.reasons or ["blocked"])[0])
+        return {"blocked": True, "block_reason": (res.reasons or ["blocked"])[0],
+                "answer": res.text, "safe_question": state.get("question", "")}
+    return {"blocked": False, "safe_question": res.text}
 
-    def input_guardrail(state):
-        verdict = ctx.input_guard.run(state["user_message"])
-        update = {"rewritten_query": verdict.redacted_text or state["user_message"]}
-        if not verdict.allowed:
-            update.update(refused=True, final_answer=REFUSAL_MESSAGE,
-                          guardrail_violations=[verdict.category])
-        else:
-            update["refused"] = False
-        return update
 
-    def persist_user(state):
-        message = ctx.conversations.append(ctx.user, state.get("session_id"), "user", state["rewritten_query"])
-        return {"session_id": message.session_id}
+async def route_node(state: ChatState, ctx: AgentContext) -> dict:
+    rr = await ctx.supervisor.route(state.get("safe_question", ""), ctx.sc)
+    await ctx.fire("route", modules=rr.modules, mode=rr.mode, fallback=rr.fallback)
+    return {"route_modules": rr.modules,
+            "route_debug": {"scores": rr.scores, "mode": rr.mode, "fallback": rr.fallback}}
 
-    def plan_route(state):
-        decision = ctx.router.route(state["rewritten_query"], ctx.user)
-        return {
-            "route_module_ids": decision.module_ids,
-            "route_tool_names": decision.tool_names,
-            "lane": decision.lane,
-        }
 
-    def retrieve(state):
-        if "search_contracts" not in state.get("route_tool_names", []):
-            return {"no_access": True, "tool_calls": [], "retrieved": []}
-        tool = ctx.registry.tool("search_contracts")
-        result = tool.run({"query": state["rewritten_query"], "top_k": ctx.max_top_k}, ctx.tool_context())
-        call = {"tool": "search_contracts", "ok": not is_error(result), "code": getattr(result, "code", 200)}
-        retrieved = result.data.get("matches", []) if isinstance(result, ToolResult) else []
-        return {"no_access": False, "tool_calls": [call], "retrieved": retrieved,
-                "retrieve_error": None if isinstance(result, ToolResult) else result.message}
+async def dispatch_node(state: ChatState, ctx: AgentContext) -> dict:
+    """Dispatch one specialist per routed module IN PARALLEL. Each specialist is
+    scoped to its own module's tools (no cross-module tool-schema bloat). Their
+    findings are merged, ranked by relevance, and capped into one org-scoped
+    context block for the single synthesize step."""
+    question = state.get("safe_question", "")
+    modules = [ctx.registry.module(mid) for mid in (state.get("route_modules") or [])]
+    modules = [m for m in modules if m and m.enabled]
+    await ctx.fire("status", stage="dispatching", specialists=[m.id for m in modules])
 
-    def answer(state):
-        if state.get("no_access"):
-            return {"final_answer": NO_ACCESS_MESSAGE, "citations": []}
-        if state.get("retrieve_error"):
-            return {"final_answer": f"Could not retrieve reports: {state['retrieve_error']}", "citations": []}
-        grounded, citations = compose_grounded(state.get("retrieved", []), ctx.max_top_k)
-        client = ctx.lanes.client_for(state.get("lane", "standard"))
-        text = finalize_answer(client, state["rewritten_query"], grounded)
-        return {"final_answer": text, "citations": citations}
-
-    def output_guardrail(state):
-        verdict = ctx.output_guard.run(state.get("final_answer", ""), state.get("citations", []))
-        return {"final_answer": verdict.redacted_text or state.get("final_answer", "")}
-
-    def persist_assistant(state):
-        ctx.conversations.append(ctx.user, state["session_id"], "assistant",
-                                 state.get("final_answer", ""), state.get("citations", []))
-        return {}
-
-    def refusal(state):
-        return {"final_answer": state.get("final_answer") or REFUSAL_MESSAGE}
-
-    return Graph(
-        entry="load_session_state",
-        nodes={
-            "load_session_state": load_session_state,
-            "input_guardrail": input_guardrail,
-            "persist_user": persist_user,
-            "plan_route": plan_route,
-            "retrieve": retrieve,
-            "answer": answer,
-            "output_guardrail": output_guardrail,
-            "persist_assistant": persist_assistant,
-            "refusal": refusal,
-        },
-        edges={
-            "load_session_state": "input_guardrail",
-            "input_guardrail": "persist_user",
-            "persist_user": lambda s: "refusal" if s.get("refused") else "plan_route",
-            "refusal": END,
-            "plan_route": "retrieve",
-            "retrieve": "answer",
-            "answer": "output_guardrail",
-            "output_guardrail": "persist_assistant",
-            "persist_assistant": END,
-        },
+    specialists = [build_specialist(m, ctx.deps, ctx.mcp) for m in modules]
+    results = await asyncio.gather(
+        *[sp.investigate(question, ctx.tool_ctx) for sp in specialists],
+        return_exceptions=True,
     )
+
+    chunks: list[Chunk] = []
+    events: list[dict] = []
+    for module, res in zip(modules, results, strict=False):
+        if isinstance(res, Exception):
+            events.append({"module": module.id, "ok": False, "error": str(res)})
+            continue
+        chunks.extend(res.chunks)
+        events.extend(res.events)
+        await ctx.fire("tool", module=module.id, ok=True, found=len(res.chunks))
+
+    chunks = relevance_rank(chunks, question, MAX_CONTEXT_ENTRIES)
+    block = "\n".join(f"[{i + 1}] {c.text}" for i, c in enumerate(chunks))
+    await ctx.fire("status", stage="retrieved", count=len(chunks))
+    return {"context_chunks": chunks, "context_block": block, "tool_events": events}
+
+
+async def answer_node(state: ChatState, ctx: AgentContext) -> dict:
+    await ctx.fire("status", stage="answering")
+    messages = build_answer_messages(state, ctx)
+    llm = ctx.deps.llm
+    lane = Lane.STANDARD
+    if ctx.stream_tokens and ctx.emit is not None:
+        buf: list[str] = []
+        async for tok in llm.stream(messages, lane=lane):
+            buf.append(tok)
+            await ctx.fire("token", text=tok)
+        text = "".join(buf)
+    else:
+        resp = await llm.complete(messages, lane=lane)
+        text = resp.text
+
+    chunks: list[Chunk] = state.get("context_chunks") or []
+    from app.core.rag.citations import extract_citation_indices
+
+    cited = extract_citation_indices(text)
+    citations = []
+    for i in cited:
+        if 1 <= i <= len(chunks):
+            cit = chunks[i - 1].to_citation()
+            citations.append({"n": i, **cit.model_dump()})
+    return {"answer": text, "citations": citations, "lane": lane.value}
+
+
+async def output_guardrail_node(state: ChatState, ctx: AgentContext) -> dict:
+    await ctx.fire("status", stage="output_guardrail")
+    res = await ctx.output_guard.run(state.get("answer", ""), state.get("context_chunks") or [], ctx.sc)
+    updates: dict[str, Any] = {"answer": res.text, "output_flags": res.flags}
+    if res.blocked:
+        updates["citations"] = []
+    return updates
+
+
+# --------------------------------------------------------------------------- #
+# graph assembly (internal engine)
+# --------------------------------------------------------------------------- #
+def build_report_graph(ctx: AgentContext):
+    g = StateGraph()
+    g.add_node(N_INPUT_GUARD, lambda s: input_guardrail_node(s, ctx))
+    g.add_node(N_ROUTE, lambda s: route_node(s, ctx))
+    g.add_node(N_GATHER, lambda s: dispatch_node(s, ctx))
+    g.add_node(N_ANSWER, lambda s: answer_node(s, ctx))
+    g.add_node(N_OUTPUT_GUARD, lambda s: output_guardrail_node(s, ctx))
+
+    g.set_entry(N_INPUT_GUARD)
+    g.add_conditional_edges(
+        N_INPUT_GUARD,
+        lambda s: "blocked" if s.get("blocked") else "ok",
+        {"blocked": END, "ok": N_ROUTE},
+    )
+    g.add_edge(N_ROUTE, N_GATHER)
+    g.add_edge(N_GATHER, N_ANSWER)
+    g.add_edge(N_ANSWER, N_OUTPUT_GUARD)
+    g.add_edge(N_OUTPUT_GUARD, END)
+    return g.compile()
+
+
+# node specs reused by the LangGraph engine
+NODE_SPECS = [
+    (N_INPUT_GUARD, input_guardrail_node),
+    (N_ROUTE, route_node),
+    (N_GATHER, dispatch_node),
+    (N_ANSWER, answer_node),
+    (N_OUTPUT_GUARD, output_guardrail_node),
+]
+
+
+__all__ = [
+    "build_report_graph",
+    "build_answer_messages",
+    "NODE_SPECS",
+    "input_guardrail_node",
+    "route_node",
+    "dispatch_node",
+    "answer_node",
+    "output_guardrail_node",
+]
