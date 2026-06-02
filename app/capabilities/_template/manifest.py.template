@@ -1,0 +1,25 @@
+"""Manifest for the <feature> capability. Rename to manifest.py."""
+
+from __future__ import annotations
+
+from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
+from app.capabilities.<feature>.tools import TOOLS
+
+
+MANIFEST = CapabilityManifest(
+    id="<feature>",                         # must be a valid python identifier
+    version="0.1.0",
+    display_name="<Human Readable Name>",
+    tools=TOOLS,                            # 3-6 typed tools
+    routing_hints=[
+        RoutingHint(
+            intents=["<keyword>", "<keyword>"],
+            examples=["<example user question>"],
+        )
+    ],
+    license_tiers=["<feature>", "platform"],
+    default_autonomy=Autonomy.READ,         # READ for query-only modules
+    rbac={"<tool_name>": "analyst"},        # min role per tool
+    owners=["team-<feature>"],
+    min_core_version="1.0.0",
+)

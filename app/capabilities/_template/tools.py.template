@@ -1,0 +1,37 @@
+"""Tools for the <feature> capability. Rename to tools.py.
+
+A module that exposes its data through its own MCP server (e.g. easm-mcp,
+aci-mcp) would have these handlers call that server via a remote MCP client
+instead of an in-process backend. Either way the Tool contract is identical.
+See plan §6.4.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.core.contracts import Tool, ToolContext, ToolException
+
+
+def _query_example(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    # ctx.org_id / ctx.user come from the verified JWT — scope every backend
+    # query by ctx.org_id. Never trust an org id passed in `args`.
+    # raise ToolException("not connected", code=503) for expected failures.
+    return {"results": [], "org_id": ctx.org_id}
+
+
+TOOLS: list[Tool] = [
+    Tool(
+        name="<feature>_query",
+        description="One-line, action-oriented description the LLM reads to "
+        "decide when to call this tool.",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+        handler=_query_example,
+        rbac_role="analyst",
+        side_effecting=False,  # True -> routed through the approval gate
+    ),
+]
