@@ -1,8 +1,16 @@
-"""Demo corpus for the reports module (dev only).
+"""Demo corpus for the reports module (DEV/TEST ONLY — mock data).
 
-In production the external cron embeds reports into ``reports_kb``; this seed
-just makes the platform answerable out of the box and powers eval/tests. Two
-orgs are seeded so tenant isolation is demonstrable.
+The reports module is corpus-backed, so it needs documents in its vector store to
+have anything to retrieve. In PRODUCTION an external ingestion path (a cron / event
+bus, off the chat hot-path — see SourceEvent/IngestionConnector in contracts.py)
+embeds real reports into the ``reports_kb`` collection. This file is the stand-in:
+it indexes a small fixed set of synthetic reports so the platform answers out of the
+box and so the eval/test suite has deterministic ground truth.
+
+WHY TWO ORGS: the rows below are seeded under two DIFFERENT tenant keys
+(``org_acme`` and ``org_globex``). Because retrieval is org-scoped from the trusted
+context, an acme user can never retrieve globex's R-9001 — seeding both lets tests
+PROVE that tenant isolation actually holds end to end.
 """
 
 from __future__ import annotations
@@ -11,6 +19,10 @@ from app.capabilities.reports.manifest import REPORTS_COLLECTION
 from app.core.contracts import CoreDeps
 from app.core.rag.pipeline import IndexItem
 
+# Synthetic reports for tenant "org_acme". Each row is (doc_id, title, date, body).
+# These deliberately mirror the other modules' mock data (the same Confluence CVE,
+# lookalike domain, threat actor, leaked credentials) so a cross-module question can
+# be demonstrated. This is MOCK content — replaced by real ingested reports in prod.
 _ACME = [
     ("R-1001", "EASM scan: critical exposure", "2026-05-28",
      "EASM scan found the Confluence server admin.acme.test exposed to the internet and "
@@ -40,6 +52,8 @@ _ACME = [
      "is a historical record retained for audit."),
 ]
 
+# Synthetic reports for the SECOND tenant "org_globex". A distinct, smaller set —
+# the point is purely that it is a different org's data, never visible to org_acme.
 _GLOBEX = [
     ("R-9001", "EASM scan: exposed RDP", "2026-05-18",
      "Globex exposes Remote Desktop (RDP) on vpn.globex.test to the public internet, creating a "
@@ -50,6 +64,9 @@ _GLOBEX = [
 ]
 
 
+# Turn the plain (doc_id, title, date, text) rows into IndexItems the pipeline can
+# embed. Each report becomes one chunk here (id ``<doc_id>::0``) with its title folded
+# into the text; a real ingester would chunk long documents into many pieces.
 def _items(rows) -> list[IndexItem]:
     out = []
     for doc_id, title, date, text in rows:
@@ -61,6 +78,9 @@ def _items(rows) -> list[IndexItem]:
     return out
 
 
+# Index each org's items UNDER THAT ORG'S KEY. The second positional arg is the
+# tenant the chunks are stamped with — this is what scopes them, so acme and globex
+# end up isolated in the same collection. Called once at dev/test startup.
 async def seed_demo(deps: CoreDeps) -> None:
     await deps.rag.index(REPORTS_COLLECTION, "org_acme", _items(_ACME))
     await deps.rag.index(REPORTS_COLLECTION, "org_globex", _items(_GLOBEX))

@@ -1,8 +1,24 @@
-"""Reports capability manifest — the first (and reference) module.
+"""Reports capability manifest — the first (and reference) capability MODULE.
 
-Everything the platform needs to wire report-chat is declared here. With only
-this module registered, the supervisor behaves like today's single agent; adding
-EASM/Brand/ACI later changes nothing in core.
+WHAT A MODULE IS (read this first): a capability module is a self-contained
+"feature cartridge". This file is its MANIFEST — the single declarative object
+(:class:`CapabilityManifest`, defined in app/core/contracts.py) that tells the
+platform everything it needs to wire the feature in. The console (app/core) reads
+this manifest at boot and DERIVES all of its behaviour from it; you never edit
+core to add a module. See the "games console + cartridges" mental model at the
+top of contracts.py.
+
+WHAT THIS MODULE COVERS: question-answering over the security-report corpus.
+Unlike the tool-backed modules (easm/aci/brand), reports is a CORPUS-backed
+module — its evidence comes from a RAG document collection (see the retriever
+below), not from typed tools. The two structured tools it ships are just targeted
+shortcuts over that same corpus.
+
+HOW IT PLUGS IN: the registry discovers ``MANIFEST`` and wires it automatically.
+Enabling/disabling is purely a config flag (``cap_reports_enabled`` below) — no
+code change. With ONLY this module registered the supervisor routes everything
+here and the system behaves like a single agent; registering EASM/Brand/ACI later
+adds routing targets without touching core or this file.
 """
 
 from __future__ import annotations
@@ -11,13 +27,28 @@ from app.capabilities.reports.tools import TOOLS
 from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
 from app.core.rag.pipeline import CollectionRetriever
 
+# The name of this module's vector-store collection. Everything reports indexes or
+# retrieves lives under this collection (per-tenant isolation is layered on top via
+# org_id at query time — see the retriever and the tools).
 REPORTS_COLLECTION = "reports_kb"
 
+# The module's RAG binding (a :class:`Retriever` from contracts.py). It adapts the
+# shared retrieval pipeline to THIS module's collection, tagging every Chunk it
+# returns with ``source="reports"`` so provenance is preserved. The specialist
+# (specialist.py) calls ``retrieve`` on this during ``_retrieve`` to gather corpus
+# evidence; tenant scoping is applied from the trusted ToolContext, never the query.
 _retriever = CollectionRetriever(
     id="reports_kb_retriever", collection=REPORTS_COLLECTION, source="reports"
 )
 
+# The cartridge itself. Each field below maps to a core subsystem that the
+# platform DERIVES behaviour from — nothing here is "called" by you; the registry
+# reads it once at boot and wires the rest.
 MANIFEST = CapabilityManifest(
+    # ``id`` is the module's stable handle: the registry keys the module by it, the
+    # supervisor names it in routing decisions, and every Chunk/tool is stamped with
+    # it. ``version``/``display_name``/``description`` are metadata (the description
+    # also gives a human + the supervisor a one-line sense of scope).
     id="reports",
     version="1.0.0",
     display_name="Security Reports",
@@ -25,11 +56,27 @@ MANIFEST = CapabilityManifest(
         "Q&A over analyst- and AI-generated security reports — EASM scan results, "
         "brand-protection findings, threat-intel write-ups, and executive briefings."
     ),
+    # Licensing tiers this module belongs to (commercial packaging metadata).
     license_tiers=("platform", "reports"),
+    # DEPLOYMENT: the name of a Settings attribute. The registry only loads this
+    # module if that flag is truthy. This is the whole on/off switch — flip the
+    # config, no code change. ("" would mean "always enabled".)
     enabled_flag="cap_reports_enabled",
+    # AGENT / MCP surface: the tuple of Tools (from tools.py). The MCP boundary
+    # exposes exactly these to the agent, and the per-module specialist may only
+    # call THESE — tool isolation, the core scaling property (see specialist.py).
     tools=TOOLS,
+    # RAG: the module's retrievers. The specialist runs each one to pull corpus
+    # evidence. reports is corpus-backed, so it binds one; pure tool modules bind none.
     retrievers=(_retriever,),
+    # The module's own system prompt, given as a path RELATIVE to this module dir
+    # (resolves to app/capabilities/reports/prompts/v1.md). When this module is
+    # routed, answer_node prepends that text to the base persona for domain flavour.
     system_prompt="prompts/v1.md",
+    # SUPERVISOR ROUTING: the only signals the supervisor scores a question against
+    # to decide whether this module should handle it. ``intents`` are short phrases
+    # the module covers; ``examples`` are representative questions. No routing logic
+    # is ever hardcoded in core — it is entirely derived from these hints.
     routing_hints=(
         RoutingHint(
             intents=(
@@ -45,9 +92,17 @@ MANIFEST = CapabilityManifest(
             ),
         ),
     ),
+    # AUTONOMY: this module only READS (answers/recommends), it never acts. Compare
+    # with easm, which is SUGGEST because it ships a gated side-effecting tool.
     default_autonomy=Autonomy.READ,
+    # RBAC: per-tool minimum-role overrides, consumed by the MCP boundary before
+    # each call. Both reports tools are viewer-level (read-only Q&A). A tool's own
+    # ``rbac_role`` is the default; this map can tighten it per deployment.
     rbac={"get_report_metadata": "viewer", "find_expiring_items": "viewer"},
+    # Ownership metadata (who maintains the module) — informational only.
     owners=("team-reports",),
 )
 
+# Re-export the manifest (what the registry imports) and the collection name (used
+# by seed.py and the tools). Strictly the module's public surface.
 __all__ = ["MANIFEST", "REPORTS_COLLECTION"]

@@ -1,19 +1,27 @@
-"""Frozen contracts: the entire stable API surface between the core platform and
-capability modules.
+"""Frozen CONTRACTS: the entire stable API surface between the core platform and
+the capability modules.
 
-Nothing in ``app/core`` (except this file) should be edited to add a feature. A
-capability module implements the small set of Protocols / dataclasses declared
-here and registers a :class:`CapabilityManifest`; the platform discovers it and
-wires it automatically. These types are SemVer'd (see ``CONTRACTS_VERSION``):
-arg/return schemas are additive, breaking changes are a major bump.
+================================ MENTAL MODEL ==============================
+Think of the system as a games console (the "core") and game cartridges (the
+"capability modules": reports, easm, brand, aci, ...). THIS FILE is the shape of
+the cartridge slot. The console never changes to add a game; a cartridge just has
+to fit the slot. Concretely: nothing in ``app/core`` (except this file) should be
+edited to add a feature. A module implements the small set of Protocols /
+dataclasses declared here and registers a :class:`CapabilityManifest`; the
+platform discovers it and wires it automatically.
 
-Design rules encoded here:
-  * Tools never raise to the agent -> failures are returned as :class:`ToolError`
-    (errors-as-data).
-  * Every tool carries ``rbac_role`` (minimum role) and ``side_effecting`` (True
-    => the core action gate must approve before ``execute``).
-  * Tenant identity lives in :class:`ToolContext`, never in tool args, so a tool
-    cannot be tricked into crossing orgs.
+These types are SemVer'd (see ``CONTRACTS_VERSION``): adding optional fields is
+backward-compatible; removing/renaming is a breaking (major) change.
+
+THREE SAFETY RULES ARE ENCODED HERE — internalize these, they recur everywhere:
+  1. Errors-as-data: a tool NEVER raises into the agent. Failures come back as a
+     :class:`ToolError` value, so one bad tool can't crash a turn.
+  2. Every tool carries ``rbac_role`` (minimum role to call it) and
+     ``side_effecting`` (True => the human action gate must approve before it
+     runs). The agent can't escalate privilege or fire actions on its own.
+  3. Tenant identity lives in :class:`ToolContext`, derived from the verified
+     token — NEVER in tool args. A tool cannot be tricked into crossing orgs.
+===========================================================================
 """
 
 from __future__ import annotations
@@ -30,7 +38,8 @@ from typing import (
 
 from pydantic import BaseModel, Field
 
-# Bump on any change to the interfaces below. Modules declare ``min_core_version``.
+# Bump on ANY change to the interfaces below. Modules can declare the minimum
+# core version they require (``CapabilityManifest.min_core_version``).
 CONTRACTS_VERSION = "1.0.0"
 
 
@@ -38,24 +47,33 @@ CONTRACTS_VERSION = "1.0.0"
 # Roles & autonomy
 # --------------------------------------------------------------------------- #
 class Role(str, Enum):
-    """Ordered RBAC roles. Higher index => strictly more privilege."""
+    """Ordered RBAC roles. Higher index => strictly more privilege. Inheriting
+    from ``str`` too means a Role IS a string ("viewer"), so it serializes and
+    compares naturally in JWTs/JSON."""
 
     VIEWER = "viewer"
     ANALYST = "analyst"
     ADMIN = "admin"
 
 
+# The privilege ORDER, as numbers, so we can compare roles with >=.
 _ROLE_ORDER: dict[str, int] = {Role.VIEWER.value: 0, Role.ANALYST.value: 1, Role.ADMIN.value: 2}
 
 
 def role_satisfies(held: Iterable[str], required: str) -> bool:
-    """True if any held role meets or exceeds ``required`` in the role order."""
+    """True if ANY role the caller holds meets or exceeds ``required``. This one
+    function is the whole RBAC check — used by the MCP boundary before every tool
+    call and by the API role dependencies. An unknown held role scores -1 (never
+    satisfies); an unknown requirement scores 0 (viewer-level)."""
     need = _ROLE_ORDER.get(required, 0)
     return any(_ROLE_ORDER.get(str(r), -1) >= need for r in held)
 
 
 class Autonomy(str, Enum):
-    """How much a capability may act. See blueprint §10 (two-layer autonomy)."""
+    """How much a capability is allowed to ACT (separate from who can call it).
+    See the blueprint's two-layer autonomy model. Most things are READ today;
+    SUGGEST drafts an action a human approves; AUTO is reserved for deterministic
+    policies promoted only after their precision is proven in production."""
 
     READ = "read"        # answers / recommends only
     SUGGEST = "suggest"  # drafts an action a human approves (gated)
@@ -66,27 +84,31 @@ class Autonomy(str, Enum):
 # Retrieval primitives
 # --------------------------------------------------------------------------- #
 class Citation(BaseModel):
-    """A grounded reference attached to an answer or tool result."""
+    """A grounded reference attached to an answer or tool result. Citations are
+    how the UI shows "this claim came from THIS source" and how the output
+    guardrail checks the answer is actually backed by evidence."""
 
     doc_id: str
-    source: str = ""                 # e.g. "reports", "easm"
+    source: str = ""                 # which module produced it, e.g. "reports", "easm"
     title: str = ""
     section: str = ""
     snippet: str = ""
     score: float = 0.0
     url: str | None = None
-    published_at: str | None = None  # ISO-8601 when known (freshness)
+    published_at: str | None = None  # ISO-8601 when known (drives freshness/recency)
 
 
 class Chunk(BaseModel):
-    """A retrieved unit of text with provenance. ``org_id`` is mandatory and is
-    set from the trusted context at ingest/retrieve time, never from user input.
+    """A retrieved unit of text with provenance — the atom of RAG evidence that
+    flows through the agent as ``context_chunks``. ``org_id`` is MANDATORY and is
+    stamped from the trusted context at ingest/retrieve time, never from user
+    input: it is the per-piece tenant tag that makes cross-org leakage impossible.
     """
 
     id: str
     text: str
     score: float = 0.0
-    org_id: str
+    org_id: str                      # required: the owning tenant (isolation)
     source: str = ""
     doc_id: str = ""
     title: str = ""
@@ -95,6 +117,9 @@ class Chunk(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def to_citation(self) -> Citation:
+        """Project a chunk down to a Citation (the public-facing reference). The
+        snippet is truncated to keep payloads small. Used by answer_node when it
+        maps an answer's [n] marker back to the chunk that filled slot n."""
         return Citation(
             doc_id=self.doc_id or self.id,
             source=self.source,
@@ -107,9 +132,12 @@ class Chunk(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
-# Tool outcomes (errors-as-data)
+# Tool outcomes (errors-as-data)  <-- SAFETY RULE #1
 # --------------------------------------------------------------------------- #
 class ToolResult(BaseModel):
+    """The SUCCESS shape returned by a tool. ``data`` is structured output,
+    ``citations`` are evidence the answer can cite. ``ok=True`` lets callers
+    branch on success/failure without try/except."""
     ok: bool = True
     data: dict[str, Any] = Field(default_factory=dict)
     citations: list[Citation] = Field(default_factory=list)
@@ -117,6 +145,10 @@ class ToolResult(BaseModel):
 
 
 class ToolError(BaseModel):
+    """The FAILURE shape — a value, not an exception. ``code`` is machine-readable
+    (e.g. "forbidden", "requires_approval", "invalid_args"); ``retriable`` tells
+    the caller whether trying again could help. The agent receives this like any
+    other result and keeps going."""
     ok: bool = False
     code: str
     message: str
@@ -124,24 +156,29 @@ class ToolError(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+# A tool call returns EITHER outcome. Callers check ``isinstance(out, ToolResult)``.
 ToolOutcome = ToolResult | ToolError
 
 
 # --------------------------------------------------------------------------- #
-# Tool context (trusted, per-request)
+# Tool context (trusted, per-request)  <-- SAFETY RULE #3
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ToolContext:
-    """Carried into every tool/retriever call. Holds the *trusted* identity
-    derived from the verified token plus handles to core services. A tool must
-    reach for nothing global; everything it needs is here."""
+    """Carried into EVERY tool/retriever call. Holds the *trusted* identity
+    derived from the verified token, plus handles to core services. ``frozen=True``
+    makes it immutable — a tool can't tamper with its own org/roles mid-call.
 
-    org_id: str
+    Design rule: a tool must reach for nothing global. Everything it legitimately
+    needs (who is asking, which org, the service deps) is right here. That keeps
+    tools pure, testable, and unable to bypass tenant isolation."""
+
+    org_id: str                  # THE tenant key — set from the token, never from args
     user_id: str
     roles: tuple[str, ...]
     trace_id: str
     request_id: str
-    deps: CoreDeps
+    deps: CoreDeps               # the shared service bundle (see bottom of file)
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def has_role(self, minimum: str) -> bool:
@@ -151,37 +188,47 @@ class ToolContext:
 # --------------------------------------------------------------------------- #
 # Tool (the universal unit of capability)
 # --------------------------------------------------------------------------- #
+# A tool's handler: receives a VALIDATED args model + the ToolContext, returns an
+# outcome (sync or async). This is the function a module author actually writes.
 ToolHandler = Callable[[BaseModel, ToolContext], ToolOutcome | Awaitable[ToolOutcome]]
 
 
 @dataclass(frozen=True)
 class Tool:
-    """A typed, MCP-exposable function the agent can call.
+    """A typed, MCP-exposable function the agent can call — the universal unit of
+    capability. Everything a module "can do" is a Tool.
 
-    ``handler`` may be sync or async and receives a validated args model plus the
-    :class:`ToolContext`. RBAC and the action gate are enforced by the *tool
-    runner* (the MCP client), not here, so this stays a pure capability wrapper —
-    but :meth:`invoke` still guarantees errors-as-data.
+    Note the separation of concerns: RBAC and the action gate are enforced by the
+    TOOL RUNNER (the MCP client, mcp/inprocess.py), NOT in here — so this stays a
+    clean capability wrapper. What :meth:`invoke` DOES guarantee is errors-as-data
+    (safety rule #1): no matter how the handler misbehaves, the agent gets a
+    ToolResult or ToolError back, never an exception.
     """
 
     name: str
-    description: str
+    description: str                              # the LLM reads this to decide when to call it
     handler: ToolHandler
-    args_schema: type[BaseModel]
+    args_schema: type[BaseModel]                  # pydantic model => validation + JSON schema for free
     returns_schema: type[BaseModel] | None = None
-    side_effecting: bool = False
-    rbac_role: str = Role.VIEWER.value
+    side_effecting: bool = False                  # True => must pass the human action gate (rule #2)
+    rbac_role: str = Role.VIEWER.value            # minimum role to call it (rule #2)
     autonomy: Autonomy = Autonomy.READ
-    module_id: str = ""  # stamped by the registry at load time
+    module_id: str = ""  # stamped by the registry at load time (which module owns this tool)
 
     async def invoke(self, raw_args: Mapping[str, Any], ctx: ToolContext) -> ToolOutcome:
+        """Validate args, run the handler, and GUARANTEE an outcome value. Three
+        failure modes are all turned into ToolError instead of raising:
+          * args don't match the schema      -> code="invalid_args"
+          * handler returns the wrong type   -> code="bad_tool_return"
+          * handler raises any exception      -> code="tool_exception"
+        This is the concrete implementation of "errors-as-data"."""
         try:
             args = self.args_schema.model_validate(dict(raw_args or {}))
         except Exception as exc:  # validation error -> data, not a raise
             return ToolError(code="invalid_args", message=str(exc), details={"tool": self.name})
         try:
             out = self.handler(args, ctx)
-            if inspect.isawaitable(out):
+            if inspect.isawaitable(out):          # handler may be sync OR async
                 out = await out
             if not isinstance(out, (ToolResult, ToolError)):
                 return ToolError(
@@ -198,7 +245,9 @@ class Tool:
             )
 
     def json_schema(self) -> dict[str, Any]:
-        """OpenAI/MCP-style tool advertisement (name + description + params)."""
+        """Advertise this tool in OpenAI/MCP function-calling format (name +
+        description + JSON-schema params). This is exactly what gets handed to the
+        LLM so it knows the tool exists and how to call it."""
         return {
             "name": self.name,
             "description": self.description,
@@ -219,7 +268,9 @@ def tool(
     rbac_role: str = Role.VIEWER.value,
     autonomy: Autonomy = Autonomy.READ,
 ) -> Callable[[ToolHandler], Tool]:
-    """Decorator to declare a :class:`Tool` from a handler function."""
+    """Decorator that turns a plain async handler function into a :class:`Tool`.
+    This is the ergonomic way module authors declare tools — see any module's
+    code, e.g. ``@tool(name="get_threat_actors", ...)`` over an async def."""
 
     def decorate(fn: ToolHandler) -> Tool:
         return Tool(
@@ -241,6 +292,10 @@ def tool(
 # --------------------------------------------------------------------------- #
 @runtime_checkable
 class Retriever(Protocol):
+    """A module's binding to a document corpus. ``retrieve`` returns Chunks for a
+    query, scoped to the caller's org (via ``ctx``). A Protocol means a module
+    can supply ANYTHING with this shape — duck typing, no base class to inherit.
+    ``@runtime_checkable`` lets ``isinstance`` checks work against it."""
     id: str
 
     async def retrieve(
@@ -256,9 +311,11 @@ class Retriever(Protocol):
 # co-locate in one context. It *investigates* (retrieves + calls its tools) and
 # returns findings; a single synthesize step joins findings across modules and
 # answers. This is the property that lets the platform scale to many modules /
-# hundreds of tools without bloating any one agent's context.
+# hundreds of tools without bloating any one agent's context. See specialist.py.
 # --------------------------------------------------------------------------- #
 class SpecialistResult(BaseModel):
+    """What one specialist hands back to the dispatch node. The ``chunks`` become
+    cited context; ``events`` are the tool-call trace for observability."""
     module_id: str
     chunks: list[Chunk] = Field(default_factory=list)   # findings (become cited context)
     events: list[dict[str, Any]] = Field(default_factory=list)  # tool-call trace
@@ -268,14 +325,18 @@ class SpecialistResult(BaseModel):
 
 @runtime_checkable
 class Specialist(Protocol):
+    """The interface a specialist implements. Just one method: investigate a
+    question for one module and return findings. GenericSpecialist (specialist.py)
+    is the default; a module can ship a custom one via its manifest."""
     id: str
 
     async def investigate(self, question: str, ctx: ToolContext) -> SpecialistResult: ...
 
 
 # Builds a Specialist for one module. Called as ``factory(module, deps, mcp)``.
-# ``None`` in a manifest means "use the generic specialist". Typed loosely to
-# avoid importing the registry/MCP types here (keeps contracts cycle-free).
+# ``None`` in a manifest means "use the generic specialist". Typed loosely
+# (``Callable[..., Specialist]``) to avoid importing registry/MCP types here,
+# which would create an import cycle — contracts must stay dependency-free.
 SpecialistFactory = Callable[..., Specialist]
 
 
@@ -283,6 +344,9 @@ SpecialistFactory = Callable[..., Specialist]
 # Ingestion — how a module's data lands (event-driven; batch = one-shot)
 # --------------------------------------------------------------------------- #
 class SourceEvent(BaseModel):
+    """An incoming data event for ingestion (e.g. "new report for org X"). The
+    chat path doesn't use these — ingestion runs off to the side (external cron /
+    event bus) and writes Chunks the retrievers later read."""
     source: str
     org_id: str
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -296,7 +360,9 @@ class IngestStats(BaseModel):
 
 @runtime_checkable
 class Sinks(Protocol):
-    """Where a connector writes normalized data."""
+    """Where an ingestion connector WRITES normalized data — the vector store
+    (chunks) and the knowledge graph (nodes/edges). Abstracted so connectors
+    don't know which concrete backend is wired."""
 
     async def write_chunks(self, chunks: Sequence[Chunk]) -> None: ...
     async def write_graph(self, org_id: str, nodes: Sequence[dict], edges: Sequence[dict]) -> None: ...
@@ -304,6 +370,8 @@ class Sinks(Protocol):
 
 @runtime_checkable
 class IngestionConnector(Protocol):
+    """Parses a SourceEvent for one source into chunks/graph and writes them to
+    the Sinks. A module contributes connectors via its manifest."""
     id: str
     source: str
 
@@ -313,6 +381,10 @@ class IngestionConnector(Protocol):
 # --------------------------------------------------------------------------- #
 # Ontology — the KG slice a module contributes
 # --------------------------------------------------------------------------- #
+# These describe the entity/relationship TYPES a module adds to the shared
+# knowledge graph (e.g. easm contributes Asset nodes; aci contributes ThreatActor
+# nodes and a "weaponizes" edge). The KG join across modules is a future feature;
+# the types are declared now so modules can carry their slice.
 @dataclass(frozen=True)
 class NodeType:
     name: str
@@ -336,6 +408,9 @@ class OntologyContribution:
 # Action handler — gated side effects (interface now, handlers later)
 # --------------------------------------------------------------------------- #
 class ActionPreview(BaseModel):
+    """A human-readable description of an action BEFORE it runs — what the
+    approval inbox shows a reviewer. ``reversible`` / ``blast_radius`` help the
+    reviewer judge risk."""
     action_type: str
     summary: str
     args: dict[str, Any] = Field(default_factory=dict)
@@ -352,6 +427,10 @@ class ActionResult(BaseModel):
 
 @runtime_checkable
 class ActionHandler(Protocol):
+    """Executes a side-effecting action AFTER approval. Two phases: ``preview``
+    (describe it for the human) and ``execute`` (do it). The interface ships now;
+    concrete handlers come later. This is the other half of the action gate —
+    side_effecting tools route here instead of running inline."""
     action_type: str
     autonomy: Autonomy
 
@@ -364,36 +443,47 @@ class ActionHandler(Protocol):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class RoutingHint:
+    """The signals the supervisor routes on. ``intents`` are short phrases the
+    module handles ("threat actor", "attack surface"); ``examples`` are sample
+    questions. The supervisor scores a question against these — no routing logic
+    is ever hardcoded in core (see supervisor.py)."""
     intents: tuple[str, ...]
     examples: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class CapabilityManifest:
-    """Everything the platform needs to wire one feature. Read at boot; the
-    supervisor's routing, each tenant's visible tools, RBAC and autonomy are all
-    *derived* from manifests, never hardcoded in core."""
+    """The CARTRIDGE: everything the platform needs to wire one feature. Read once
+    at boot; the supervisor's routing, each tenant's visible tools, RBAC, and
+    autonomy are all DERIVED from manifests — never hardcoded in core. Adding a
+    module = writing one of these + its tools. That's the extension story.
+
+    Every field maps to a core subsystem:
+      tools/retrievers/specialist -> the agent & RAG          routing_hints -> supervisor
+      rbac/default_autonomy       -> the MCP boundary & gate  ontology      -> the KG
+      ingestion/action_handlers   -> ingestion & action gate  enabled_flag  -> deployment
+    """
 
     id: str
     version: str
     display_name: str
     description: str = ""
     license_tiers: tuple[str, ...] = ("platform",)
-    enabled_flag: str = ""          # Settings attribute name; "" => always enabled
+    enabled_flag: str = ""          # name of a Settings attr; "" => always enabled
     enabled_default: bool = True
 
     tools: tuple[Tool, ...] = ()
     retrievers: tuple[Retriever, ...] = ()
-    specialist: SpecialistFactory | None = None  # None => generic specialist
-    system_prompt: str = ""         # path relative to the module dir
+    specialist: SpecialistFactory | None = None  # None => use the generic specialist
+    system_prompt: str = ""         # path (relative to the module dir) to a prompt file
     routing_hints: tuple[RoutingHint, ...] = ()
     default_autonomy: Autonomy = Autonomy.READ
-    rbac: Mapping[str, str] = field(default_factory=dict)  # tool_name -> min role
+    rbac: Mapping[str, str] = field(default_factory=dict)  # tool_name -> min role override
     ontology: OntologyContribution | None = None
     ingestion: tuple[IngestionConnector, ...] = ()
     action_handlers: tuple[ActionHandler, ...] = ()
 
-    min_core_version: str = "1.0.0"
+    min_core_version: str = "1.0.0"   # the registry checks this against CONTRACTS_VERSION
     owners: tuple[str, ...] = ()
 
 
@@ -402,14 +492,18 @@ class CapabilityManifest:
 # --------------------------------------------------------------------------- #
 @dataclass
 class CoreDeps:
-    """Handles to the frozen core services. Typed as ``Any`` to keep this module
-    import-cycle-free; concrete types live in their own packages."""
+    """The bag of shared core services, built ONCE at boot (bootstrap.py) and
+    handed to tools/specialists via ToolContext.deps. Typed as ``Any`` on purpose
+    to keep this contracts module import-cycle-free — the concrete classes live in
+    their own packages and would import back from here. This is hand-rolled
+    dependency injection: nothing constructs its own services, everything receives
+    them, which is what makes the whole app config-driven and testable."""
 
     settings: Any
-    llm: Any            # app.core.llm.lanes.LaneRouter
+    llm: Any            # app.core.llm.lanes.LaneRouter  (the 3-lane LLM handle)
     rag: Any            # app.core.rag.pipeline.RetrievalPipeline
     registry: Any       # app.core.registry.CapabilityRegistry
-    conversations: Any  # session store
+    conversations: Any  # session/message store
     kg: Any             # app.core.memory.kg.KnowledgeGraph (NoOp default)
     action_gate: Any    # app.core.action_gate.gate.ActionGate
     tracer: Any         # observability tracer (NoOp default)

@@ -1,10 +1,22 @@
 """Embedders.
 
-Default ``deterministic`` uses a *stable* hashed bag-of-words embedding (blake2,
-not Python's randomized ``hash()``), so cosine similarity is meaningful and
-reproducible across processes/runs with zero infra. ``tei`` calls a
-Text-Embeddings-Inference server (Qwen3-Embedding in prod); ``openai`` calls an
-OpenAI-compatible embeddings endpoint.
+WHAT AN EMBEDDING IS (the core of RAG retrieval): an embedding turns a piece of
+text into a fixed-length vector of floats — a point in a high-dimensional space —
+positioned so that texts with similar MEANING land near each other. We embed every
+chunk at index time and embed the question at query time, then find the chunks
+whose vectors are closest to the question's. "Closest" is measured by COSINE
+SIMILARITY: the cosine of the angle between two vectors, which is 1.0 when they
+point the same way and 0 when unrelated. (Cosine, not raw distance, is why all the
+embedders here L2-normalize their vectors.) ``dim`` is the vector length / number
+of dimensions; the query and the chunks MUST share the same ``dim`` to be compared.
+
+This file is the swappable embedding backend. Default ``deterministic`` uses a
+*stable* hashed bag-of-words embedding (blake2, not Python's randomized ``hash()``
+which differs per process), so cosine similarity is meaningful and reproducible
+across processes/runs with zero infra. ``tei`` calls a Text-Embeddings-Inference
+server (Qwen3-Embedding in prod); ``openai`` calls an OpenAI-compatible embeddings
+endpoint. All three satisfy the same ``Embedder`` protocol so the pipeline doesn't
+care which is wired.
 """
 
 from __future__ import annotations
@@ -22,50 +34,74 @@ _WORD = re.compile(r"[a-z0-9]+")
 
 
 def _tokens(text: str) -> list[str]:
+    # Lowercase word tokenizer — the unit the deterministic embedder hashes.
     return _WORD.findall(text.lower())
 
 
 class Embedder(Protocol):
+    # The contract every embedder implements (a Protocol = duck-typed interface,
+    # no base class to inherit). ``dim`` is the output vector length.
     dim: int
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...      # batch: documents at index time
 
-    async def embed_query(self, text: str) -> list[float]: ...
+    async def embed_query(self, text: str) -> list[float]: ...                 # single: the question at query time
 
-    async def aclose(self) -> None: ...
+    async def aclose(self) -> None: ...                                        # release any HTTP client
 
 
 class DeterministicEmbedder:
+    """Infra-free embedder: a hashed bag-of-words ("feature hashing"). No model,
+    no GPU, no network — yet it produces stable vectors where lexically similar
+    texts score high cosine similarity. Perfect for dev/tests; swap to ``tei`` or
+    ``openai`` for real semantic quality."""
+
     provider = "deterministic"
 
     def __init__(self, dim: int = 1024) -> None:
         self.dim = dim
 
     def _vec(self, text: str) -> np.ndarray:
+        # Build the vector by HASHING each token to a dimension and bumping that
+        # slot — the "hashing trick" that maps an unbounded vocabulary into a
+        # fixed ``dim`` without storing a vocabulary table.
         v = np.zeros(self.dim, dtype=np.float32)
         toks = _tokens(text)
         for tok in toks:
+            # blake2b is a STABLE hash (unlike Python's per-process-salted hash()),
+            # so the same word maps to the same dimension on every run/host — the
+            # property that makes cosine similarity reproducible.
             h = int.from_bytes(hashlib.blake2b(tok.encode(), digest_size=8).digest(), "big")
             v[h % self.dim] += 1.0
-        # add bigrams for a little word-order signal
+        # add bigrams for a little word-order signal — pure bag-of-words ignores
+        # order entirely; hashing adjacent pairs recovers a hint of it.
         for a, b in zip(toks, toks[1:], strict=False):
             h = int.from_bytes(hashlib.blake2b(f"{a}_{b}".encode(), digest_size=8).digest(), "big")
             v[h % self.dim] += 0.5
+        # L2-normalize so dot product == cosine similarity downstream (and so long
+        # documents don't get artificially large vectors just for being long).
         n = float(np.linalg.norm(v))
         return v / n if n > 0 else v
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        # Embed a batch of documents (index time).
         return [self._vec(t).tolist() for t in texts]
 
     async def embed_query(self, text: str) -> list[float]:
+        # Embed one query (search time). Same function as documents — query and
+        # corpus MUST be embedded the same way to live in the same vector space.
         return self._vec(text).tolist()
 
     async def aclose(self) -> None:
-        return None
+        return None     # nothing to release — no network client
 
 
 class TEIEmbedder:
-    """Hugging Face Text-Embeddings-Inference (``/embed``)."""
+    """Hugging Face Text-Embeddings-Inference (``/embed``).
+
+    Calls a self-hosted embedding model server over HTTP (Qwen3-Embedding in prod).
+    This is the real-quality path: a trained model produces genuinely semantic
+    vectors, at the cost of running a GPU service."""
 
     provider = "tei"
 
@@ -76,6 +112,8 @@ class TEIEmbedder:
         self._client = None
 
     def _http(self):
+        # Lazily create (and reuse) the async HTTP client on first use, so merely
+        # constructing the embedder opens no sockets.
         if self._client is None:
             import httpx
 
@@ -85,6 +123,8 @@ class TEIEmbedder:
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         from app.core.errors import UpstreamError
 
+        # Wrap any network/HTTP failure as a domain UpstreamError so callers see a
+        # consistent error type rather than raw httpx exceptions.
         try:
             r = await self._http().post(f"{self._base_url}/embed", json={"inputs": list(texts)})
             r.raise_for_status()
@@ -93,6 +133,7 @@ class TEIEmbedder:
             raise UpstreamError(f"TEI embed failed: {exc}") from exc
 
     async def embed_query(self, text: str) -> list[float]:
+        # Embed one text by reusing the batch path and taking the only result.
         return (await self.embed([text]))[0]
 
     async def aclose(self) -> None:
@@ -102,6 +143,9 @@ class TEIEmbedder:
 
 
 class OpenAIEmbedder:
+    """OpenAI-compatible ``/embeddings`` endpoint (also fits Azure/other vendors
+    speaking the same API). ``model`` names the hosted embedding model."""
+
     provider = "openai"
 
     def __init__(self, base_url: str, api_key: str, model: str, dim: int, timeout: float = 30.0) -> None:
@@ -113,6 +157,7 @@ class OpenAIEmbedder:
         self._client = None
 
     def _http(self):
+        # Lazy client, with the bearer token set once as a default header.
         if self._client is None:
             import httpx
 
@@ -129,6 +174,7 @@ class OpenAIEmbedder:
                 f"{self._base_url}/embeddings", json={"model": self._model, "input": list(texts)}
             )
             r.raise_for_status()
+            # OpenAI returns {"data": [{"embedding": [...]}, ...]} — pull the vectors.
             return [d["embedding"] for d in r.json()["data"]]
         except Exception as exc:  # noqa: BLE001
             raise UpstreamError(f"OpenAI embed failed: {exc}") from exc
@@ -143,6 +189,10 @@ class OpenAIEmbedder:
 
 
 def build_embedder(settings: Settings) -> Embedder:
+    # Factory: pick the embedder from config. ``embedding_dim`` must match what the
+    # chosen model actually outputs (e.g. Qwen3 supports Matryoshka embeddings —
+    # one model trained so you can truncate the vector to a shorter ``dim`` and
+    # still get usable similarity, trading a little accuracy for speed/storage).
     p = settings.embedding_provider
     if p == "deterministic":
         return DeterministicEmbedder(dim=settings.embedding_dim)
