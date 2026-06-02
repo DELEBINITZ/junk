@@ -34,6 +34,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import numpy as np
+
 from app.core.contracts import Chunk, SpecialistResult, ToolContext, ToolResult
 from app.core.llm.base import ChatMessage, Lane, LLMToolSpec
 
@@ -41,6 +43,28 @@ from app.core.llm.base import ChatMessage, Lane, LLMToolSpec
 # so a single chatty module can't dominate the merged context downstream.
 PER_SPECIALIST_MAX = 6
 _WORD = re.compile(r"[a-z0-9]+")     # crude tokenizer used by relevance ranking
+
+# Cache of tool-description embedding vectors, so we embed a module's tool surface
+# ONCE (keyed by module id + embedder provider + tool names) instead of every turn
+# — important when an integrated MCP server exposes a large, stable tool set.
+_TOOL_VEC_CACHE: dict[tuple, list] = {}
+
+
+def _cosine(a, b) -> float:
+    va = np.asarray(a, dtype=np.float32)
+    vb = np.asarray(b, dtype=np.float32)
+    na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+    return float(va @ vb / (na * nb)) if na and nb else 0.0
+
+
+def _lexical_select(tools: list, question: str, cap: int) -> list:
+    """Fallback tool ranker (keyword overlap) when no embedder is available."""
+    qtok = set(_WORD.findall(question.lower()))
+
+    def score(t) -> int:
+        return len(qtok & set(_WORD.findall(f"{t.name} {t.description}".lower())))
+
+    return sorted(tools, key=score, reverse=True)[:cap]
 
 
 # --------------------------------------------------------------------------- #
@@ -60,8 +84,22 @@ def relevance_rank(chunks: list[Chunk], question: str, cap: int) -> list[Chunk]:
         # (overlap count, retrieval score) — sorted descending below.
         return (len(qtok & set(_WORD.findall(c.text.lower()))), c.score)
 
-    # Drop empty chunks, sort best-first, keep ``cap``.
-    return sorted([c for c in chunks if c.text.strip()], key=key, reverse=True)[:cap]
+    # Drop empty chunks, sort best-first, then DEDUPE by exact text so duplicate
+    # passages (same doc retrieved by two tools/steps, or across replan rounds)
+    # don't fill the context and crowd out distinct evidence. Dedupe after sorting
+    # keeps the best-ranked copy.
+    ranked = sorted([c for c in chunks if c.text.strip()], key=key, reverse=True)
+    out: list[Chunk] = []
+    seen: set[str] = set()
+    for c in ranked:
+        sig = c.text.strip().lower()
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(c)
+        if len(out) >= cap:
+            break
+    return out
 
 
 def autocall_args(tool, question: str):
@@ -128,6 +166,86 @@ class GenericSpecialist:
         through the human approval gate. Both are core safety properties."""
         return [t for t in self.module.tools.values() if not t.side_effecting]
 
+    async def _select_tools(self, question: str, cap: int) -> list:
+        """PRODUCTION TOOL SELECTION (semantic tool-RAG) — the context-flood guard.
+
+        Returns the ``cap`` tools most relevant to the question, so the agent
+        CHOOSES correctly even when a module (e.g. an integrated MCP server)
+        exposes hundreds of tools, without flooding the LLM context with every
+        schema. Ranks by EMBEDDING similarity between the question and each tool's
+        name+description — robust to wording, unlike keyword overlap — and caches
+        the tool vectors per module so the surface is embedded once, not per turn.
+        Falls back to the lexical ranker if no embedder is wired, and never raises
+        (a selection failure must not break a turn)."""
+        tools = self._read_tools()
+        if len(tools) <= cap:
+            return tools
+        embedder = getattr(getattr(self.deps, "rag", None), "embedder", None)
+        if embedder is None:
+            return _lexical_select(tools, question, cap)
+        try:
+            key = (self.id, getattr(embedder, "provider", "?"), tuple(t.name for t in tools))
+            vecs = _TOOL_VEC_CACHE.get(key)
+            if vecs is None:
+                vecs = await embedder.embed([f"{t.name}: {t.description}" for t in tools])
+                _TOOL_VEC_CACHE[key] = vecs
+            qv = await embedder.embed_query(question)
+            order = sorted(range(len(tools)), key=lambda i: _cosine(qv, vecs[i]), reverse=True)
+            return [tools[i] for i in order[:cap]]
+        except Exception:  # noqa: BLE001 - selection must never break a turn
+            return _lexical_select(tools, question, cap)
+
+    async def _rank_candidates(self, cands: list[dict], question: str, cap: int) -> list[dict]:
+        """Semantic shortlist over UNIFIED candidates (local + discovered), each a
+        dict with name/description. Same embedding tool-RAG as ``_select_tools`` but
+        over dicts, so it ranks local Tool stubs and dynamically-discovered remote
+        tools together, then keeps the top ``cap``."""
+        if len(cands) <= cap:
+            return cands
+        embedder = getattr(getattr(self.deps, "rag", None), "embedder", None)
+        if embedder is None:
+            qtok = set(_WORD.findall(question.lower()))
+
+            def sc(c) -> int:
+                return len(qtok & set(_WORD.findall(f"{c['name']} {c.get('description', '')}".lower())))
+
+            return sorted(cands, key=sc, reverse=True)[:cap]
+        try:
+            qv = await embedder.embed_query(question)
+            vecs = await embedder.embed([f"{c['name']}: {c.get('description', '')}" for c in cands])
+            order = sorted(range(len(cands)), key=lambda i: _cosine(qv, vecs[i]), reverse=True)
+            return [cands[i] for i in order[:cap]]
+        except Exception:  # noqa: BLE001
+            return cands[:cap]
+
+    async def _gather_candidates(self, question: str, ctx: ToolContext, cap: int) -> list[dict]:
+        """Build the LLM's tool candidate set: this module's LOCAL read tools PLUS
+        any tools dynamically DISCOVERED from its remote MCP server (pure dynamic),
+        de-duped (a local declaration wins over a discovered tool of the same name),
+        then semantically shortlisted to ``cap``. This is what lets the agent choose
+        correctly among a remote server's LIVE toolset with no local declaration,
+        while never flooding the context with every schema."""
+        cands: list[dict] = [
+            {"name": t.name, "description": t.description, "parameters": t.args_schema.model_json_schema()}
+            for t in self._read_tools()
+        ]
+        discover = getattr(self.mcp, "discover_tools", None)
+        if discover is not None:
+            try:
+                for d in await discover(self.id, ctx):
+                    cands.append({"name": d["name"], "description": d.get("description", ""),
+                                  "parameters": d.get("parameters", {})})
+            except Exception:  # noqa: BLE001 - discovery is best-effort
+                pass
+        seen: set[str] = set()
+        uniq: list[dict] = []
+        for c in cands:
+            if c["name"] in seen:
+                continue
+            seen.add(c["name"])
+            uniq.append(c)
+        return await self._rank_candidates(uniq, question, cap)
+
     def _use_llm_planner(self) -> bool:
         """Pick the planner. Use the LLM tool-calling planner only if configured
         (``router_mode=llm``), a REAL model is wired (not the deterministic stub),
@@ -175,23 +293,30 @@ class GenericSpecialist:
         """HEURISTIC planner: for each read tool whose args we can fill from the
         question (see autocall_args), call it through the MCP boundary and fold
         the result into findings. No LLM involved — fully deterministic."""
-        for tname, tool in self.module.tools.items():
-            if tool.side_effecting:
+        # Only consider the shortlisted read tools (flood guard) — _select_tools
+        # already excludes side-effecting tools.
+        for tool in await self._select_tools(question, self.deps.settings.max_tools_advertised):
+            # Skip tools a module marked auto_invoke=False (LLM/planner-only, e.g.
+            # a RAG search tool that would duplicate the module's bound retriever).
+            if not tool.auto_invoke:
                 continue
             args = autocall_args(tool, question)
             if args is None:                       # can't infer args -> skip this tool
                 continue
-            out = await self.mcp.call_tool(tname, args, ctx)
-            self._fold(tname, out, chunks, events, ctx.org_id)
+            out = await self.mcp.call_tool(tool.name, args, ctx)
+            self._fold(tool.name, out, chunks, events, ctx.org_id)
 
     async def _llm_tools(self, question: str, ctx: ToolContext, chunks: list[Chunk], events: list[dict]) -> None:
-        """LLM tool-calling planner: advertise ONLY this module's read tools to
-        the model and let it choose which to call (and with what args) via
-        function calling, looping until it stops asking for tools or we hit
-        ``max_tool_iterations``. Note ``self._read_tools()`` — the model literally
-        cannot pick a tool from another module, because it never sees one."""
-        tools = [LLMToolSpec(name=t.name, description=t.description,
-                             parameters=t.args_schema.model_json_schema()) for t in self._read_tools()]
+        """LLM tool-calling planner: advertise this module's tools to the model and
+        let it choose which to call (and with what args) via function calling,
+        looping until it stops asking for tools or we hit ``max_tool_iterations``.
+        Candidates are this module's LOCAL read tools PLUS tools dynamically
+        DISCOVERED from its remote MCP server (``_gather_candidates``), semantically
+        shortlisted so a huge live toolset never floods context. The model cannot
+        pick another module's tool (tool isolation)."""
+        candidates = await self._gather_candidates(question, ctx, self.deps.settings.max_tools_advertised)
+        tools = [LLMToolSpec(name=c["name"], description=c["description"],
+                             parameters=c["parameters"]) for c in candidates]
         persona = self.module.prompt_text or f"You are the {self.module.manifest.display_name} specialist."
         messages = [ChatMessage(role="system", content=persona),
                     ChatMessage(role="user", content=question)]

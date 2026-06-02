@@ -133,7 +133,7 @@ class CapabilityRegistry:
                 name=t.name, description=t.description, handler=t.handler,
                 args_schema=t.args_schema, returns_schema=t.returns_schema,
                 side_effecting=t.side_effecting, rbac_role=t.rbac_role,
-                autonomy=t.autonomy, module_id=manifest.id,
+                autonomy=t.autonomy, auto_invoke=t.auto_invoke, module_id=manifest.id,
             )
             if stamped.name in tools:
                 raise RegistryError(f"duplicate tool '{stamped.name}' in module '{manifest.id}'")

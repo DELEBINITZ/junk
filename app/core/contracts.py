@@ -213,6 +213,12 @@ class Tool:
     side_effecting: bool = False                  # True => must pass the human action gate (rule #2)
     rbac_role: str = Role.VIEWER.value            # minimum role to call it (rule #2)
     autonomy: Autonomy = Autonomy.READ
+    # If False, the heuristic specialist will NOT auto-invoke this tool while
+    # gathering (it's reserved for the LLM/planner to call deliberately). Use it for
+    # a tool that overlaps a bound retriever (e.g. a RAG "search" tool) so the two
+    # don't both fire on every turn. The tool is still advertised to the LLM and
+    # callable through the MCP boundary like any other.
+    auto_invoke: bool = True
     module_id: str = ""  # stamped by the registry at load time (which module owns this tool)
 
     async def invoke(self, raw_args: Mapping[str, Any], ctx: ToolContext) -> ToolOutcome:
@@ -267,6 +273,7 @@ def tool(
     side_effecting: bool = False,
     rbac_role: str = Role.VIEWER.value,
     autonomy: Autonomy = Autonomy.READ,
+    auto_invoke: bool = True,
 ) -> Callable[[ToolHandler], Tool]:
     """Decorator that turns a plain async handler function into a :class:`Tool`.
     This is the ergonomic way module authors declare tools — see any module's
@@ -282,6 +289,7 @@ def tool(
             side_effecting=side_effecting,
             rbac_role=rbac_role,
             autonomy=autonomy,
+            auto_invoke=auto_invoke,
         )
 
     return decorate

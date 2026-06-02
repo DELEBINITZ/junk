@@ -92,6 +92,30 @@ def create_refresh_token(settings: Settings, *, sub: str, org_id: str) -> Issued
     return IssuedToken(_encode(settings, claims), jti, exp)
 
 
+def create_service_token(
+    settings: Settings, *, sub: str, org_id: str, roles: tuple[str, ...],
+    audience: str, ttl_seconds: int,
+) -> str:
+    """Mint a SHORT-LIVED, org-scoped SERVICE token for a remote MCP call.
+
+    When a module is promoted to its own MCP server, the agent must prove WHO is
+    calling and FOR WHICH ORG — but we never put the org in the tool arguments
+    (an attacker could change those). Instead we mint this token from the trusted
+    local identity and send it in the Authorization header; the remote server
+    re-derives org/roles from it (same rule, across the wire). ``audience`` names
+    the intended server (e.g. "easm-mcp") so a token can't be replayed elsewhere;
+    the TTL is tiny because it's used immediately for one hop. ``type="access"``
+    so the remote server's ``decode_token(expected_type="access")`` accepts it.
+    """
+    exp = _now() + ttl_seconds
+    claims = {
+        "sub": sub, "org_id": org_id, "roles": list(roles), "email": "",
+        "type": "access", "aud": audience, "jti": uuid.uuid4().hex,
+        "iat": _now(), "exp": exp,
+    }
+    return _encode(settings, claims)
+
+
 def decode_token(settings: Settings, token: str, *, expected_type: str | None = None) -> dict[str, Any]:
     """VERIFY a token and return its claims, or raise AuthError. This is the gate
     every local-auth request passes through.
@@ -117,4 +141,5 @@ def decode_token(settings: Settings, token: str, *, expected_type: str | None = 
     return claims
 
 
-__all__ = ["IssuedToken", "create_access_token", "create_refresh_token", "decode_token"]
+__all__ = ["IssuedToken", "create_access_token", "create_refresh_token",
+           "create_service_token", "decode_token"]

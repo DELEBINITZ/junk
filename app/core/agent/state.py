@@ -35,6 +35,11 @@ N_ROUTE = "route"
 N_GATHER = "gather_context"
 N_ANSWER = "answer"
 N_OUTPUT_GUARD = "output_guardrail"
+# Planner-mode nodes (orchestrator_mode=planner). The planner graph swaps route+
+# gather for plan + plan_dispatch and adds a replan_gate that can loop back to plan.
+N_PLAN = "plan"
+N_PLAN_DISPATCH = "plan_dispatch"
+N_REPLAN_GATE = "replan_gate"
 
 
 class ChatState(TypedDict, total=False):
@@ -65,6 +70,13 @@ class ChatState(TypedDict, total=False):
     # --- produced by route_node (the supervisor) ---
     route_modules: list[str]          # which capability module(s) handle this turn
     route_debug: dict[str, Any]       # scores/mode/fallback — for /route/preview + logs
+    # --- produced by the planner path (orchestrator_mode=planner) ---
+    plan: list[dict[str, Any]]        # the steps the brain decided (domain, subq, depends_on)
+    plan_results: list[dict[str, Any]]# per-step outcome (domain, subq, ok, found) — feeds replan
+    plan_debug: dict[str, Any]        # plan mode/raw — for observability
+    needs_replan: bool                # replan_gate's branch decision (loop to plan vs synthesize)
+    replan_count: int                 # how many replans have happened (bounded by max_replans)
+    replan_notes: str                 # gap note injected into the next planning round
     # --- produced by dispatch_node (specialists + their tools/retrieval) ---
     context_chunks: list[Chunk]       # the retrieved evidence, ranked + capped
     context_block: str                # those chunks rendered as "[1] ... [2] ..." for the prompt
@@ -153,4 +165,7 @@ __all__ = [
     "N_GATHER",
     "N_ANSWER",
     "N_OUTPUT_GUARD",
+    "N_PLAN",
+    "N_PLAN_DISPATCH",
+    "N_REPLAN_GATE",
 ]

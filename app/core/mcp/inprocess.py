@@ -36,6 +36,7 @@ gate but still pass RBAC.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -82,10 +83,26 @@ class InProcessMCPClient:
         *,
         action_gate: ActionGateProtocol | None = None,
         logger: Any = None,
+        remote_executors: Mapping[str, Any] | None = None,
+        settings: Any = None,
     ) -> None:
         self.registry = registry            # which modules/tools exist + their RBAC
         self.action_gate = action_gate      # human-approval gate for side effects (may be None)
         self.logger = logger
+        self._settings = settings           # for the dynamic-discovery policy/cache TTL
+        # module_id -> a remote executor (e.g. FastMCPRemote) that RUNS that
+        # module's tools on a remote MCP server. Empty by default = everything
+        # runs in-process. Crucially this only changes WHERE a tool executes; the
+        # RBAC + action-gate checks below still run locally first, so promoting a
+        # module to a remote server never weakens enforcement.
+        self.remote_executors: Mapping[str, Any] = remote_executors or {}
+        # PURE-DYNAMIC discovery state. ``_discovered`` is the resolve map
+        # (org_id, tool_name) -> module_id, populated by ``discover_tools`` so the
+        # boundary can route a call to a tool that exists ONLY on the remote server
+        # (not in any local manifest). ``_discover_cache`` memoizes a server's
+        # tools/list per (module, org) with a TTL so we don't re-list every turn.
+        self._discovered: dict[tuple[str, str], str] = {}
+        self._discover_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 
     async def list_tools(self, sc: SecurityContext) -> list[dict]:
         """Advertise the tools THIS caller is allowed to see. ``capability_view``
@@ -93,6 +110,74 @@ class InProcessMCPClient:
         agent is never even told about tools it could not call. Each tool is
         returned as its function-calling JSON schema."""
         return [t.json_schema() for t in self.registry.capability_view(sc).tools]
+
+    async def discover_tools(self, module_id: str, ctx: ToolContext) -> list[dict]:
+        """PURE-DYNAMIC discovery: ask a module's remote MCP server which tools it
+        exposes (tools/list), apply the safety policy, cache per (module, org), and
+        register the SAFE ones in the resolve map so they become callable through
+        ``call_tool``. Returns the safe descriptors (name/description/parameters).
+
+        Safety policy (so dynamic discovery can't introduce an ungated side effect):
+          * server marks the tool read-only        -> callable;
+          * server marks it destructive/non-read    -> EXCLUDED (must be a declared
+            local stub to be callable, so the action gate applies);
+          * unannotated                             -> callable iff the trust flag.
+        Never raises — a discovery failure just yields no dynamic tools this turn."""
+        executor = self.remote_executors.get(module_id)
+        if executor is None or not hasattr(executor, "list_tools"):
+            return []
+        ttl = getattr(self._settings, "mcp_tool_cache_ttl_seconds", 300) if self._settings else 300
+        ck = (module_id, ctx.org_id)
+        cached = self._discover_cache.get(ck)
+        now = time.time()
+        if cached and (now - cached[0]) < ttl:
+            return cached[1]
+        # The remote server filters its tool list by the caller's org/roles, so we
+        # list with an identity rebuilt from the trusted ToolContext.
+        sc = SecurityContext(org_id=ctx.org_id, user_id=ctx.user_id, roles=ctx.roles, email="")
+        try:
+            raw = await executor.list_tools(sc)
+        except Exception:  # noqa: BLE001 - server down / listing failed
+            return cached[1] if cached else []
+        trust = getattr(self._settings, "mcp_dynamic_trust_unannotated", True) if self._settings else True
+        safe: list[dict] = []
+        for d in raw:
+            ro, dh = d.get("read_only_hint"), d.get("destructive_hint")
+            if ro is True:
+                ok = True
+            elif ro is False or dh is True:
+                ok = False
+            else:
+                ok = trust
+            if not ok:
+                continue
+            safe.append(d)
+            self._discovered[(ctx.org_id, d["name"])] = module_id
+        self._discover_cache[ck] = (now, safe)
+        return safe
+
+    async def _call_discovered(
+        self, name: str, arguments: Mapping[str, Any], ctx: ToolContext, module_id: str
+    ) -> ToolOutcome:
+        """Execute a dynamically-discovered tool on its remote server. There is no
+        local manifest entry, so RBAC here is a coarse LOCAL FLOOR
+        (``mcp_dynamic_tool_role``); the remote server re-derives the caller's roles
+        from the service token and enforces its own fine-grained RBAC. Only
+        read-safe tools ever reach this path (discovery excluded destructive ones),
+        so the no-ungated-side-effects invariant still holds."""
+        executor = self.remote_executors.get(module_id)
+        if executor is None:
+            return ToolError(code="unknown_tool", message=f"no such tool: {name}")
+        role = getattr(self._settings, "mcp_dynamic_tool_role", "viewer") if self._settings else "viewer"
+        if not role_satisfies(ctx.roles, role):
+            self._log("tool_denied", name, ctx, reason="rbac_dynamic", required=role)
+            return ToolError(code="forbidden", message=f"role '{role}' required to call '{name}'",
+                             details={"have": list(ctx.roles), "need": role})
+        self._log("tool_call", name, ctx, cap_module=module_id,
+                  transport=getattr(executor, "transport", "remote"), dynamic=True)
+        outcome = await executor.call_tool(name, arguments, ctx)
+        self._log("tool_result", name, ctx, ok=getattr(outcome, "ok", False))
+        return outcome
 
     async def call_tool(self, name: str, arguments: Mapping[str, Any], ctx: ToolContext) -> ToolOutcome:
         """Run one tool through the full security pipeline. THE enforcement path.
@@ -105,9 +190,14 @@ class InProcessMCPClient:
         from the verified token); ``arguments`` are attacker-influencable and are
         used ONLY as tool inputs, never to decide org or permissions.
         """
-        # (a) The tool must exist in the registry.
+        # (a) Resolve the tool. First the local registry; if it's not there, it may
+        # be a PURE-DYNAMIC tool discovered from a remote MCP server (not declared in
+        # any local manifest) — route those through the dynamic path below.
         found = self.registry.find_tool(name)
         if not found:
+            module_id = self._discovered.get((ctx.org_id, name))
+            if module_id is not None:
+                return await self._call_discovered(name, arguments, ctx, module_id)
             return ToolError(code="unknown_tool", message=f"no such tool: {name}")
         module, tool = found
         # (b) ...and live in an enabled module (feature flags / licensing).
@@ -148,10 +238,18 @@ class InProcessMCPClient:
                 )
 
         # (e) Only now, with RBAC satisfied and (for side effects) approval in
-        # hand, do we actually run the tool. ``invoke`` itself guarantees
+        # hand, do we actually run the tool. If this module has been promoted to a
+        # remote MCP server, dispatch EXECUTION there; otherwise run the local
+        # handler. Either way ``invoke``/the remote adapter guarantees
         # errors-as-data, so even a misbehaving handler returns an outcome.
-        self._log("tool_call", name, ctx, cap_module=module.id)
-        outcome = await tool.invoke(arguments, ctx)
+        executor = self.remote_executors.get(module.id)
+        if executor is not None:
+            self._log("tool_call", name, ctx, cap_module=module.id,
+                      transport=getattr(executor, "transport", "remote"))
+            outcome = await executor.call_tool(name, arguments, ctx)
+        else:
+            self._log("tool_call", name, ctx, cap_module=module.id)
+            outcome = await tool.invoke(arguments, ctx)
         self._log("tool_result", name, ctx, ok=getattr(outcome, "ok", False))
         return outcome
 

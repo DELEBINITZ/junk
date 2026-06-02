@@ -18,12 +18,20 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from app.core.agent.nodes import NODE_SPECS, build_report_graph
+from app.core.agent.nodes import (
+    NODE_SPECS,
+    PLANNER_NODE_SPECS,
+    build_planner_graph,
+    build_report_graph,
+)
 from app.core.agent.state import (
     N_ANSWER,
     N_GATHER,
     N_INPUT_GUARD,
     N_OUTPUT_GUARD,
+    N_PLAN,
+    N_PLAN_DISPATCH,
+    N_REPLAN_GATE,
     N_ROUTE,
     AgentContext,
     ChatState,
@@ -41,12 +49,16 @@ class AgentEngine(Protocol):
 
 class InternalEngine:
     """The default, zero-dependency engine — just wraps our built-in graph
-    (graph.py via nodes.build_report_graph). ``thread_id`` is accepted for
-    interface parity but unused: the built-in engine keeps no cross-run state."""
+    (graph.py). Picks the heuristic graph or the planner graph from
+    ``orchestrator_mode``. ``thread_id`` is accepted for interface parity but
+    unused: the built-in engine keeps no cross-run state."""
     name = "internal"
 
     def __init__(self, ctx: AgentContext) -> None:
-        self._compiled = build_report_graph(ctx)
+        if getattr(ctx.settings, "orchestrator_mode", "heuristic") == "planner":
+            self._compiled = build_planner_graph(ctx)
+        else:
+            self._compiled = build_report_graph(ctx)
 
     async def run(self, state: dict, *, thread_id: str) -> dict:
         return await self._compiled.run(state)
@@ -76,19 +88,39 @@ class LangGraphEngine:
                 return await fn(state, ctx)
             return _node
 
-        # Register the IDENTICAL node set (single source of truth = NODE_SPECS).
-        for name, fn in NODE_SPECS:
+        planner_mode = getattr(ctx.settings, "orchestrator_mode", "heuristic") == "planner"
+        # Register the IDENTICAL node set the built-in engine uses (single source of
+        # truth), choosing the heuristic or planner node list by mode.
+        specs = PLANNER_NODE_SPECS if planner_mode else NODE_SPECS
+        for name, fn in specs:
             sg.add_node(name, _wrap(fn))
         sg.add_edge(START, N_INPUT_GUARD)
-        # Same single branch as the built-in graph: blocked -> END, else -> route.
-        sg.add_conditional_edges(
-            N_INPUT_GUARD,
-            lambda s: "blocked" if s.get("blocked") else "ok",
-            {"blocked": END, "ok": N_ROUTE},
-        )
-        sg.add_edge(N_ROUTE, N_GATHER)
-        sg.add_edge(N_GATHER, N_ANSWER)
-        sg.add_edge(N_ANSWER, N_OUTPUT_GUARD)
+        if planner_mode:
+            # Mirror of build_planner_graph: plan -> dispatch -> answer -> reflect,
+            # where the reflect gate loops back to plan (incomplete) or finishes.
+            sg.add_conditional_edges(
+                N_INPUT_GUARD,
+                lambda s: "blocked" if s.get("blocked") else "ok",
+                {"blocked": END, "ok": N_PLAN},
+            )
+            sg.add_edge(N_PLAN, N_PLAN_DISPATCH)
+            sg.add_edge(N_PLAN_DISPATCH, N_ANSWER)
+            sg.add_edge(N_ANSWER, N_REPLAN_GATE)
+            sg.add_conditional_edges(
+                N_REPLAN_GATE,
+                lambda s: "replan" if s.get("needs_replan") else "finish",
+                {"replan": N_PLAN, "finish": N_OUTPUT_GUARD},
+            )
+        else:
+            # Same single branch as the built-in graph: blocked -> END, else -> route.
+            sg.add_conditional_edges(
+                N_INPUT_GUARD,
+                lambda s: "blocked" if s.get("blocked") else "ok",
+                {"blocked": END, "ok": N_ROUTE},
+            )
+            sg.add_edge(N_ROUTE, N_GATHER)
+            sg.add_edge(N_GATHER, N_ANSWER)
+            sg.add_edge(N_ANSWER, N_OUTPUT_GUARD)
         sg.add_edge(N_OUTPUT_GUARD, END)
         # ``compile(checkpointer=...)`` is what enables resumable, persisted runs.
         self._compiled = sg.compile(checkpointer=checkpointer)

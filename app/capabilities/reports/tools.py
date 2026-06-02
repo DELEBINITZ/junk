@@ -102,8 +102,43 @@ async def find_expiring_items(args: ExpiringArgs, ctx: ToolContext):
     )
 
 
+class SearchArgs(BaseModel):
+    query: str = Field(description="What to search the security-reports corpus for (natural language).")
+    top_k: int = Field(default=6, ge=1, le=20, description="How many passages to return.")
+
+
+# RETRIEVAL-AS-A-TOOL. This exposes the module's RAG search as a first-class tool so
+# the planner/LLM can issue targeted sub-queries on demand (and so future corpora —
+# breaches, FAQ — follow the IDENTICAL pattern: one search tool per collection). It
+# is marked ``auto_invoke=False`` so the heuristic specialist doesn't fire it on
+# every turn (the module's bound retriever already auto-gathers); the LLM/planner
+# calls it deliberately. Still org-scoped and still passes the MCP boundary.
+@tool(
+    name="search_reports",
+    description=(
+        "Semantic RAG search over the embedded security-reports corpus. Returns the "
+        "most relevant report passages (with citations) for a natural-language query. "
+        "Use this to ground an answer in what analyst/AI security reports actually say."
+    ),
+    args_schema=SearchArgs,
+    rbac_role="viewer",
+    auto_invoke=False,
+)
+async def search_reports(args: SearchArgs, ctx: ToolContext):
+    # Same org-scoped pipeline the bound retriever uses (org_id from ctx, never args),
+    # just reachable as a callable tool. Returns a hit count + doc ids as structured
+    # data plus the passages as citations the answer can ground on.
+    chunks = await ctx.deps.rag.retrieve(args.query, collection="reports_kb", ctx=ctx, top_k=args.top_k)
+    if not chunks:
+        return ToolResult(data={"hits": 0}, citations=[])
+    return ToolResult(
+        data={"hits": len(chunks), "doc_ids": [c.doc_id for c in chunks]},
+        citations=[c.to_citation() for c in chunks],
+    )
+
+
 # The tuple the manifest imports as ``tools=TOOLS``. This is the module's entire
 # MCP/agent surface; ordering is irrelevant (the supervisor/specialist pick by need).
-TOOLS = (get_report_metadata, find_expiring_items)
+TOOLS = (get_report_metadata, find_expiring_items, search_reports)
 
-__all__ = ["TOOLS", "get_report_metadata", "find_expiring_items"]
+__all__ = ["TOOLS", "get_report_metadata", "find_expiring_items", "search_reports"]

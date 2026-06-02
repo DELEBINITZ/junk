@@ -44,7 +44,9 @@ async def test_injection_blocked(services, acme):
 async def test_streaming_emits_tokens_then_done(services, acme):
     types = [ev.type async for ev in services.orchestrator.stream_turn(acme, question="what are our top risks?")]
     assert types.count("token") > 5
-    assert types[-1] == "done" and "route" in types
+    # a routing-decision event is emitted — "plan" in planner mode (default),
+    # "route" in heuristic mode.
+    assert types[-1] == "done" and ("plan" in types or "route" in types)
 
 
 @pytest.mark.asyncio

@@ -37,8 +37,12 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The insecure development JWT secret. Referenced as the dev default AND by the
+# production guard, which refuses to boot prod while this is still in use.
+_DEV_JWT_SECRET = "dev-insecure-change-me-please-32byte-minimum-secret"  # noqa: S105
 
 
 class Settings(BaseSettings):
@@ -72,7 +76,7 @@ class Settings(BaseSettings):
     # every request's ToolContext and powers tenant isolation. The dev jwt_secret
     # is intentionally insecure and MUST be overridden outside dev.
     auth_provider: Literal["local", "oidc"] = "local"
-    jwt_secret: str = "dev-insecure-change-me-please-32byte-minimum-secret"  # noqa: S105 - dev only
+    jwt_secret: str = _DEV_JWT_SECRET  # CHANGE in prod — the prod guard enforces this
     jwt_algorithm: str = "HS256"
     access_token_ttl_seconds: int = 3600
     refresh_token_ttl_seconds: int = 1209600  # 14 days
@@ -182,9 +186,59 @@ class Settings(BaseSettings):
     # rolled into a running summary.
     agent_engine: Literal["internal", "langgraph"] = "internal"
     max_tool_iterations: int = 4
-    history_window_messages: int = 12
+    history_window_messages: int = 12     # how many prior messages run_turn loads
+    answer_history_turns: int = 6         # how many of those the answer prompt includes verbatim
     summary_trigger_messages: int = 20
-    router_mode: Literal["heuristic", "llm"] = "heuristic"
+    # The agentic path is ON by default: the planner brain + LLM tool-calling. Both
+    # DEGRADE GRACEFULLY to deterministic behaviour when no real LLM is wired (the
+    # provider gate inside the supervisor/planner/specialist makes them no-ops on
+    # the deterministic stub), so the zero-infra path still works. Point the LLM at
+    # your Qwen/SGLang and the full agentic loop (plan -> tools -> reflect) lights up.
+    router_mode: Literal["heuristic", "llm"] = "llm"
+    # Orchestration strategy. ``heuristic`` = the v1 supervisor->specialists graph
+    # (route -> parallel dispatch -> answer). ``planner`` = the LLM-brain graph
+    # (plan -> dispatch-with-dependencies -> synthesize -> bounded replan): it
+    # decomposes a query into steps across modules and supports cross-module data
+    # dependencies (a step can consume an earlier step's findings). The planner
+    # falls back to a deterministic supervisor-style plan when no real LLM is wired,
+    # so the zero-infra path still works and tests stay green.
+    orchestrator_mode: Literal["heuristic", "planner"] = "planner"
+    max_plan_steps: int = 6      # hard cap on steps the planner may emit (bounds fan-out + cost)
+    max_replans: int = 1         # how many times reflection may revise after a gap (0 = never)
+    planner_max_fanout: int = 2  # max modules a single (deterministic) plan spreads across
+
+    # ---- Remote MCP servers + tool-context budget --------------------------
+    # Per-module MCP server URLs. Empty => that module runs IN-PROCESS (local
+    # tools). Set one (e.g. a FastMCP server for EASM) and that module's tool
+    # EXECUTION is routed there over MCP, while its manifest stays local as the
+    # contract (so RBAC, the action gate, and planner cards are unchanged). Brand
+    # and ACI follow the same pattern when their servers exist.
+    easm_mcp_url: str = ""
+    brand_mcp_url: str = ""
+    aci_mcp_url: str = ""
+    # TTL of the short-lived, org-scoped service token minted to authenticate a
+    # remote MCP call (identity travels in this token, never in tool args).
+    mcp_service_token_ttl_seconds: int = 120
+    # CONTEXT-FLOOD GUARD: the max number of tools a specialist advertises to the
+    # tool-calling LLM at once. A remote MCP server may expose hundreds of tools;
+    # the specialist shortlists the most relevant ones (tool-RAG) up to this budget
+    # so a single agent context is never flooded with tool schemas.
+    max_tools_advertised: int = 8
+    # DYNAMIC TOOL DISCOVERY (pure-dynamic MCP). When a module is backed by an
+    # external MCP server, the agent discovers its tools at runtime via tools/list
+    # instead of declaring them locally. The discovered list is cached per
+    # (module, org) for this many seconds (servers filter by the caller's org).
+    mcp_tool_cache_ttl_seconds: int = 300
+    # Coarse LOCAL role floor applied to a dynamically-discovered tool (the remote
+    # server still enforces its own fine-grained RBAC from the service token; this
+    # is just a local floor since there's no local manifest entry to read).
+    mcp_dynamic_tool_role: str = "viewer"
+    # SAFETY POLICY for discovered tools the server did NOT annotate with a
+    # read-only/destructive hint: True => trust as read-callable; False => exclude
+    # (require a local manifest stub so the human action gate applies). A tool the
+    # server explicitly marks destructive/non-read-only is NEVER dynamically
+    # callable regardless of this flag — side effects must be declared + gated.
+    mcp_dynamic_trust_unannotated: bool = True
 
     # ---- Observability -----------------------------------------------------
     # Tracing + metrics. ``tracing_provider=none`` uses a NoOp tracer (default, hot
@@ -233,6 +287,54 @@ class Settings(BaseSettings):
                 return v  # JSON list — let pydantic parse
             return [item.strip() for item in s.split(",") if item.strip()]
         return v
+
+    @model_validator(mode="after")
+    def _enforce_prod_no_stub(self) -> Settings:
+        """PRODUCTION GUARD — fail-closed if ENVIRONMENT=prod is running on any stub
+        or insecure setting. This is how "no stub in production" is GUARANTEED: the
+        process refuses to boot and prints exactly what to fix, instead of silently
+        serving a security product on hash-embeddings + in-memory data. Dev/staging
+        are unaffected, so the zero-infra path and tests still work."""
+        if self.environment != "prod":
+            return self
+        bad: list[str] = []
+        if self.llm_provider == "deterministic":
+            bad.append("LLM_PROVIDER=deterministic — set sglang (self-hosted Qwen)")
+        if self.embedding_provider == "deterministic":
+            bad.append("EMBEDDING_PROVIDER=deterministic — set tei (Qwen3-Embedding)")
+        if self.retrieval_backend == "memory":
+            bad.append("RETRIEVAL_BACKEND=memory — set qdrant")
+        if self.store_backend == "memory":
+            bad.append("STORE_BACKEND=memory — set postgres (RLS)")
+        if self.store_backend == "postgres" and not self.database_url:
+            bad.append("STORE_BACKEND=postgres but DATABASE_URL is empty")
+        if self.seed_demo_data:
+            bad.append("SEED_DEMO_DATA=true — must be false in prod (no demo corpora)")
+        if self.debug:
+            bad.append("DEBUG=true — must be false in prod")
+        if self.auth_provider == "local":
+            if self.jwt_secret == _DEV_JWT_SECRET:
+                bad.append("JWT_SECRET is the insecure dev default — set a strong secret")
+            elif len(self.jwt_secret) < 32:
+                bad.append("JWT_SECRET shorter than 32 bytes")
+        if self.auth_provider == "oidc" and not (self.oidc_issuer and self.oidc_jwks_url):
+            bad.append("AUTH_PROVIDER=oidc but OIDC_ISSUER/OIDC_JWKS_URL not set")
+        # Tool-backed modules MUST point at a real MCP server in prod, else they
+        # would serve their built-in mock data. (Corpus modules like reports are
+        # covered by RETRIEVAL_BACKEND=qdrant above.)
+        for enabled, url, var in (
+            (self.cap_easm_enabled, self.easm_mcp_url, "EASM_MCP_URL"),
+            (self.cap_brand_enabled, self.brand_mcp_url, "BRAND_MCP_URL"),
+            (self.cap_aci_enabled, self.aci_mcp_url, "ACI_MCP_URL"),
+        ):
+            if enabled and not url:
+                bad.append(f"{var} not set while its module is enabled — would serve mock data")
+        if bad:
+            raise ValueError(
+                "ENVIRONMENT=prod but stub/insecure configuration detected. Fix:\n  - "
+                + "\n  - ".join(bad)
+            )
+        return self
 
     @property
     def is_prod(self) -> bool:

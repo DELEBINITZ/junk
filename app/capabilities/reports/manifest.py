@@ -98,7 +98,8 @@ MANIFEST = CapabilityManifest(
     # RBAC: per-tool minimum-role overrides, consumed by the MCP boundary before
     # each call. Both reports tools are viewer-level (read-only Q&A). A tool's own
     # ``rbac_role`` is the default; this map can tighten it per deployment.
-    rbac={"get_report_metadata": "viewer", "find_expiring_items": "viewer"},
+    rbac={"get_report_metadata": "viewer", "find_expiring_items": "viewer",
+          "search_reports": "viewer"},
     # Ownership metadata (who maintains the module) — informational only.
     owners=("team-reports",),
 )

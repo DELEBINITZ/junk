@@ -90,6 +90,46 @@ class AppServices:
                     pass
 
 
+def _service_token_minters(settings: Settings, audience: str):
+    """Return the (for_ctx, for_sc) token minters for one remote audience. Defined
+    at module level (not inside the loop below) so each call binds its OWN
+    ``audience`` — the closures turn the trusted local identity into a short-lived,
+    org-scoped service token for that specific server."""
+    from app.core.security.jwt import create_service_token
+
+    def for_ctx(ctx):
+        return create_service_token(
+            settings, sub=ctx.user_id, org_id=ctx.org_id, roles=ctx.roles,
+            audience=audience, ttl_seconds=settings.mcp_service_token_ttl_seconds)
+
+    def for_sc(sc):
+        return create_service_token(
+            settings, sub=sc.user_id, org_id=sc.org_id, roles=sc.roles,
+            audience=audience, ttl_seconds=settings.mcp_service_token_ttl_seconds)
+
+    return for_ctx, for_sc
+
+
+def _build_remote_executors(settings: Settings) -> dict[str, Any]:
+    """Build the per-module REMOTE tool executors from config. For each module with
+    a configured ``*_mcp_url`` we create a FastMCPRemote whose calls carry a
+    short-lived, org-scoped service token (identity rides in the token, never in
+    tool args). Empty by default => every module runs in-process, so this adds no
+    dependency and no behaviour change unless a URL is set. This is the ONE place a
+    module is "promoted" to its own server; the easm/brand/aci pattern is identical
+    — add a URL, done."""
+    from app.core.mcp.fastmcp_client import FastMCPRemote
+
+    urls = {"easm": settings.easm_mcp_url, "brand": settings.brand_mcp_url, "aci": settings.aci_mcp_url}
+    executors: dict[str, Any] = {}
+    for module_id, url in urls.items():
+        if not url:
+            continue
+        for_ctx, for_sc = _service_token_minters(settings, f"{module_id}-mcp")
+        executors[module_id] = FastMCPRemote(url, token_for_ctx=for_ctx, token_for_sc=for_sc)
+    return executors
+
+
 def build_services(settings: Settings) -> AppServices:
     """THE composition root. Construct every service from ``settings`` and wire
     them into the running app. Order matters and reads like a dependency chain:
@@ -136,7 +176,8 @@ def build_services(settings: Settings) -> AppServices:
     #    enforces RBAC and routes side-effecting tools to the action gate. The
     #    supervisor does routing. The checkpointer (durable run state) only exists
     #    on the LangGraph engine — None otherwise.
-    mcp = InProcessMCPClient(registry, action_gate=action_gate, logger=logger)
+    mcp = InProcessMCPClient(registry, action_gate=action_gate, logger=logger,
+                             remote_executors=_build_remote_executors(settings), settings=settings)
     supervisor = Supervisor(registry, llm, settings)
     checkpointer = build_checkpointer(settings) if settings.agent_engine == "langgraph" else None
 

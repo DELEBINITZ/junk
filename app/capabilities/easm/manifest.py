@@ -41,11 +41,12 @@ MANIFEST = CapabilityManifest(
         RoutingHint(
             intents=(
                 "attack surface", "exposed asset", "exposure", "open port", "asset inventory",
-                "external scan", "what's exposed", "subdomain", "shadow IT", "internet-facing",
-                "rescan", "surface change",
+                "asset count", "how many assets", "live assets", "external scan", "what's exposed",
+                "subdomain", "shadow IT", "internet-facing", "rescan", "surface change",
             ),
             examples=(
                 "what assets do we have exposed to the internet?",
+                "how many assets are live?",
                 "show me our current exposures",
                 "what changed on our attack surface this week?",
                 "rescan admin.acme.test",
@@ -61,7 +62,7 @@ MANIFEST = CapabilityManifest(
     # agent can never escalate privilege. (This mirrors each tool's own ``rbac_role``.)
     rbac={
         "query_assets": "viewer", "get_exposures": "viewer", "get_asset_changes": "viewer",
-        "trigger_rescan": "analyst",
+        "get_live_asset_count": "viewer", "trigger_rescan": "analyst",
     },
     owners=("team-easm",),
 )

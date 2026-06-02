@@ -158,7 +158,32 @@ async def trigger_rescan(args: RescanArgs, ctx: ToolContext):
     return ToolResult(data={"asset": args.asset, "status": "rescan_queued"})
 
 
-# The module's full tool surface, imported by the manifest as ``tools=TOOLS``.
-TOOLS = (query_assets, get_exposures, get_asset_changes, trigger_rescan)
+class AssetCountArgs(BaseModel):
+    live_only: bool = Field(default=True, description="Count only live/internet-exposed assets.")
 
-__all__ = ["TOOLS", "query_assets", "get_exposures", "get_asset_changes", "trigger_rescan"]
+
+# READ tool, viewer-level. This is the example tool that a real ``easm-mcp`` server
+# would serve: a single fast COUNT. Locally it counts the mock inventory; when
+# ``easm_mcp_url`` is configured, the MCP boundary routes EXECUTION to the remote
+# server instead (the local body is bypassed) — same name, same return contract,
+# org scoped from ctx either way. That is the "manifest is the contract, server is
+# the implementation" promotion path in one tool.
+@tool(name="get_live_asset_count",
+      description="Get the count of the organization's live (internet-exposed) external assets.",
+      args_schema=AssetCountArgs, rbac_role="viewer")
+async def get_live_asset_count(args: AssetCountArgs, ctx: ToolContext):
+    assets = _org(ctx)["assets"]
+    live = [a for a in assets if a.get("exposed")] if args.live_only else assets
+    n = len(live)
+    return ToolResult(
+        data={"live_asset_count": n, "live_only": args.live_only},
+        citations=[Citation(doc_id="easm-asset-count", source="easm", title="Live asset count",
+                            snippet=f"The organization currently has {n} live internet-exposed external assets.")],
+    )
+
+
+# The module's full tool surface, imported by the manifest as ``tools=TOOLS``.
+TOOLS = (query_assets, get_exposures, get_asset_changes, get_live_asset_count, trigger_rescan)
+
+__all__ = ["TOOLS", "query_assets", "get_exposures", "get_asset_changes",
+           "get_live_asset_count", "trigger_rescan"]

@@ -37,6 +37,9 @@ from app.core.agent.state import (
     N_GATHER,
     N_INPUT_GUARD,
     N_OUTPUT_GUARD,
+    N_PLAN,
+    N_PLAN_DISPATCH,
+    N_REPLAN_GATE,
     N_ROUTE,
     AgentContext,
     ChatState,
@@ -94,9 +97,12 @@ def build_answer_messages(state: ChatState, ctx: AgentContext) -> list[ChatMessa
     messages = [ChatMessage(role="system", content=persona)]
     if state.get("summary"):
         messages.append(ChatMessage(role="system", content=f"Conversation summary so far: {state['summary']}"))
-    # Only the last 6 turns — recent context matters, older context is covered by
-    # the rolling summary above. This bounds prompt size on long conversations.
-    for turn in (state.get("history") or [])[-6:]:
+    # Only the last N turns (settings.answer_history_turns) — recent context
+    # matters most, older context is covered by the rolling summary above. This is
+    # the ChatGPT-style "last-N messages as context" window; it bounds the prompt
+    # on long conversations while keeping the thread coherent for follow-ups.
+    n_turns = getattr(ctx.settings, "answer_history_turns", 6)
+    for turn in (state.get("history") or [])[-n_turns:]:
         role = turn.get("role", "user")
         if role in ("user", "assistant"):
             messages.append(ChatMessage(role=role, content=turn.get("content", "")))
@@ -301,13 +307,227 @@ NODE_SPECS = [
 ]
 
 
+# --------------------------------------------------------------------------- #
+# planner-mode nodes (orchestrator_mode=planner)
+#
+# The planner graph replaces route+gather with plan + plan_dispatch and adds a
+# replan_gate that can loop back to plan when evidence is missing. answer and the
+# two guardrails are SHARED with the heuristic graph — only the middle changes.
+# --------------------------------------------------------------------------- #
+def _step_summary(res, domain: str) -> str:
+    """A one-line gist of a step's findings, injected into any dependent step's
+    sub-question (this is how a later step 'sees' an earlier step's result)."""
+    if getattr(res, "summary", ""):
+        return res.summary
+    if res.chunks:
+        return f"[{domain}] {res.chunks[0].text[:200]}"
+    return f"[{domain}] no findings"
+
+
+async def plan_node(state: ChatState, ctx: AgentContext) -> dict:
+    """PLAN — the LLM brain decomposes the question into steps (see planner.py).
+
+    Builds a fresh Planner per turn (it is stateless), asks it for a Plan, and
+    publishes the steps + the set of domains involved. ``route_modules`` is set
+    from the plan's domains so the shared answer node still picks a module persona
+    and the TurnResult still reports what was consulted. On a replan loop,
+    ``replan_notes`` from the gate is fed back in so the brain can revise."""
+    from app.core.agent.planner import Planner
+
+    planner = Planner(ctx.registry, ctx.deps.llm, ctx.settings)
+    plan = await planner.plan(
+        state.get("safe_question", ""), ctx.sc,
+        replan_notes=state.get("replan_notes", ""),
+        history=state.get("history"), summary=state.get("summary", ""),
+    )
+    domains = list(dict.fromkeys(s.domain for s in plan.steps))
+    await ctx.fire(
+        "plan",
+        steps=[{"id": s.id, "domain": s.domain, "subq": s.subq, "depends_on": s.depends_on} for s in plan.steps],
+        mode=plan.mode,
+    )
+    return {
+        "plan": [s.model_dump() for s in plan.steps],
+        "route_modules": domains,
+        "plan_debug": {"mode": plan.mode, "synthesis": plan.synthesis,
+                       "replan_round": state.get("replan_count", 0)},
+    }
+
+
+async def plan_dispatch_node(state: ChatState, ctx: AgentContext) -> dict:
+    """DISPATCH (with dependencies) — execute the plan in dependency WAVES.
+
+    Each wave runs every step whose dependencies are already satisfied, IN
+    PARALLEL (asyncio.gather). A dependent step waits for its upstream steps and
+    receives their gists prepended to its sub-question — that is the cross-module
+    chain ("find the exposure, THEN find who weaponizes it"). Independent steps
+    just fan out. The EXECUTOR of one step is the ordinary per-module specialist
+    (build_specialist + investigate), so tool isolation, retrieval, RBAC and the
+    action gate all apply exactly as in heuristic mode. Findings from all steps
+    are merged, relevance-ranked, and capped into one numbered context block."""
+    question = state.get("safe_question", "")
+    steps: list[dict] = list(state.get("plan") or [])
+    await ctx.fire("status", stage="plan_dispatch", steps=len(steps))
+
+    summaries: dict[str, str] = {}        # step id -> gist (fed to dependents)
+    done: set[str] = set()
+    # Seed with any evidence already gathered on a PRIOR round, so a reflection
+    # replan ADDS to the context rather than discarding what we already found
+    # (relevance_rank dedupes the overlap).
+    all_chunks: list[Chunk] = list(state.get("context_chunks") or [])
+    events: list[dict] = []
+    plan_results: list[dict] = []
+
+    async def run_step(s: dict):
+        module = ctx.registry.module(s["domain"])
+        if not module or not module.enabled:
+            return s, None
+        subq = s["subq"]
+        deps = [d for d in s.get("depends_on", []) if d in summaries]
+        if deps:                          # inject upstream findings into this sub-question
+            ctxt = "\n".join(f"- {summaries[d]}" for d in deps)
+            subq = f"{s['subq']}\n\nUse these findings from earlier steps:\n{ctxt}"
+        specialist = build_specialist(module, ctx.deps, ctx.mcp)
+        res = await specialist.investigate(subq, ctx.tool_ctx)
+        return s, res
+
+    remaining = list(steps)
+    guard = 0
+    # The loop processes one wave per iteration. ``guard`` bounds it to the number
+    # of steps (+1) — with acyclic deps that is always enough to finish.
+    while remaining and guard <= len(steps) + 1:
+        guard += 1
+        ready = [s for s in remaining if all(d in done for d in s.get("depends_on", []))]
+        if not ready:                     # unsatisfiable deps -> run the rest anyway (degrade, never hang)
+            ready = remaining
+        wave = await asyncio.gather(*[run_step(s) for s in ready], return_exceptions=True)
+        for item in wave:
+            if isinstance(item, Exception):
+                continue
+            s, res = item
+            done.add(s["id"])
+            if res is None:               # disabled/missing module
+                plan_results.append({"id": s["id"], "domain": s["domain"], "subq": s["subq"], "ok": False, "found": 0})
+                events.append({"step": s["id"], "domain": s["domain"], "ok": False})
+                continue
+            summaries[s["id"]] = _step_summary(res, s["domain"])
+            all_chunks.extend(res.chunks)
+            events.extend(res.events)
+            plan_results.append({"id": s["id"], "domain": s["domain"], "subq": s["subq"],
+                                 "ok": True, "found": len(res.chunks)})
+            await ctx.fire("tool", step=s["id"], module=s["domain"], ok=True, found=len(res.chunks))
+        remaining = [s for s in remaining if s["id"] not in done]
+
+    ranked = relevance_rank(all_chunks, question, MAX_CONTEXT_ENTRIES)
+    block = "\n".join(f"[{i + 1}] {c.text}" for i, c in enumerate(ranked))
+    await ctx.fire("status", stage="retrieved", count=len(ranked))
+    return {"context_chunks": ranked, "context_block": block,
+            "tool_events": events, "plan_results": plan_results}
+
+
+async def reflect_gate_node(state: ChatState, ctx: AgentContext) -> dict:
+    """REFLECT GATE — runs AFTER the answer. This is what makes the loop agentic
+    rather than a one-shot pipeline: a critic LLM judges whether the ANSWER
+    actually addresses the question and every sub-question. If it finds a real gap
+    (or a step returned no evidence) and budget remains, it loops back to PLAN with
+    a note on what's missing; the next round re-plans for the gap and ACCUMULATES
+    evidence (plan_dispatch seeds from the prior context).
+
+    Conservative + BOUNDED: only an LLM-mode run reflects, only up to
+    ``max_replans`` times. The deterministic path always finishes in one pass, so
+    zero-infra runs and tests never loop. The decision is read by the conditional
+    edge (replan -> plan, finish -> output_guard)."""
+    count = state.get("replan_count", 0)
+    max_replans = getattr(ctx.settings, "max_replans", 1)
+    is_llm = ctx.settings.router_mode == "llm" and getattr(ctx.deps.llm, "provider", "") != "deterministic"
+    if not is_llm or count >= max_replans:
+        return {"needs_replan": False}
+
+    results = state.get("plan_results") or []
+    gaps = [r for r in results if not r.get("ok") or r.get("found", 0) == 0]
+    question = state.get("safe_question", "")
+    answer = state.get("answer", "")
+    subqs = "; ".join(r.get("subq", "") for r in results) or question
+
+    # A cheap completeness critic on the FAST lane. Reflection must never break a
+    # turn, so any failure just finishes with the answer we have.
+    critic = [
+        ChatMessage(role="system", content=(
+            "You are a strict completeness critic. Decide if the ANSWER fully addresses the "
+            "QUESTION and every SUB-QUESTION. If complete, reply exactly 'COMPLETE'. Otherwise "
+            "reply 'GAP: <what specifically is missing or unanswered>'.")),
+        ChatMessage(role="user", content=f"QUESTION: {question}\nSUB-QUESTIONS: {subqs}\nANSWER: {answer}"),
+    ]
+    try:
+        resp = await ctx.deps.llm.complete(critic, lane=Lane.FAST)
+        verdict = (resp.text or "").strip()
+    except Exception:  # noqa: BLE001 - reflection is best-effort
+        return {"needs_replan": False}
+
+    if not (verdict.upper().startswith("GAP") or gaps):
+        return {"needs_replan": False}
+    note = verdict if verdict.upper().startswith("GAP") else (
+        "Unresolved: " + "; ".join(f"{r['domain']} ({r['subq']})" for r in gaps))
+    await ctx.fire("status", stage="reflecting", round=count + 1)
+    return {"needs_replan": True, "replan_count": count + 1, "replan_notes": note}
+
+
+def build_planner_graph(ctx: AgentContext):
+    """Wire the planner-mode graph for the built-in engine. Same shape the
+    LangGraph engine mirrors (engines.py). Note the cycle: replan_gate can route
+    back to plan, which the engine's max-steps fuse keeps bounded."""
+    g = StateGraph()
+    g.add_node(N_INPUT_GUARD, lambda s: input_guardrail_node(s, ctx))
+    g.add_node(N_PLAN, lambda s: plan_node(s, ctx))
+    g.add_node(N_PLAN_DISPATCH, lambda s: plan_dispatch_node(s, ctx))
+    g.add_node(N_ANSWER, lambda s: answer_node(s, ctx))
+    g.add_node(N_REPLAN_GATE, lambda s: reflect_gate_node(s, ctx))
+    g.add_node(N_OUTPUT_GUARD, lambda s: output_guardrail_node(s, ctx))
+
+    g.set_entry(N_INPUT_GUARD)
+    g.add_conditional_edges(
+        N_INPUT_GUARD,
+        lambda s: "blocked" if s.get("blocked") else "ok",
+        {"blocked": END, "ok": N_PLAN},
+    )
+    g.add_edge(N_PLAN, N_PLAN_DISPATCH)
+    g.add_edge(N_PLAN_DISPATCH, N_ANSWER)
+    g.add_edge(N_ANSWER, N_REPLAN_GATE)
+    # The branch that makes it agentic: reflect on the answer; if incomplete, loop
+    # back to PLAN (accumulating evidence); otherwise finish to the output guard.
+    g.add_conditional_edges(
+        N_REPLAN_GATE,
+        lambda s: "replan" if s.get("needs_replan") else "finish",
+        {"replan": N_PLAN, "finish": N_OUTPUT_GUARD},
+    )
+    g.add_edge(N_OUTPUT_GUARD, END)
+    return g.compile()
+
+
+# Planner node set for the LangGraph engine (mirrors build_planner_graph). Note
+# the reflect gate sits AFTER answer.
+PLANNER_NODE_SPECS = [
+    (N_INPUT_GUARD, input_guardrail_node),
+    (N_PLAN, plan_node),
+    (N_PLAN_DISPATCH, plan_dispatch_node),
+    (N_ANSWER, answer_node),
+    (N_REPLAN_GATE, reflect_gate_node),
+    (N_OUTPUT_GUARD, output_guardrail_node),
+]
+
+
 __all__ = [
     "build_report_graph",
+    "build_planner_graph",
     "build_answer_messages",
     "NODE_SPECS",
+    "PLANNER_NODE_SPECS",
     "input_guardrail_node",
     "route_node",
     "dispatch_node",
     "answer_node",
     "output_guardrail_node",
+    "plan_node",
+    "plan_dispatch_node",
+    "reflect_gate_node",
 ]
