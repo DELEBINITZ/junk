@@ -33,7 +33,7 @@ from app.core.contracts import Chunk, ToolContext
 from app.core.rag.embeddings import Embedder, build_embedder
 from app.core.rag.filters import extract_time_filters
 from app.core.rag.reranker import Reranker, build_reranker
-from app.core.rag.vector_store import InMemoryVectorStore, SearchFilters, VectorRecord, VectorStore
+from app.core.rag.vector_store import SearchFilters, VectorRecord, VectorStore
 
 
 class IndexItem(BaseModel):
@@ -201,13 +201,10 @@ class CollectionRetriever:
 
 
 def build_vector_store(settings: Settings) -> VectorStore:
-    # Pick the vector backend from config: real Qdrant in prod, the in-memory
-    # brute-force store otherwise. Both honor the same org_id-scoped contract.
-    if settings.retrieval_backend == "qdrant":
-        from app.core.rag.qdrant_backend import QdrantVectorStore
+    # Qdrant is the only vector backend (org_id-scoped). No in-memory fallback.
+    from app.core.rag.qdrant_backend import QdrantVectorStore
 
-        return QdrantVectorStore(settings.qdrant_url, settings.qdrant_api_key)
-    return InMemoryVectorStore()
+    return QdrantVectorStore(settings.qdrant_url, settings.qdrant_api_key)
 
 
 def build_rag(settings: Settings) -> RetrievalPipeline:

@@ -1,11 +1,10 @@
 """PostgreSQL-backed conversation store (``store_backend=postgres``).
 
 ================================ MENTAL MODEL =============================
-This is the PRODUCTION twin of InMemoryConversationStore. It implements the exact
-same ``ConversationStore`` interface, so callers (the chat service, the routers)
-are completely unaware which backend is live — only ``bootstrap`` decides, from
-``store_backend``. The difference is durability AND how tenant isolation is
-enforced.
+This is the ConversationStore implementation. It satisfies the ``ConversationStore``
+interface, so callers (the chat service, the routers) talk to the interface and are
+unaware of the concrete backend. It provides durability AND enforces tenant
+isolation at the database via Row-Level Security.
 
 THE KEY IDEA — defense at the database via RLS: every method below runs its SQL
 inside ``self.db.org_transaction(org_id)``. That context manager opens a Postgres

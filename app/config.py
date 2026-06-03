@@ -4,27 +4,25 @@ the whole app is assembled from.
 MENTAL MODEL: this one Settings object is the "control panel" for the platform.
 bootstrap.py reads it and decides which concrete backend to wire for every seam
 (LLM, embeddings, vector store, chat store, agent engine, tracing). That pattern
-is "config-gating": the *same* code path serves either a deterministic, self-
-hosted default or a real production backend, chosen purely by a value here. No
-code change is needed to switch — only an env var.
+is "config-gating": the *same* code path serves whichever real backend a value
+here selects. No code change is needed to switch — only an env var.
 
-WHY DETERMINISTIC DEFAULTS MATTER (read this twice): every external dependency
-defaults to a zero-infra local path, so the system boots and serves with no GPU,
-no API keys, and no network. Two payoffs:
+REAL INFRA IS REQUIRED: the offline/deterministic stubs have been removed. The
+platform needs a real LLM (SGLang/OpenAI-compatible), a real embedder (TEI/OpenAI),
+Qdrant, and Postgres to boot and serve. Two payoffs of the data-governance posture:
   * onboarding / tests / CI run anywhere, instantly and reproducibly; and
   * SECURITY — on the defaults, no contract or security-intelligence text is ever
     sent to an external LLM/embedding API. Sensitive data only leaves this process
     if an operator EXPLICITLY flips a provider to a hosted service and supplies
     creds. Self-hosted-by-default is a deliberate data-governance posture.
 
-  * ``llm_provider=deterministic``      -> no LLM server needed
-  * ``embedding_provider=deterministic``-> hash embeddings, no TEI
-  * ``retrieval_backend=memory``        -> in-process vector store, no Qdrant
-  * ``store_backend=memory``            -> in-process chat/session store, no PG
+  * ``llm_provider=sglang|openai``      -> a real LLM server is required
+  * ``embedding_provider=tei|openai``   -> a real embedder is required
+  * ``retrieval_backend=qdrant``        -> Qdrant is required
+  * ``store_backend=postgres``          -> Postgres (+RLS) is required
   * ``agent_engine=internal``           -> built-in graph engine, no langgraph dep
 
-Flip the corresponding env var + provide creds to use the real production
-backends (SGLang, TEI, Qdrant, Postgres+RLS, Redis, Langfuse, LangGraph).
+Provide each backend's URL + creds via env. There is no zero-infra fallback.
 
 HOW pydantic-settings WORKS: each field below is read from the environment (or a
 ``.env`` file) by its UPPER_CASE name; if absent, the default here is used and is
@@ -91,8 +89,8 @@ class Settings(BaseSettings):
     # is the Postgres session variable set to the org id inside each transaction,
     # so the database itself enforces "an org can only read its own rows" — a
     # second, defense-in-depth layer of tenant isolation under the app checks.
-    store_backend: Literal["memory", "postgres"] = "memory"
-    database_url: str = ""  # postgresql://user:pass@host:5432/db
+    store_backend: Literal["postgres"] = "postgres"
+    database_url: str = ""  # postgresql://user:pass@host:5432/db (REQUIRED — no in-memory fallback)
     rls_setting_name: str = "app.organization_id"
     db_pool_min: int = 1
     db_pool_max: int = 10
@@ -105,14 +103,12 @@ class Settings(BaseSettings):
     semantic_cache_threshold: float = 0.95
 
     # ---- LLM ---------------------------------------------------------------
-    # The model backend. ``deterministic`` is a stub that returns fixed, grounded
-    # output with NO network call — the security-relevant default (no prompt or
-    # retrieved text leaves the box). ``sglang`` is the self-hosted production
-    # path; ``openai`` is a hosted dev convenience and, by design, never for
-    # sensitive prod data. Three model "lanes" (fast/standard/deep) let cheap
-    # steps (routing, tool planning) use a small model and the answer use a bigger
-    # one — see llm/lanes.py.
-    llm_provider: Literal["deterministic", "sglang", "openai"] = "deterministic"
+    # The model backend. ``sglang`` is the self-hosted production path; ``openai``
+    # is a hosted/OpenAI-compatible endpoint. A real LLM server is REQUIRED — there
+    # is no offline stub. Three model "lanes" (fast/standard/deep) let cheap steps
+    # (routing, tool planning) use a small model and the answer use a bigger one —
+    # see llm/lanes.py.
+    llm_provider: Literal["sglang", "openai"] = "sglang"
     # SGLang (OpenAI-compatible) — three lanes
     sglang_base_url: str = "http://localhost:30000/v1"
     sglang_api_key: str = "EMPTY"
@@ -128,22 +124,22 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
 
     # ---- Embeddings --------------------------------------------------------
-    # Vectorizer for RAG. ``deterministic`` hashes text into a vector locally (no
-    # model, no network — keeps the default offline and reproducible); ``tei`` is
-    # the self-hosted embedding server. ``embedding_dim`` MUST match whatever the
-    # vector store was created with.
-    embedding_provider: Literal["deterministic", "tei", "openai"] = "deterministic"
+    # Vectorizer for RAG. ``tei`` is the self-hosted embedding server; ``openai`` is
+    # an OpenAI-compatible embedding endpoint. A real embedder is REQUIRED — there is
+    # no offline stub. ``embedding_dim`` MUST match whatever the vector store was
+    # created with.
+    embedding_provider: Literal["tei", "openai"] = "tei"
     tei_embed_url: str = "http://localhost:8080"
     embedding_dim: int = 1024
     embedding_model: str = "Qwen/Qwen3-Embedding-8B"
 
     # ---- Retrieval ---------------------------------------------------------
-    # The vector store + RAG knobs. ``memory`` is an in-process store (zero infra);
-    # ``qdrant`` is the production vector DB. ``top_k`` = how many candidates to
-    # fetch; reranking (a cross-encoder, optional) reorders them for precision and
+    # The vector store + RAG knobs. ``qdrant`` is the production vector DB and the
+    # only backend — there is no in-process fallback. ``top_k`` = how many candidates
+    # to fetch; reranking (a cross-encoder, optional) reorders them for precision and
     # keeps the best ``rerank_top_k``. ``recency_half_life_days`` lets fresher docs
     # outrank stale ones — important for security intel that ages fast.
-    retrieval_backend: Literal["memory", "qdrant"] = "memory"
+    retrieval_backend: Literal["qdrant"] = "qdrant"
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     retrieval_top_k: int = 20
@@ -353,24 +349,17 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _enforce_prod_no_stub(self) -> Settings:
-        """PRODUCTION GUARD — fail-closed if ENVIRONMENT=prod is running on any stub
-        or insecure setting. This is how "no stub in production" is GUARANTEED: the
-        process refuses to boot and prints exactly what to fix, instead of silently
-        serving a security product on hash-embeddings + in-memory data. Dev/staging
-        are unaffected, so the zero-infra path and tests still work."""
+        """PRODUCTION GUARD — fail-closed if ENVIRONMENT=prod is running on an
+        insecure or incomplete setting. The deterministic/in-memory stubs no longer
+        exist (a real LLM/embedder/Qdrant/Postgres is always required), so this now
+        checks the remaining footguns: a missing DB URL, dev secrets, and demo
+        toggles. The process refuses to boot and prints exactly what to fix."""
         if self.environment != "prod":
             return self
         bad: list[str] = []
-        if self.llm_provider == "deterministic":
-            bad.append("LLM_PROVIDER=deterministic — set sglang (self-hosted Qwen)")
-        if self.embedding_provider == "deterministic":
-            bad.append("EMBEDDING_PROVIDER=deterministic — set tei (Qwen3-Embedding)")
-        if self.retrieval_backend == "memory":
-            bad.append("RETRIEVAL_BACKEND=memory — set qdrant")
-        if self.store_backend == "memory":
-            bad.append("STORE_BACKEND=memory — set postgres (RLS)")
-        if self.store_backend == "postgres" and not self.database_url:
-            bad.append("STORE_BACKEND=postgres but DATABASE_URL is empty")
+        # Postgres is the only store backend — a DB URL is mandatory to run at all.
+        if not self.database_url:
+            bad.append("DATABASE_URL is empty — Postgres is required (no in-memory store)")
         if self.seed_demo_data:
             bad.append("SEED_DEMO_DATA=true — must be false in prod (no demo corpora)")
         if self.debug:
@@ -395,7 +384,7 @@ class Settings(BaseSettings):
                 bad.append(f"{var} not set while its module is enabled — would serve mock data")
         if bad:
             raise ValueError(
-                "ENVIRONMENT=prod but stub/insecure configuration detected. Fix:\n  - "
+                "ENVIRONMENT=prod but insecure/incomplete configuration detected. Fix:\n  - "
                 + "\n  - ".join(bad)
             )
         return self
