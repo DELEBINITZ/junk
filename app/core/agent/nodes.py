@@ -33,7 +33,7 @@ import re
 from typing import Any
 
 from app.core.agent.graph import END, StateGraph
-from app.core.agent.specialist import build_specialist, relevance_rank
+from app.core.agent.specialist import build_specialist, rank_evidence
 from app.core.agent.state import (
     N_ANSWER,
     N_GATHER,
@@ -53,18 +53,37 @@ from app.core.llm.base import CONTEXT_MARKER, ChatMessage, Lane
 
 # After merging every specialist's findings we keep at most this many chunks for
 # the final prompt. A hard cap is what keeps the LLM context bounded no matter
-# how many modules answered — cost and latency stay predictable.
+# how many modules answered — cost and latency stay predictable. Each reflection
+# round raises the cap (see _context_cap) so accumulated evidence isn't truncated.
 MAX_CONTEXT_ENTRIES = 8
+MAX_CONTEXT_ENTRIES_CEILING = 16   # hard upper bound even after several replans
+
+
+def _context_cap(state: ChatState) -> int:
+    """How many merged chunks to keep this round. Grows with reflection depth so a
+    deep-reasoning loop ACCUMULATES evidence (each round adds findings) instead of
+    re-truncating to the same 8 every pass — bounded by the ceiling for cost/latency."""
+    return min(MAX_CONTEXT_ENTRIES + 3 * state.get("replan_count", 0), MAX_CONTEXT_ENTRIES_CEILING)
+
 
 # The base "system prompt" — the standing instructions given to the answer LLM.
-# Note the two rules that make this a RAG system and not a chatbot: answer ONLY
-# from the retrieved context, and refuse (don't guess) when the context lacks
-# the answer. This is the anti-hallucination contract, enforced again at output.
+# The two rules that make this a RAG system and not a chatbot: answer ONLY from the
+# retrieved context, and refuse (don't guess) when it lacks the answer (the
+# anti-hallucination contract, enforced again at output). The rest raise answer
+# quality: prioritize by risk, reconcile conflicting sources, and be explicit about
+# confidence/gaps rather than papering over them.
 BASE_SYSTEM = (
-    "You are a security-intelligence analyst assistant. Answer the user's "
-    "question USING ONLY the retrieved context below. Cite every claim with its "
-    "source marker like [1]. If the context does not contain the answer, say you "
-    "don't have enough grounded information — never guess. Be concise and precise."
+    "You are a security-intelligence analyst assistant. Answer the user's question "
+    "USING ONLY the retrieved context below, and cite every claim with its source "
+    "marker like [1] (cite multiple when a claim rests on several, e.g. [1][3]).\n"
+    "- If the context does not contain the answer, say you don't have enough grounded "
+    "information and name what's missing — never guess or use outside knowledge.\n"
+    "- Lead with what matters most: rank findings by severity/exploitability and "
+    "recency; surface critical/high items first.\n"
+    "- If sources conflict or are partial, say so explicitly and prefer the most "
+    "specific, most recent, best-supported evidence rather than averaging them.\n"
+    "- Report concrete specifics (asset names, CVE ids, dates, severities) over "
+    "generalities. Be concise and precise; structure multi-part answers clearly."
 )
 
 
@@ -101,6 +120,12 @@ def build_answer_messages(state: ChatState, ctx: AgentContext) -> list[ChatMessa
     messages = [ChatMessage(role="system", content=persona)]
     if state.get("summary"):
         messages.append(ChatMessage(role="system", content=f"Conversation summary so far: {state['summary']}"))
+    # The planner decides HOW to combine cross-domain findings (its ``synthesis``
+    # goal); thread it in so the answer step actually follows that strategy instead
+    # of ignoring the plan's intent. Empty on the non-planner path.
+    if state.get("synthesis"):
+        messages.append(ChatMessage(
+            role="system", content=f"Synthesis goal for this answer: {state['synthesis']}"))
     # Only the last N turns (settings.answer_history_turns) — recent context
     # matters most, older context is covered by the rolling summary above. This is
     # the ChatGPT-style "last-N messages as context" window; it bounds the prompt
@@ -313,10 +338,14 @@ async def dispatch_node(state: ChatState, ctx: AgentContext) -> dict:
         events.extend(res.events)
         await ctx.fire("tool", module=module.id, ok=True, found=len(res.chunks))
 
-    # Rank the merged evidence by overlap with the question, then keep the top N.
-    # Ranking BEFORE capping is what prevents a relevant chunk from a late module
-    # being dropped just because of insertion order.
-    chunks = relevance_rank(chunks, question, MAX_CONTEXT_ENTRIES)
+    # Rank the merged evidence by MEANING (embedding similarity to the question),
+    # then keep the top N. This is the single most important ranking in the turn —
+    # it decides which chunks the answer LLM actually sees — so we rank semantically
+    # (rank_evidence) rather than by keyword overlap. Ranking BEFORE capping is what
+    # prevents a relevant chunk from a late module being dropped on insertion order.
+    # ``rank_evidence`` falls back to the lexical ranker if the embedder is absent.
+    embedder = getattr(ctx.deps.rag, "embedder", None)
+    chunks = await rank_evidence(chunks, question, _context_cap(state), embedder)
     # Render as "[1] text\n[2] ..." (injection-neutralized); the [n] indices become
     # the citation markers the answer LLM uses, mapped back to sources in answer_node.
     block = render_context_block(chunks, ctx)
@@ -336,7 +365,14 @@ async def answer_node(state: ChatState, ctx: AgentContext) -> dict:
     await ctx.fire("status", stage="answering")
     messages = build_answer_messages(state, ctx)
     llm = ctx.deps.llm
-    lane = Lane.STANDARD                          # answers use the standard model (see llm/lanes.py)
+    # ADAPTIVE LANE: a hard synthesis — a multi-step plan, several routed modules, or
+    # a turn that went through a reflection round — earns the DEEP model (the strongest
+    # tier). A simple single-module question stays on STANDARD to keep cost/latency low.
+    # (Under the openai provider all lanes map to one model, so this is a no-op there.)
+    plan_steps = state.get("plan") or []
+    routed = state.get("route_modules") or []
+    hard = len(plan_steps) > 1 or len(routed) > 1 or state.get("replan_count", 0) > 0
+    lane = Lane.DEEP if hard else Lane.STANDARD
     if ctx.stream_tokens and ctx.emit is not None:
         # Streaming path: accumulate tokens while also emitting each one live.
         buf: list[str] = []
@@ -475,6 +511,9 @@ async def plan_node(state: ChatState, ctx: AgentContext) -> dict:
     return {
         "plan": [s.model_dump() for s in plan.steps],
         "route_modules": domains,
+        # Publish the synthesis goal to STATE (not just debug) so the answer node can
+        # follow the plan's strategy for combining findings (see build_answer_messages).
+        "synthesis": plan.synthesis,
         "plan_debug": {"mode": plan.mode, "synthesis": plan.synthesis,
                        "replan_round": state.get("replan_count", 0)},
     }
@@ -499,7 +538,7 @@ async def plan_dispatch_node(state: ChatState, ctx: AgentContext) -> dict:
     done: set[str] = set()
     # Seed with any evidence already gathered on a PRIOR round, so a reflection
     # replan ADDS to the context rather than discarding what we already found
-    # (relevance_rank dedupes the overlap).
+    # (rank_evidence dedupes the overlap at the end).
     all_chunks: list[Chunk] = list(state.get("context_chunks") or [])
     events: list[dict] = []
     plan_results: list[dict] = []
@@ -553,7 +592,13 @@ async def plan_dispatch_node(state: ChatState, ctx: AgentContext) -> dict:
             await ctx.fire("tool", step=s["id"], module=s["domain"], ok=True, found=len(res.chunks))
         remaining = [s for s in remaining if s["id"] not in done]
 
-    ranked = relevance_rank(all_chunks, question, MAX_CONTEXT_ENTRIES)
+    # Semantically rank the POOLED evidence from every plan step (RAG chunks + tool
+    # outputs) by meaning, dedupe, and keep the top N. The cap GROWS with reflection
+    # depth (_context_cap) so each replan round adds to the context rather than
+    # re-truncating to the same size — that is what makes the deep-reasoning loop
+    # actually accumulate evidence. Embedder-backed, with a lexical fallback.
+    embedder = getattr(ctx.deps.rag, "embedder", None)
+    ranked = await rank_evidence(all_chunks, question, _context_cap(state), embedder)
     block = render_context_block(ranked, ctx)
     await ctx.fire("status", stage="retrieved", count=len(ranked))
     return {"context_chunks": ranked, "context_block": block,
@@ -568,21 +613,35 @@ async def reflect_gate_node(state: ChatState, ctx: AgentContext) -> dict:
     a note on what's missing; the next round re-plans for the gap and ACCUMULATES
     evidence (plan_dispatch seeds from the prior context).
 
-    Conservative + BOUNDED: only an LLM-mode run reflects, only up to
-    ``max_replans`` times. The deterministic path always finishes in one pass, so
-    zero-infra runs and tests never loop. The decision is read by the conditional
-    edge (replan -> plan, finish -> output_guard)."""
+    Conservative + BOUNDED: reflection runs only when the LLM router is on
+    (``router_mode=llm``) and only up to ``max_replans`` times, so a turn can never
+    loop indefinitely. The decision is read by the conditional edge (replan -> plan,
+    finish -> output_guard)."""
     count = state.get("replan_count", 0)
     max_replans = getattr(ctx.settings, "max_replans", 1)
+    # ``router_mode=llm`` gates reflection. (The provider-name check is a belt-and-
+    # suspenders guard against a non-reasoning stub; real providers always pass it.)
     is_llm = ctx.settings.router_mode == "llm" and getattr(ctx.deps.llm, "provider", "") != "deterministic"
     if not is_llm or count >= max_replans:
         return {"needs_replan": False}
 
     results = state.get("plan_results") or []
+    # A "gap" = a plan step that errored or returned ZERO evidence — a concrete hole
+    # the next round should target. ``citations`` tells us how grounded the answer is.
     gaps = [r for r in results if not r.get("ok") or r.get("found", 0) == 0]
+    citations = state.get("citations") or []
     question = state.get("safe_question", "")
     answer = state.get("answer", "")
     subqs = "; ".join(r.get("subq", "") for r in results) or question
+
+    # EFFICIENCY SHORT-CIRCUIT: if every step found evidence (no gaps) AND the answer
+    # is already well-grounded (cites >= 2 distinct sources), it is almost certainly
+    # complete — so skip the extra critic LLM call and finish. The output groundedness
+    # guardrail still runs downstream, so this only avoids a redundant check on the
+    # common good case. Anything weaker (any gap, or a thinly-cited answer) still falls
+    # through to the critic below, which can send the loop back to PLAN.
+    if not gaps and len(citations) >= 2:
+        return {"needs_replan": False}
 
     # A cheap completeness+groundedness critic on the FAST lane (deep-reasoning gate).
     # It pushes the loop to fetch BETTER data, not just fill blanks: it flags a gap

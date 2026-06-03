@@ -5,8 +5,10 @@ Today it answers questions about **security reports**; it is built as a **frozen
 core + drop-in capability modules** so EASM, Brand Protection, and ACI (and
 anything after) bolt on as ~1-day modules with **no core change**.
 
-This document is the design + a map into the code. Built greenfield in FastAPI;
-runs with **zero infra** by default and flips to a self-hosted GPU stack by config.
+This document is the design + a map into the code. Built greenfield in FastAPI on a
+real-infra stack: a real LLM (SGLang/OpenAI-compatible), a real embedder (TEI/OpenAI),
+Qdrant, and Postgres+RLS. Routing is dynamic (by meaning) and the default
+orchestrator plans → dispatches → reflects.
 
 ---
 
@@ -73,20 +75,20 @@ prompt cannot make the agent cross orgs.
 | Concern | Path | Notes |
 |--------|------|------|
 | Frozen contracts | `app/core/contracts.py` | `Tool`, `CapabilityManifest`, `ToolContext`, `Retriever`, `ActionHandler`, … (SemVer'd) |
-| Config | `app/config.py` | every backend config-gated; deterministic defaults |
+| Config | `app/config.py` | every backend config-gated; real infra required (no offline stubs) |
 | Registry | `app/core/registry.py` | manifest discovery, per-org capability views |
 | Supervisor / router | `app/core/agent/supervisor.py` | manifest-driven; heuristic + LLM modes |
 | Specialists | `app/core/agent/specialist.py` | one per module, run **in parallel**, each **scoped to its own tools** (tool schemas never co-locate → scales to 100s of tools); pluggable per module via `manifest.specialist` |
 | Graph engines | `app/core/agent/graph.py`, `engines.py` | built-in (zero-dep) + real **LangGraph** + checkpointer |
 | Nodes | `app/core/agent/nodes.py` | guardrail→route→gather→answer→guardrail |
 | Orchestrator | `app/core/agent/orchestrator.py` | sessions, persistence, SSE streaming |
-| LLM lanes | `app/core/llm/` | deterministic · SGLang · OpenAI-compat; fast/standard/deep |
-| Retrieval | `app/core/rag/` | embeddings, **org-filtered** vector store (mem/Qdrant), reranker, time filters, citations |
-| Memory | `app/core/memory/` | sessions+messages (mem/Postgres-RLS), rolling summary, KG seam |
+| LLM lanes | `app/core/llm/` | SGLang · OpenAI-compat; fast/standard/deep |
+| Retrieval | `app/core/rag/` | embeddings (TEI/OpenAI), **org-filtered** Qdrant store, reranker, time filters, citations |
+| Memory | `app/core/memory/` | sessions+messages (Postgres-RLS), rolling summary, KG seam |
 | Guardrails | `app/core/guardrails/` | input/output spine; model seams (Prompt/Llama Guard) |
 | MCP boundary | `app/core/mcp/` | in-process now; remote client + standalone server seams |
 | Action gate | `app/core/action_gate/` | human-approval inbox for side-effecting tools |
-| Security | `app/core/security/` | local JWT + OIDC, RBAC, revocation, org context |
+| Security | `app/core/security/` | API key + verified JWT, RBAC, org context, MCP service tokens |
 | DB / RLS | `app/core/db/` | async pool, `org_transaction` (RLS), migrations |
 | Ingestion | `app/core/ingestion/` | `/ingest` path + event-bus seam + parsers |
 | Observability | `app/core/observability/` | logging, Langfuse seam, metrics, audit |
@@ -103,20 +105,23 @@ A module is a directory with a `MANIFEST` (`app/core/contracts.py:CapabilityMani
 
 ```python
 MANIFEST = CapabilityManifest(
-    id="easm", version="1.0.0", display_name="...",
+    id="easm", version="1.0.0",
+    display_name="External Attack Surface Management",   # display_name + description
+    description="Exposed assets, exposures, attack-surface changes; rescans (gated).",
     enabled_flag="cap_easm_enabled",          # deployment composition
-    tools=TOOLS,                              # typed, MCP-exposable, RBAC'd
+    tools=TOOLS,                              # typed, MCP-exposable, RBAC'd (names+descs = routing signal)
     retrievers=(CollectionRetriever(...),),   # optional corpus binding (RAG)
-    routing_hints=(RoutingHint(intents=..., examples=...),),  # supervisor routes from these
     default_autonomy=Autonomy.SUGGEST,
     rbac={"trigger_rescan": "analyst"},       # min role per tool
 )
 ```
 
 At boot the registry **discovers** manifests, validates contracts, merges
-ontology, and computes per-org views. The supervisor routes from `routing_hints`;
-RBAC + the action gate come from the manifest. **Adding a feature edits no core
-file.** Two corpus shapes are demonstrated: `reports` (RAG corpus + retriever) and
+ontology, and computes per-org views. The supervisor/planner routes by MEANING
+(embedding similarity over each module's description + tool descriptions, or the LLM
+router — no keyword lists); RBAC + the action gate come from the manifest. **Adding
+a feature edits no core file**, and pointing it at an MCP server is config-only
+(`MCP_URLS`). Two corpus shapes are demonstrated: `reports` (RAG corpus + retriever) and
 `easm` (tool-backed structured data — its "MCP surface").
 
 ### Contract tests (the safety net)
@@ -148,7 +153,7 @@ system before a module needs it.
 
 | Layer | Enforcement |
 |------|-------------|
-| AuthN | local JWT (`security/jwt.py`) or OIDC JWKS (`security/oidc.py`); refresh + revocation |
+| AuthN | gateway API key (`X-API-Key`) + verified JWT identity (`security/jwt.py`, `security/deps.py`) |
 | AuthZ | ordered RBAC (`viewer<analyst<admin`), per-tool min role from manifest |
 | Vector store | **mandatory `org_id` filter** on every search (`rag/vector_store.py`, `qdrant_backend.py`) |
 | Chat store | Postgres **RLS** via `org_transaction` (`db/postgres.py`, `0001_init.sql`) |

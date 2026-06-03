@@ -109,24 +109,28 @@ Planner graph: input_guard -> plan -> plan_dispatch -> answer -> reflect_gate ->
    question into a Plan = steps[{id, domain, subq, depends_on}]. `domain` = which
    capability. `depends_on` = ids of earlier steps whose findings this step needs.
    It reads compact CAPABILITY CARDS (one line per module) + conversation history,
-   and decides BY MEANING (section 4). Deterministic fallback = one parallel step
-   per semantically-routed module. Validation makes the plan acyclic.
+   and decides BY MEANING (section 4). Heuristic fallback (LLM router off) = one
+   parallel step per semantically-routed module. Validation makes the plan acyclic.
 
 (3c) plan_dispatch_node -> execute the plan in dependency WAVES. Ready steps run
    in parallel; a dependent step waits and gets the upstream gist injected into
    its sub-question (cross-module chains). Each step's executor is the per-module
    SPECIALIST (section 5). All evidence is merged, injection-neutralized,
-   de-duplicated, ranked, and capped into one numbered context block. Evidence
-   ACCUMULATES across reflect rounds.
+   SEMANTICALLY reranked (embedding similarity to the question), de-duplicated, and
+   capped into one numbered context block — the cap GROWS with reflection depth so
+   evidence ACCUMULATES across reflect rounds.
 
-(3d) answer_node -> SYNTHESIZE. Builds the prompt (persona + summary + last-N
-   history + UNTRUSTED-fenced context + bare question), runs the STANDARD LLM
-   lane, streams tokens, maps [n] markers back to source chunks -> citations.
+(3d) answer_node -> SYNTHESIZE. Builds the prompt (persona + the plan's synthesis
+   goal + summary + last-N history + UNTRUSTED-fenced context + bare question), runs
+   an ADAPTIVE lane (DEEP for multi-step/cross-domain/reflected turns, else STANDARD),
+   streams tokens, maps [n] markers back to source chunks -> citations.
 
 (3e) reflect_gate_node -> REFLECTION. A critic LLM judges whether the answer
-   addresses the question + every sub-question. Gap + budget left -> loop back to
-   PLAN with a note (accumulates evidence). Bounded (max_replans), LLM-only;
-   deterministic = one pass. THIS is what makes it an agent, not a pipeline.
+   addresses the question + every sub-question AND is grounded. Gap + budget left ->
+   loop back to PLAN with a concrete follow-up (accumulates evidence). Bounded
+   (max_replans), runs only when the LLM router is on; it short-circuits without a
+   critic call when the answer is already gap-free + well-cited. THIS is what makes
+   it an agent, not a pipeline.
 
 (3f) output_guardrail_node -> final safety. PII redaction (Presidio/regex),
    exfiltration defang, groundedness/hallucinated-citation check. Then it ships.
@@ -149,8 +153,8 @@ LEVEL 1 — WHICH CAPABILITY (module/app)?        agent/supervisor.py
        capability and PICKS. No keywords. This is the real production decider.
      * semantic (the default fallback) — EMBEDDING similarity between the query and
        each module's PROFILE (display name + description + tool names/descriptions).
-       Routes by MEANING. Profiles are embedded ONCE and cached (_MODULE_VEC_CACHE).
-       Works offline via the deterministic embedder; sharper with a real one.
+       Routes by MEANING. Profiles are embedded ONCE and cached (_MODULE_VEC_CACHE),
+       using the configured embedder (TEI/OpenAI).
    IMPORTANT: routing is FULLY DYNAMIC — there are no routing keywords. The old
    keyword/hybrid strategies and per-module routing_hints have been REMOVED because
    they silently mis-routed any query worded differently from the curated phrases.
@@ -200,9 +204,8 @@ A module = app/capabilities/<id>/ with a manifest (+ tools/retriever).
 The MANIFEST (contracts.py: CapabilityManifest) declares; the core DERIVES:
    id/display_name/description -> identity + the planner CARD
    enabled_flag                -> deployment on/off (config)
-   tools                       -> the agent/MCP surface
+   tools                       -> the agent/MCP surface (names+descriptions = routing signal)
    retrievers                  -> RAG corpus binding
-   routing_hints               -> OPTIONAL descriptive signal (no longer required)
    rbac { tool -> min role }   -> enforced at the MCP boundary
    default_autonomy            -> READ vs SUGGEST (can draft a gated action)
 
@@ -347,17 +350,17 @@ error for high-security). OWASP LLM01/02/06/08/09 covered.
 
 RetrievalPipeline.retrieve runs 6 stages:
    1. (auto) time filter   "last quarter" -> date window        filters.py
-   2. embed query          text -> vector (deterministic | TEI/Qwen3)  embeddings.py
+   2. embed query          text -> vector (TEI/Qwen3 | OpenAI)        embeddings.py
    3. vector search        nearest chunks, MANDATORY org_id filter at the DB,
                            over-fetched                          qdrant_backend.py
    4. recency re-weight    exponential time-decay                pipeline.py
    5. rerank               cross-encoder (Qwen3-Reranker/TEI) -> top-k  reranker.py
    6. return chunks        become the [1]..[n] cited context
 
-org_id filter (step 3) is non-negotiable, from the token, never the query. Dev =
-in-memory store; prod = Qdrant. reports corpus is filled by YOUR external cron
-(embed + upsert to "reports_kb"); the system only READS it. Contract: same
-collection + same embedding model/dim + an org_id on every point.
+org_id filter (step 3) is non-negotiable, from the token, never the query. The
+vector store is Qdrant (the only backend). The reports corpus is filled by YOUR
+external cron (embed + upsert to "reports_kb"); the system only READS it. Contract:
+same collection + same embedding model/dim + an org_id on every point.
 
 
 ===============================================================================
@@ -381,16 +384,15 @@ collection + same embedding model/dim + an org_id on every point.
  12. CONFIG — DEV vs PROD + THE NO-STUB GUARD     app/config.py
 ===============================================================================
 
-Defaults are DEV-safe (deterministic LLM/embeddings, in-memory stores) so the
-system runs zero-infra. Production selects real backends in .env.production:
-self-hosted Qwen (SGLang or ANY OpenAI-compatible server), TEI embeddings/rerank,
-Qdrant, Postgres+RLS, Redis, LangGraph engine, Presidio + Prompt Guard + Llama
-Guard, MCP server URLs.
+REAL infra is required (the offline stubs were removed): a real LLM (SGLang or ANY
+OpenAI-compatible server), a real embedder (TEI/OpenAI), Qdrant, Postgres+RLS, and
+optionally Redis, the LangGraph engine, Presidio + Prompt Guard + Llama Guard, and
+MCP server URLs. The dev defaults point these at localhost; configure them in .env.
 
 THE PROD GUARD (config._enforce_prod_no_stub): with ENVIRONMENT=prod the boot
-FAILS CLOSED if any stub/insecure setting is still active (deterministic LLM,
-memory store, demo seed, dev JWT secret, an enabled tool-module without its MCP
-url, ...). It prints exactly what to fix. So prod can never silently run on stubs.
+FAILS CLOSED on insecure/incomplete config (missing DATABASE_URL, dev JWT secret,
+dev API key, demo seed on, debug on, an enabled tool-module without its MCP url).
+It prints exactly what to fix.
 
 Key agentic config: ORCHESTRATOR_MODE=planner, ROUTER_MODE=llm,
 ROUTING_STRATEGY=semantic (the non-LLM fallback), MAX_TOOLS_ADVERTISED,
@@ -434,7 +436,7 @@ Both run the IDENTICAL node set; switching is one flag.
  app/core/contracts.py        frozen interfaces (Tool, Manifest, ToolContext...)
  app/core/registry.py         discovers modules; per-org capability views
  app/core/api/chat_router.py  /v1/chat, /chat/stream, /sessions, /capabilities
- app/core/security/           auth (JWT/OIDC), RBAC, SecurityContext, service tokens
+ app/core/security/           auth (API key + JWT), RBAC, SecurityContext, service tokens
  app/core/agent/orchestrator.py  owns a turn: sessions, history, persistence, SSE
  app/core/agent/state.py      ChatState (turn data) + AgentContext (services)
  app/core/agent/graph.py      built-in LangGraph-shaped engine (start here)

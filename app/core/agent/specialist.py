@@ -102,6 +102,42 @@ def relevance_rank(chunks: list[Chunk], question: str, cap: int) -> list[Chunk]:
     return out
 
 
+async def rank_evidence(chunks: list[Chunk], question: str, cap: int, embedder=None) -> list[Chunk]:
+    """SEMANTIC merge-ranker for the final answer context — the highest-leverage
+    ranking in the turn (it decides which evidence the answer LLM actually sees).
+
+    Ranks the merged cross-specialist + tool evidence by EMBEDDING similarity to the
+    question (by meaning, robust to wording) instead of crude keyword overlap, then
+    dedupes by exact text and keeps the top ``cap``. The per-collection cross-encoder
+    reranker only runs INSIDE retrieval; this is the equivalent quality step for the
+    POOLED evidence (RAG chunks + tool outputs from every module/plan step).
+
+    Falls back to the lexical :func:`relevance_rank` when no embedder is wired or on
+    any failure — ranking must never break a turn.
+    """
+    clean = [c for c in chunks if c.text.strip()]
+    if embedder is None or len(clean) <= 1:
+        return relevance_rank(chunks, question, cap)
+    try:
+        qv = await embedder.embed_query(question)
+        vecs = await embedder.embed([c.text for c in clean])
+        order = sorted(range(len(clean)), key=lambda i: _cosine(qv, vecs[i]), reverse=True)
+        out: list[Chunk] = []
+        seen: set[str] = set()
+        for i in order:
+            c = clean[i]
+            sig = c.text.strip().lower()
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(c)
+            if len(out) >= cap:
+                break
+        return out
+    except Exception:  # noqa: BLE001 - ranking must never break a turn
+        return relevance_rank(chunks, question, cap)
+
+
 def autocall_args(tool, question: str):
     """For the HEURISTIC planner: figure out the args to auto-invoke a read tool,
     or return ``None`` meaning "this tool needs specific args I can't infer from
@@ -362,5 +398,5 @@ def build_specialist(module, deps, mcp):
     return GenericSpecialist(module, deps, mcp)
 
 
-__all__ = ["GenericSpecialist", "build_specialist", "relevance_rank",
+__all__ = ["GenericSpecialist", "build_specialist", "relevance_rank", "rank_evidence",
            "autocall_args", "summarize_tool_result", "PER_SPECIALIST_MAX"]

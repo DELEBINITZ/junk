@@ -4,7 +4,6 @@ from app.core.rag.citations import GroundednessReport, verify_groundedness
 from app.core.rag.embeddings import Embedder, build_embedder
 from app.core.rag.pipeline import (
     CollectionRetriever,
-    IndexItem,
     RetrievalPipeline,
     build_rag,
     build_vector_store,
@@ -22,7 +21,6 @@ __all__ = [
     "build_reranker",
     "RetrievalPipeline",
     "CollectionRetriever",
-    "IndexItem",
     "build_rag",
     "build_vector_store",
     "GroundednessReport",

@@ -77,6 +77,7 @@ class ChatState(TypedDict, total=False):
     plan: list[dict[str, Any]]        # the steps the brain decided (domain, subq, depends_on)
     plan_results: list[dict[str, Any]]# per-step outcome (domain, subq, ok, found) — feeds replan
     plan_debug: dict[str, Any]        # plan mode/raw — for observability
+    synthesis: str                    # the plan's goal for COMBINING findings (used by the answer node)
     needs_replan: bool                # replan_gate's branch decision (loop to plan vs synthesize)
     replan_count: int                 # how many replans have happened (bounded by max_replans)
     replan_notes: str                 # gap note injected into the next planning round
@@ -116,6 +117,8 @@ def make_initial_state(
         # bound is correct from the FIRST pass and a turn never inherits stale
         # replan counters/notes. The reflect gate increments replan_count each loop.
         replan_count=0, replan_notes="",
+        # The planner sets this to its synthesis strategy; empty on the non-planner path.
+        synthesis="",
     )
 
 

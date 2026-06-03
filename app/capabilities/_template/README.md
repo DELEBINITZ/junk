@@ -15,10 +15,11 @@ Add a product feature in ~1 day **without opening any file under `app/core/`**.
    structured `ToolResult`/`ToolError`. Mark side-effecting tools
    (`side_effecting=True`) — they auto-route through the human-approval gate.
 3. **Write the prompt** at `prompts/v1.md` (persona + few-shots).
-4. **Fill the manifest** (`manifest.py`): id, routing hints, RBAC, autonomy.
-   If the feature has a corpus, bind a `CollectionRetriever`; if it has its own
-   data feed, add an `IngestionConnector`; if it adds entities, declare an
-   `OntologyContribution`. All optional.
+4. **Fill the manifest** (`manifest.py`): id, a crisp `description`, RBAC, autonomy.
+   Routing is by MEANING (the description + tool descriptions ARE the routing signal —
+   no keyword lists). If the feature has a corpus, bind a `CollectionRetriever` (the
+   corpus is filled by the external ingestion cron; the module only reads); if it adds
+   entities, declare an `OntologyContribution`. All optional.
 5. **Add a flag** `cap_<feature>_enabled: bool = False` to `app/config.py`.
 6. **Add evals** at `evals/golden.jsonl` (golden questions + expected routing).
    CI runs them.
@@ -35,10 +36,9 @@ appear in `/v1/capabilities` — all derived from your manifest. No core edit.
 | `tools.py` | yes (or a retriever) | the typed tools |
 | `prompts/v1.md` | recommended | specialist persona |
 | `evals/golden.jsonl` | yes (CI gate) | golden questions |
-| `retrievers` (in manifest) | if it has a corpus | RAG binding |
-| `ingestion.py` | if it has a data feed | event → corpus/KG |
+| `retrievers` (in manifest) | if it has a corpus | RAG binding (read; the corpus is cron-fed) |
 | `ontology` (in manifest) | if it adds entities | KG slice |
-| `seed.py` (`seed_demo`) | dev only | demo data |
+| `tools.py` (remote) | to back with MCP | add `MCP_URLS[<id>]` — no code edit |
 
 ## Promote to a standalone MCP server (later)
 

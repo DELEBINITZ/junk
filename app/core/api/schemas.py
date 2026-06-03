@@ -6,7 +6,7 @@ parse + VALIDATE incoming JSON (a bad body becomes an automatic 422, before any
 handler runs), (2) SERIALIZE handler return values to JSON, and (3) generate the
 OpenAPI docs. Keeping them in one file makes the whole API surface readable at a
 glance. They are grouped by feature with ``# ---- section ----`` banners that
-mirror the routers (auth / chat / sessions / routing / ingestion / approvals).
+mirror the routers (auth / chat / sessions / routing / approvals).
 
 A note on tenancy: notice none of these request models carry ``org_id``. That is
 deliberate — the tenant is taken from the verified token (SecurityContext) in the
@@ -141,32 +141,6 @@ class CapabilitiesResponse(BaseModel):
     # capability-aware UI and makes the agent's surface introspectable.
     modules: list[CapabilityInfo]
     tools: list[ToolInfo]
-
-
-# ---- ingestion ----
-class IngestDocumentIn(BaseModel):
-    # One document to load into a corpus. Note there is no org_id field — the
-    # tenant is stamped from the token at ingest time, never sent by the client.
-    doc_id: str
-    title: str = ""
-    text: str
-    source: str = "reports"
-    published_at: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class IngestRequest(BaseModel):
-    # A batch ingest into one ``collection``. ``chunk=True`` asks the pipeline to
-    # split documents into retrievable chunks.
-    collection: str = "reports_kb"
-    documents: list[IngestDocumentIn]
-    chunk: bool = True
-
-
-class IngestResponse(BaseModel):
-    # Counts of what landed: documents accepted and chunks produced.
-    documents: int
-    chunks: int
 
 
 # ---- approvals ----
