@@ -35,10 +35,10 @@ always runnable, and overriding is just setting an env var.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # The insecure development JWT secret. Referenced as the dev default AND by the
 # production guard, which refuses to boot prod while this is still in use.
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     log_json: bool = False
     host: str = "0.0.0.0"
     port: int = 8000
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["*"])
 
     # ---- Auth --------------------------------------------------------------
     # Identity. ``local`` mints/verifies its own JWTs (great for dev); ``oidc``
@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     # The org claim is critical: it is the verified tenant key that flows into
     # every request's ToolContext and powers tenant isolation. The dev jwt_secret
     # is intentionally insecure and MUST be overridden outside dev.
-    auth_provider: Literal["local", "oidc"] = "local"
+    auth_provider: Literal["local", "oidc", "apikey"] = "local"
     jwt_secret: str = _DEV_JWT_SECRET  # CHANGE in prod — the prod guard enforces this
     jwt_algorithm: str = "HS256"
     access_token_ttl_seconds: int = 3600
@@ -87,6 +87,16 @@ class Settings(BaseSettings):
     oidc_jwks_url: str = ""
     oidc_org_claim: str = "org_id"
     oidc_roles_claim: str = "roles"
+    # ---- API-key auth (AUTH_PROVIDER=apikey) — TESTING / trusted-gateway ONLY ----
+    # A request authenticates with one of these keys (``X-API-Key`` header or
+    # ``?api_key=`` for SSE). The org/user/roles are then taken from the request:
+    # the chat BODY, or ``X-Org-Id``/``X-User-Id``/``X-Roles`` headers, or the query
+    # string. WARNING: this TRUSTS the caller for identity — whoever holds a key can
+    # set any org_id, so it RELAXES tenant isolation. Use only behind a trusted
+    # backend or for local testing. The production guard REJECTS apikey; for prod
+    # use local/oidc (or bind each key to a fixed org).
+    api_keys: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["dev-api-key-change-me"])
+    apikey_default_roles: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["analyst"])
 
     # ---- Stores ------------------------------------------------------------
     # Where conversations/sessions persist. ``memory`` is in-process (zero infra);
@@ -184,7 +194,7 @@ class Settings(BaseSettings):
     # the subject matter, not PII).
     pii_provider: Literal["regex", "presidio"] = "regex"
     pii_score_threshold: float = 0.5
-    pii_entities: list[str] = Field(default_factory=lambda: [
+    pii_entities: Annotated[list[str], NoDecode] = Field(default_factory=lambda: [
         "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "CREDIT_CARD",
         "IBAN_CODE", "US_BANK_NUMBER", "CRYPTO", "MEDICAL_LICENSE", "US_PASSPORT",
     ])
@@ -215,6 +225,9 @@ class Settings(BaseSettings):
     # rolled into a running summary.
     agent_engine: Literal["internal", "langgraph"] = "internal"
     max_tool_iterations: int = 4
+    # Small-talk / scope triage: greet + steer on "hi" / "what can you do" / off-topic
+    # WITHOUT routing, retrieval, or tool calls. Off => every message runs the full agent.
+    smalltalk_handling: bool = True
     history_window_messages: int = 12     # how many prior messages run_turn loads
     answer_history_turns: int = 6         # how many of those the answer prompt includes verbatim
     summary_trigger_messages: int = 20
@@ -324,6 +337,20 @@ class Settings(BaseSettings):
             return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
+    @field_validator("api_keys", "apikey_default_roles", "pii_entities", mode="before")
+    @classmethod
+    def _csv_list(cls, v: object) -> object:
+        """Same CSV-or-JSON convenience for the other list-valued settings, so an
+        env var like ``API_KEYS=key1,key2`` works without JSON."""
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):
+                return v
+            return [item.strip() for item in s.split(",") if item.strip()]
+        return v
+
     @model_validator(mode="after")
     def _enforce_prod_no_stub(self) -> Settings:
         """PRODUCTION GUARD — fail-closed if ENVIRONMENT=prod is running on any stub
@@ -353,6 +380,9 @@ class Settings(BaseSettings):
                 bad.append("JWT_SECRET is the insecure dev default — set a strong secret")
             elif len(self.jwt_secret) < 32:
                 bad.append("JWT_SECRET shorter than 32 bytes")
+        if self.auth_provider == "apikey":
+            bad.append("AUTH_PROVIDER=apikey is testing-only (it trusts caller identity) "
+                       "— use local or oidc in prod")
         if self.auth_provider == "oidc" and not (self.oidc_issuer and self.oidc_jwks_url):
             bad.append("AUTH_PROVIDER=oidc but OIDC_ISSUER/OIDC_JWKS_URL not set")
         # Tool-backed modules MUST point at a real MCP server in prod, else they

@@ -70,6 +70,7 @@ class PostgresConversationStore:
             id=row["id"], session_id=row["session_id"], org_id=row["org_id"], role=row["role"],
             content=row["content"], citations=row.get("citations") or [],
             tool_calls=row.get("tool_calls") or [], meta=row.get("meta") or {},
+            feedback=row.get("feedback", 0) or 0,
             created_at=_iso(row["created_at"]),
         )
 
@@ -198,6 +199,17 @@ class PostgresConversationStore:
                     "ORDER BY m.created_at DESC LIMIT %s", (user_id, query, limit),
                 )
                 return [self._message(r) for r in await cur.fetchall()]
+
+    async def set_message_feedback(self, org_id: str, message_id: str, value: int) -> bool:
+        # RLS scopes the UPDATE to this org's rows, so a caller can only rate its
+        # own messages. Value is clamped to {-1,0,1}.
+        async with self.db.org_transaction(org_id) as conn:
+            async with await self._cur(conn) as cur:
+                await cur.execute(
+                    "UPDATE chat_messages SET feedback=%s WHERE id=%s",
+                    (max(-1, min(1, int(value))), message_id),
+                )
+                return cur.rowcount > 0
 
     async def aclose(self) -> None:
         # The shared PostgresDatabase owns the pool's lifecycle, so this store has

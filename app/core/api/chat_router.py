@@ -25,6 +25,7 @@ from app.core.api.schemas import (
     ChatRequest,
     ChatResponse,
     CreateSessionRequest,
+    FeedbackRequest,
     MessageInfo,
     RoutePreviewRequest,
     RoutePreviewResponse,
@@ -35,6 +36,7 @@ from app.core.api.schemas import (
 )
 from app.core.errors import NotFound
 from app.core.security.context import SecurityContext
+from app.core.security.deps import resolve_identity
 from app.core.streaming import sse_from_events
 
 router = APIRouter(prefix="/v1", tags=["chat"])
@@ -49,19 +51,22 @@ def _session_info(s) -> SessionInfo:
 
 
 def _message_info(m) -> MessageInfo:
-    return MessageInfo(id=m.id, role=m.role, content=m.content, citations=m.citations, created_at=m.created_at)
+    return MessageInfo(id=m.id, role=m.role, content=m.content, citations=m.citations,
+                       created_at=m.created_at, feedback=getattr(m, "feedback", 0))
 
 
 # ---- chat ----
 @router.post("/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest, request: Request, sc: SecurityContext = Depends(require_user)) -> ChatResponse:
+async def chat(body: ChatRequest, request: Request) -> ChatResponse:
     """Run ONE non-streaming chat turn and return the complete answer.
 
-    Hands the whole turn to the orchestrator (which runs the agent graph: guard ->
-    route -> gather -> answer -> guard) scoped to the verified caller. The
-    ``timer``/``inc`` calls record latency + a turn counter for observability. The
-    response carries everything the UI needs: answer, citations, the session +
+    Identity is resolved via ``resolve_identity``: from the verified token
+    (local/oidc), or — in apikey mode — from the API key + the body's org_id/
+    user_id/roles. Then the whole turn goes to the orchestrator (the agent graph:
+    guard -> triage -> route -> gather -> answer -> guard) scoped to that caller.
+    The response carries everything the UI needs: answer, citations, the session +
     message it persisted to, the routed modules, guardrail flags, and a trace id."""
+    sc = resolve_identity(request, org_id=body.org_id, user_id=body.user_id, roles=body.roles)
     services = get_services(request)
     with services.metrics.timer("chat_turn_ms"):
         r = await services.orchestrator.run_turn(sc, question=body.message, session_id=body.session_id)
@@ -171,6 +176,19 @@ async def delete_session(session_id: str, request: Request,
     if not ok:
         raise NotFound("session not found")
     return {"status": "deleted", "session_id": session_id}
+
+
+# ---- message feedback (thumbs up/down) ----
+@router.post("/messages/{message_id}/feedback")
+async def message_feedback(message_id: str, body: FeedbackRequest, request: Request,
+                           sc: SecurityContext = Depends(require_user)) -> dict:
+    """Rate an assistant message (-1/0/1). Org-scoped: a caller can only rate its
+    own org's messages (RLS / ownership check in the store)."""
+    services = get_services(request)
+    ok = await services.conversations.set_message_feedback(sc.org_id, message_id, body.value)
+    if not ok:
+        raise NotFound("message not found")
+    return {"status": "ok", "message_id": message_id, "feedback": body.value}
 
 
 # ---- routing / capabilities ----

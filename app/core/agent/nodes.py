@@ -28,6 +28,7 @@ ChatState. ``ctx`` (AgentContext) carries the services + the streaming sink.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from app.core.agent.graph import END, StateGraph
@@ -41,6 +42,7 @@ from app.core.agent.state import (
     N_PLAN_DISPATCH,
     N_REPLAN_GATE,
     N_ROUTE,
+    N_TRIAGE,
     AgentContext,
     ChatState,
 )
@@ -166,6 +168,90 @@ async def input_guardrail_node(state: ChatState, ctx: AgentContext) -> dict:
                 "answer": res.text, "safe_question": state.get("question", "")}
     # Not blocked: ``res.text`` is the cleaned question we use downstream.
     return {"blocked": False, "safe_question": res.text}
+
+
+# --------------------------------------------------------------------------- #
+# triage (small-talk / scope) — answer greetings and "what can you do" directly,
+# with NO routing, retrieval, or tool calls. Keeps the chat natural and steers the
+# user toward what the assistant is actually for.
+# --------------------------------------------------------------------------- #
+_GREETING_RE = re.compile(
+    r"^\s*(hi+|hello+|hey+|yo|hiya|howdy|greetings|good (morning|afternoon|evening|day)|"
+    r"how('?s| is| are)?\s*(it going|you|things|u)|what'?s up|sup|thanks?|thank you|thx|"
+    r"cheers|bye+|goodbye|see you|ok(ay)?|cool|nice|great|got it)\b",
+    re.IGNORECASE,
+)
+_HELP_RE = re.compile(
+    r"\b(what can you do|what do you do|how (can|do) you help|what (can|do) you (help|cover|offer)|"
+    r"your capabilities|what are you capable|how do you work|help me|what should i ask|"
+    r"give me examples?)\b",
+    re.IGNORECASE,
+)
+_IDENTITY_RE = re.compile(
+    r"\b(who are you|what are you|your name|are you (a |an )?(bot|ai|human|robot|chatgpt|gpt|llm|model))\b",
+    re.IGNORECASE,
+)
+
+
+def _triage_category(text: str) -> str:
+    """Classify a message: greeting / help / identity / task. High precision —
+    'help'/'identity' are specific phrases; a 'greeting' must ALSO be short, so a
+    real question that merely starts with 'hi...' isn't misread as chitchat."""
+    t = text.strip()
+    if not t:
+        return "greeting"
+    if _HELP_RE.search(t):
+        return "help"
+    if _IDENTITY_RE.search(t):
+        return "identity"
+    if _GREETING_RE.match(t) and len(t.split()) <= 8:
+        return "greeting"
+    return "task"
+
+
+def _capabilities_blurb(ctx: AgentContext) -> str:
+    """List what THIS caller's org can actually use, from the registry — so the
+    steer reflects the live, entitled capability set, never a hardcoded list."""
+    view = ctx.registry.capability_view(ctx.sc)
+    lines = []
+    for mid in dict.fromkeys(view.module_ids):
+        m = ctx.registry.module(mid)
+        if m:
+            lines.append(f"• {m.manifest.display_name} — {m.manifest.description}")
+    return "\n".join(lines) or "• (no capabilities are enabled for your org yet)"
+
+
+def _direct_reply(category: str, ctx: AgentContext) -> str:
+    caps = _capabilities_blurb(ctx)
+    if category == "identity":
+        return ("I'm a security-intelligence assistant — an AI that answers questions grounded "
+                "in your organization's security data. I can help with:\n\n" + caps +
+                "\n\nAsk me a security question and I'll dig into your data.")
+    if category == "help":
+        return ("Here's what I can help with:\n\n" + caps +
+                "\n\nTry: \"what are our top risks this quarter?\", \"what's exposed on our attack "
+                "surface?\", or \"which threat actors are targeting us?\"")
+    # greeting / chitchat
+    return ("Hi! I'm your security-intelligence assistant. I answer questions grounded in your "
+            "security data — I can help with:\n\n" + caps +
+            "\n\nWhat would you like to know? For example: \"summarize our latest report\".")
+
+
+async def triage_node(state: ChatState, ctx: AgentContext) -> dict:
+    """Small-talk / scope gate. For a greeting, a 'what can you do', or an identity
+    question, reply DIRECTLY (with a capability steer) and skip routing, retrieval,
+    and every tool call. A real task proceeds to the agent. Disabled via config =>
+    everything is treated as a task."""
+    if not getattr(ctx.settings, "smalltalk_handling", True):
+        return {"triage": "task"}
+    category = _triage_category(state.get("safe_question") or state.get("question") or "")
+    if category == "task":
+        return {"triage": "task"}
+    text = _direct_reply(category, ctx)
+    await ctx.fire("status", stage="smalltalk", category=category)
+    if ctx.stream_tokens and ctx.emit is not None:
+        await ctx.fire("token", text=text)        # surface the reply on the stream too
+    return {"triage": category, "answer": text, "citations": [], "route_modules": []}
 
 
 async def route_node(state: ChatState, ctx: AgentContext) -> dict:
@@ -303,18 +389,24 @@ def build_report_graph(ctx: AgentContext):
     """
     g = StateGraph()
     g.add_node(N_INPUT_GUARD, lambda s: input_guardrail_node(s, ctx))
+    g.add_node(N_TRIAGE, lambda s: triage_node(s, ctx))
     g.add_node(N_ROUTE, lambda s: route_node(s, ctx))
     g.add_node(N_GATHER, lambda s: dispatch_node(s, ctx))
     g.add_node(N_ANSWER, lambda s: answer_node(s, ctx))
     g.add_node(N_OUTPUT_GUARD, lambda s: output_guardrail_node(s, ctx))
 
     g.set_entry(N_INPUT_GUARD)
-    # The only fork in the road: if the input guardrail blocked, skip everything
-    # and go straight to END; otherwise proceed to routing.
+    # blocked -> END; otherwise triage for small-talk before doing real work.
     g.add_conditional_edges(
         N_INPUT_GUARD,
         lambda s: "blocked" if s.get("blocked") else "ok",
-        {"blocked": END, "ok": N_ROUTE},
+        {"blocked": END, "ok": N_TRIAGE},
+    )
+    # triage: a greeting/help/identity reply ends the turn directly; a task routes.
+    g.add_conditional_edges(
+        N_TRIAGE,
+        lambda s: "task" if s.get("triage", "task") == "task" else "direct",
+        {"task": N_ROUTE, "direct": END},
     )
     g.add_edge(N_ROUTE, N_GATHER)
     g.add_edge(N_GATHER, N_ANSWER)
@@ -328,6 +420,7 @@ def build_report_graph(ctx: AgentContext):
 # truth, so the two engines can never drift apart.
 NODE_SPECS = [
     (N_INPUT_GUARD, input_guardrail_node),
+    (N_TRIAGE, triage_node),
     (N_ROUTE, route_node),
     (N_GATHER, dispatch_node),
     (N_ANSWER, answer_node),
@@ -507,6 +600,7 @@ def build_planner_graph(ctx: AgentContext):
     back to plan, which the engine's max-steps fuse keeps bounded."""
     g = StateGraph()
     g.add_node(N_INPUT_GUARD, lambda s: input_guardrail_node(s, ctx))
+    g.add_node(N_TRIAGE, lambda s: triage_node(s, ctx))
     g.add_node(N_PLAN, lambda s: plan_node(s, ctx))
     g.add_node(N_PLAN_DISPATCH, lambda s: plan_dispatch_node(s, ctx))
     g.add_node(N_ANSWER, lambda s: answer_node(s, ctx))
@@ -517,7 +611,13 @@ def build_planner_graph(ctx: AgentContext):
     g.add_conditional_edges(
         N_INPUT_GUARD,
         lambda s: "blocked" if s.get("blocked") else "ok",
-        {"blocked": END, "ok": N_PLAN},
+        {"blocked": END, "ok": N_TRIAGE},
+    )
+    # small-talk short-circuits before planning; a task goes to the planner.
+    g.add_conditional_edges(
+        N_TRIAGE,
+        lambda s: "task" if s.get("triage", "task") == "task" else "direct",
+        {"task": N_PLAN, "direct": END},
     )
     g.add_edge(N_PLAN, N_PLAN_DISPATCH)
     g.add_edge(N_PLAN_DISPATCH, N_ANSWER)
@@ -537,6 +637,7 @@ def build_planner_graph(ctx: AgentContext):
 # the reflect gate sits AFTER answer.
 PLANNER_NODE_SPECS = [
     (N_INPUT_GUARD, input_guardrail_node),
+    (N_TRIAGE, triage_node),
     (N_PLAN, plan_node),
     (N_PLAN_DISPATCH, plan_dispatch_node),
     (N_ANSWER, answer_node),
@@ -552,6 +653,7 @@ __all__ = [
     "NODE_SPECS",
     "PLANNER_NODE_SPECS",
     "input_guardrail_node",
+    "triage_node",
     "route_node",
     "dispatch_node",
     "answer_node",

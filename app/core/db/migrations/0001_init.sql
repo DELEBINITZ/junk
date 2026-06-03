@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     citations   JSONB NOT NULL DEFAULT '[]'::jsonb,
     tool_calls  JSONB NOT NULL DEFAULT '[]'::jsonb,
     meta        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    feedback    SMALLINT NOT NULL DEFAULT 0,          -- user rating: -1 down, 0 none, 1 up
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages (session_id, created_at);

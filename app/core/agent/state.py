@@ -31,6 +31,7 @@ from app.core.security.context import SecurityContext
 # (nodes.py) and the LangGraph engine (engines.py) wire the SAME graph. If these
 # were stray string literals, the two engines could drift out of sync.
 N_INPUT_GUARD = "input_guardrail"
+N_TRIAGE = "triage"
 N_ROUTE = "route"
 N_GATHER = "gather_context"
 N_ANSWER = "answer"
@@ -67,6 +68,8 @@ class ChatState(TypedDict, total=False):
     safe_question: str   # the question after redaction/screening (what we actually use)
     blocked: bool        # True => guardrail refused; engine jumps to END
     block_reason: str
+    # --- produced by triage_node ---
+    triage: str          # "task" => run the agent; "greeting"/"help"/"identity" => direct reply
     # --- produced by route_node (the supervisor) ---
     route_modules: list[str]          # which capability module(s) handle this turn
     route_debug: dict[str, Any]       # scores/mode/fallback — for /route/preview + logs
@@ -161,6 +164,7 @@ __all__ = [
     "EmitFn",
     "make_initial_state",
     "N_INPUT_GUARD",
+    "N_TRIAGE",
     "N_ROUTE",
     "N_GATHER",
     "N_ANSWER",

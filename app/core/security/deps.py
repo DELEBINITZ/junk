@@ -57,6 +57,43 @@ def _revocation_store(request: Request, settings: Settings) -> RevocationStore:
     return store or get_default_revocation_store()
 
 
+# --- API-key auth (AUTH_PROVIDER=apikey) — TESTING / trusted-gateway only ------
+def _api_key_from(request: Request) -> str:
+    # The key may ride a header (normal calls) or the query string (SSE can't set
+    # headers). Header lookup is case-insensitive in Starlette.
+    return (request.headers.get("x-api-key") or request.query_params.get("api_key") or "")
+
+
+def _verify_api_key(request: Request, settings: Settings) -> None:
+    key = _api_key_from(request)
+    if not settings.api_keys or key not in set(settings.api_keys):
+        raise AuthError("invalid or missing API key")
+
+
+def _roles_tuple(roles, request: Request, settings: Settings) -> tuple[str, ...]:
+    if roles:
+        return tuple(str(r) for r in roles)
+    raw = request.headers.get("x-roles") or request.query_params.get("roles") or ""
+    parsed = tuple(r.strip() for r in str(raw).split(",") if r.strip())
+    return parsed or tuple(settings.apikey_default_roles) or ("viewer",)
+
+
+def apikey_context(request: Request, settings: Settings, *,
+                   org_id=None, user_id=None, roles=None) -> SecurityContext:
+    """Authenticate with the API key, then build the identity from explicit params
+    (chat body), falling back to X-Org-Id/X-User-Id/X-Roles headers or the query
+    string. SECURITY: this TRUSTS the caller for org/user — whoever holds a key can
+    set any org. Testing / trusted-backend only (the prod guard forbids apikey)."""
+    _verify_api_key(request, settings)
+    org = org_id or request.headers.get("x-org-id") or request.query_params.get("org_id")
+    user = user_id or request.headers.get("x-user-id") or request.query_params.get("user_id")
+    if not org or not user:
+        raise AuthError("apikey mode requires org_id and user_id (in the chat body, "
+                        "X-Org-Id/X-User-Id headers, or query string)")
+    return SecurityContext(org_id=str(org), user_id=str(user),
+                           roles=_roles_tuple(roles, request, settings), email="")
+
+
 def build_security_context(request: Request) -> SecurityContext:
     """Turn the incoming request into a verified SecurityContext, or raise.
 
@@ -65,6 +102,11 @@ def build_security_context(request: Request) -> SecurityContext:
     It branches on the configured provider but both branches end at the same
     SecurityContext shape."""
     settings: Settings = getattr(request.app.state, "settings", None) or get_settings()
+
+    if settings.auth_provider == "apikey":
+        # API key authenticates; identity from headers/query (testing/gateway).
+        return apikey_context(request, settings)
+
     token = extract_bearer_token(request)
     if not token:
         raise AuthError("missing bearer token")     # no credential at all -> 401
@@ -133,9 +175,22 @@ def require_role(minimum: str):
     return _dep
 
 
+def resolve_identity(request: Request, *, org_id=None, user_id=None, roles=None) -> SecurityContext:
+    """Identity for the CHAT endpoints, where (in apikey mode) the user params are
+    allowed to come from the request BODY. In apikey mode the explicit args win
+    (then headers/query); in token/oidc mode the args are ignored and identity is
+    taken from the verified token, exactly as everywhere else."""
+    settings: Settings = getattr(request.app.state, "settings", None) or get_settings()
+    if settings.auth_provider == "apikey":
+        return apikey_context(request, settings, org_id=org_id, user_id=user_id, roles=roles)
+    return build_security_context(request)
+
+
 __all__ = [
     "extract_bearer_token",
     "build_security_context",
+    "apikey_context",
+    "resolve_identity",
     "require_user",
     "require_role",
 ]

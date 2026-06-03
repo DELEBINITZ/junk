@@ -58,6 +58,7 @@ class Message(BaseModel):
     citations: list[dict[str, Any]] = Field(default_factory=list)  # sources backing an assistant turn
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)  # tools the agent invoked this turn
     meta: dict[str, Any] = Field(default_factory=dict)
+    feedback: int = 0               # user rating of an assistant turn: -1 down, 0 none, 1 up
 
 
 class Session(BaseModel):
@@ -92,6 +93,7 @@ class ConversationStore(Protocol):
     async def append_message(self, org_id: str, session_id: str, role: str, content: str, *, citations=None, tool_calls=None, meta=None) -> Message: ...
     async def get_messages(self, org_id: str, session_id: str, *, limit: int | None = None) -> list[Message]: ...
     async def search_messages(self, org_id: str, user_id: str, query: str, *, limit: int = 20) -> list[Message]: ...
+    async def set_message_feedback(self, org_id: str, message_id: str, value: int) -> bool: ...
     async def aclose(self) -> None: ...
 
 
@@ -204,6 +206,18 @@ class InMemoryConversationStore:
         # Best overlap first; ties broken by recency (newer created_at wins).
         scored.sort(key=lambda t: (t[0], t[1].created_at), reverse=True)
         return [m for _s, m in scored[:limit]]
+
+    async def set_message_feedback(self, org_id: str, message_id: str, value: int) -> bool:
+        # Find the message within an OWNED session and set its rating. Clamped to
+        # {-1,0,1}. Returns False if it isn't this org's message (never another's).
+        for sid, s in self._sessions.items():
+            if s.org_id != org_id:
+                continue
+            for m in self._messages.get(sid, []):
+                if m.id == message_id:
+                    m.feedback = max(-1, min(1, int(value)))
+                    return True
+        return False
 
     async def aclose(self) -> None:
         # Nothing to release for an in-process store; present to satisfy the protocol.

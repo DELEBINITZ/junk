@@ -57,6 +57,12 @@ class ChatRequest(BaseModel):
     # ``session_id`` is optional: omit it to start a brand-new conversation.
     message: str = Field(min_length=1)
     session_id: str | None = None
+    # Caller identity — used ONLY in AUTH_PROVIDER=apikey mode (a trusted gateway
+    # passes the end-user context in the body). In token/oidc mode these are
+    # ignored and identity comes from the verified token.
+    org_id: str | None = None
+    user_id: str | None = None
+    roles: list[str] | None = None
 
 
 class ChatResponse(BaseModel):
@@ -102,6 +108,12 @@ class MessageInfo(BaseModel):
     content: str
     citations: list[dict[str, Any]] = []
     created_at: str
+    feedback: int = 0               # user rating: -1 down, 0 none, 1 up
+
+
+class FeedbackRequest(BaseModel):
+    # Rate an assistant message. -1 = thumbs down, 0 = clear, 1 = thumbs up.
+    value: int = Field(ge=-1, le=1)
 
 
 class SessionDetail(SessionInfo):

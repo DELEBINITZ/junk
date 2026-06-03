@@ -33,6 +33,7 @@ from app.core.agent.state import (
     N_PLAN_DISPATCH,
     N_REPLAN_GATE,
     N_ROUTE,
+    N_TRIAGE,
     AgentContext,
     ChatState,
 )
@@ -95,13 +96,19 @@ class LangGraphEngine:
         for name, fn in specs:
             sg.add_node(name, _wrap(fn))
         sg.add_edge(START, N_INPUT_GUARD)
+        # blocked -> END; else triage for small-talk (both modes).
+        sg.add_conditional_edges(
+            N_INPUT_GUARD,
+            lambda s: "blocked" if s.get("blocked") else "ok",
+            {"blocked": END, "ok": N_TRIAGE},
+        )
         if planner_mode:
-            # Mirror of build_planner_graph: plan -> dispatch -> answer -> reflect,
-            # where the reflect gate loops back to plan (incomplete) or finishes.
+            # triage: small-talk ends directly; a task goes to the planner. Then
+            # plan -> dispatch -> answer -> reflect (loop to plan or finish).
             sg.add_conditional_edges(
-                N_INPUT_GUARD,
-                lambda s: "blocked" if s.get("blocked") else "ok",
-                {"blocked": END, "ok": N_PLAN},
+                N_TRIAGE,
+                lambda s: "task" if s.get("triage", "task") == "task" else "direct",
+                {"task": N_PLAN, "direct": END},
             )
             sg.add_edge(N_PLAN, N_PLAN_DISPATCH)
             sg.add_edge(N_PLAN_DISPATCH, N_ANSWER)
@@ -112,11 +119,10 @@ class LangGraphEngine:
                 {"replan": N_PLAN, "finish": N_OUTPUT_GUARD},
             )
         else:
-            # Same single branch as the built-in graph: blocked -> END, else -> route.
             sg.add_conditional_edges(
-                N_INPUT_GUARD,
-                lambda s: "blocked" if s.get("blocked") else "ok",
-                {"blocked": END, "ok": N_ROUTE},
+                N_TRIAGE,
+                lambda s: "task" if s.get("triage", "task") == "task" else "direct",
+                {"task": N_ROUTE, "direct": END},
             )
             sg.add_edge(N_ROUTE, N_GATHER)
             sg.add_edge(N_GATHER, N_ANSWER)
