@@ -22,32 +22,16 @@ works: add a collection, bind a retriever, done.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
-
-from pydantic import BaseModel, Field
 
 from app.config import Settings
 from app.core.contracts import Chunk, ToolContext
 from app.core.rag.embeddings import Embedder, build_embedder
 from app.core.rag.filters import extract_time_filters
 from app.core.rag.reranker import Reranker, build_reranker
-from app.core.rag.vector_store import SearchFilters, VectorRecord, VectorStore
-
-
-class IndexItem(BaseModel):
-    # One document/chunk handed to the pipeline for indexing. Note there is NO
-    # org_id here — it's passed separately to index() and stamped from the trusted
-    # context, so a caller can't smuggle a different tenant in via the payload.
-    id: str
-    text: str
-    source: str = ""
-    doc_id: str = ""
-    title: str = ""
-    section: str = ""
-    published_at: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+from app.core.rag.vector_store import SearchFilters, VectorStore
 
 
 def _age_days(published_at: str | None) -> float | None:
@@ -82,29 +66,9 @@ class RetrievalPipeline:
         self.reranker = reranker
         self.settings = settings
 
-    async def ensure_collection(self, collection: str) -> None:
-        # Create the collection sized to the embedder's vector dim if needed.
-        await self.store.ensure_collection(collection, self.embedder.dim)
-
-    async def index(self, collection: str, org_id: str, items: Sequence[IndexItem]) -> int:
-        """The WRITE path: embed each item's text and upsert it as a tenant-tagged
-        vector record. ``org_id`` is required and stamped onto every record — this
-        is where the isolation tag is applied at ingest, exactly once, from the
-        trusted caller."""
-        if not org_id:
-            raise ValueError("index requires org_id (tenant isolation)")
-        await self.ensure_collection(collection)
-        # Batch-embed all texts in one call, then pair each vector back with its item.
-        vectors = await self.embedder.embed([it.text for it in items])
-        records = [
-            VectorRecord(
-                id=it.id, org_id=org_id, vector=vectors[i], text=it.text, source=it.source,
-                doc_id=it.doc_id, title=it.title, section=it.section,
-                published_at=it.published_at, metadata=it.metadata,
-            )
-            for i, it in enumerate(items)
-        ]
-        return await self.store.upsert(collection, records)
+    # NOTE: this pipeline is READ-ONLY. Documents are written to the vector store by
+    # an external ingestion cron (embed + upsert directly to the collection); the app
+    # only retrieves. There is intentionally no index()/upsert path here.
 
     def _apply_recency(self, chunks: list[Chunk]) -> list[Chunk]:
         """RECENCY RE-WEIGHTING (time-decay): softly nudge fresher chunks up the
@@ -219,7 +183,6 @@ def build_rag(settings: Settings) -> RetrievalPipeline:
 
 
 __all__ = [
-    "IndexItem",
     "RetrievalPipeline",
     "CollectionRetriever",
     "build_vector_store",

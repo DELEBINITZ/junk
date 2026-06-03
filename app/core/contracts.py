@@ -27,7 +27,7 @@ THREE SAFETY RULES ARE ENCODED HERE — internalize these, they recur everywhere
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -348,42 +348,10 @@ class Specialist(Protocol):
 SpecialistFactory = Callable[..., Specialist]
 
 
-# --------------------------------------------------------------------------- #
-# Ingestion — how a module's data lands (event-driven; batch = one-shot)
-# --------------------------------------------------------------------------- #
-class SourceEvent(BaseModel):
-    """An incoming data event for ingestion (e.g. "new report for org X"). The
-    chat path doesn't use these — ingestion runs off to the side (external cron /
-    event bus) and writes Chunks the retrievers later read."""
-    source: str
-    org_id: str
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class IngestStats(BaseModel):
-    documents: int = 0
-    chunks: int = 0
-    errors: int = 0
-
-
-@runtime_checkable
-class Sinks(Protocol):
-    """Where an ingestion connector WRITES normalized data — the vector store
-    (chunks) and the knowledge graph (nodes/edges). Abstracted so connectors
-    don't know which concrete backend is wired."""
-
-    async def write_chunks(self, chunks: Sequence[Chunk]) -> None: ...
-    async def write_graph(self, org_id: str, nodes: Sequence[dict], edges: Sequence[dict]) -> None: ...
-
-
-@runtime_checkable
-class IngestionConnector(Protocol):
-    """Parses a SourceEvent for one source into chunks/graph and writes them to
-    the Sinks. A module contributes connectors via its manifest."""
-    id: str
-    source: str
-
-    async def handle(self, event: SourceEvent, sinks: Sinks) -> IngestStats: ...
+# NOTE: ingestion is OUT OF SCOPE for this app. Corpora are populated by an external
+# cron that embeds + upserts directly to the vector store; the platform only RETRIEVES.
+# (The old SourceEvent / Sinks / IngestionConnector seam was removed with the in-app
+# ingestion service.)
 
 
 # --------------------------------------------------------------------------- #
@@ -459,7 +427,7 @@ class CapabilityManifest:
     Every field maps to a core subsystem:
       tools/retrievers/specialist -> the agent & RAG          description+tools -> supervisor
       rbac/default_autonomy       -> the MCP boundary & gate  ontology          -> the KG
-      ingestion/action_handlers   -> ingestion & action gate  enabled_flag      -> deployment
+      action_handlers             -> the action gate           enabled_flag      -> deployment
 
     ROUTING is DYNAMIC: the supervisor/planner decide which module(s) answer a
     question by MEANING — embedding similarity over each module's ``display_name``
@@ -484,7 +452,6 @@ class CapabilityManifest:
     default_autonomy: Autonomy = Autonomy.READ
     rbac: Mapping[str, str] = field(default_factory=dict)  # tool_name -> min role override
     ontology: OntologyContribution | None = None
-    ingestion: tuple[IngestionConnector, ...] = ()
     action_handlers: tuple[ActionHandler, ...] = ()
 
     min_core_version: str = "1.0.0"   # the registry checks this against CONTRACTS_VERSION
@@ -532,10 +499,6 @@ __all__ = [
     "Specialist",
     "SpecialistResult",
     "SpecialistFactory",
-    "SourceEvent",
-    "IngestStats",
-    "Sinks",
-    "IngestionConnector",
     "NodeType",
     "EdgeType",
     "OntologyContribution",

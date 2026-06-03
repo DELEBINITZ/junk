@@ -32,7 +32,6 @@ from app.core.action_gate import ActionGate, build_action_gate
 from app.core.agent import Orchestrator, Supervisor, build_checkpointer
 from app.core.contracts import CoreDeps
 from app.core.guardrails import build_input_guardrails, build_output_guardrails
-from app.core.ingestion import IngestionService
 from app.core.llm import build_llm
 from app.core.mcp import InProcessMCPClient
 from app.core.memory import RollingSummarizer, build_conversation_store, build_kg
@@ -68,7 +67,6 @@ class AppServices:
     tracer: Any
     metrics: Any
     logger: Any
-    ingestion: Any = None
     audit: Any = None
     checkpointer: Any = None
 
@@ -106,24 +104,35 @@ def _service_token_minters(settings: Settings, audience: str):
     return for_ctx, for_sc
 
 
-def _build_remote_executors(settings: Settings) -> dict[str, Any]:
-    """Build the per-module REMOTE tool executors from config. For each module with
-    a configured ``*_mcp_url`` we create a FastMCPRemote whose calls carry a
-    short-lived, org-scoped service token (identity rides in the token, never in
-    tool args). Empty by default => every module runs in-process, so this adds no
-    dependency and no behaviour change unless a URL is set. This is the ONE place a
-    module is "promoted" to its own server; the easm/brand/aci pattern is identical
-    — add a URL, done."""
+def _mcp_url_for(settings: Settings, module_id: str) -> str:
+    """Resolve the MCP server URL for one module, or "" if it runs in-process.
+
+    Two sources, generic map first: the ``mcp_urls`` {id: url} map (the zero-code
+    integration path — add an entry, done) wins; otherwise a legacy per-module
+    ``<id>_mcp_url`` Settings field (easm/brand/aci/testkit, kept for back-compat).
+    Convention over configuration: there is no hardcoded list of module ids here, so
+    a brand-new MCP-backed module is wired purely from config."""
+    return (settings.mcp_urls.get(module_id) or getattr(settings, f"{module_id}_mcp_url", "") or "").strip()
+
+
+def _build_remote_executors(settings: Settings, registry: CapabilityRegistry) -> dict[str, Any]:
+    """Build the per-module REMOTE tool executors from config. For each REGISTERED
+    module that has an MCP URL (see ``_mcp_url_for``) we create a FastMCPRemote whose
+    calls carry a short-lived, org-scoped service token (identity rides in the token,
+    never in tool args). Empty by default => every module runs in-process, so this
+    adds no dependency and no behaviour change unless a URL is set. This is the ONE
+    place a module is "promoted" to its own server — and it now iterates the registry
+    (like seed_demo) instead of a hardcoded id list, so promoting ANY module to MCP is
+    config-only: write its manifest, add its url to ``MCP_URLS``, done. No core edit."""
     from app.core.mcp.fastmcp_client import FastMCPRemote
 
-    urls = {"easm": settings.easm_mcp_url, "brand": settings.brand_mcp_url,
-            "aci": settings.aci_mcp_url, "testkit": settings.testkit_mcp_url}
     executors: dict[str, Any] = {}
-    for module_id, url in urls.items():
+    for module in registry.modules():
+        url = _mcp_url_for(settings, module.id)
         if not url:
             continue
-        for_ctx, for_sc = _service_token_minters(settings, f"{module_id}-mcp")
-        executors[module_id] = FastMCPRemote(url, token_for_ctx=for_ctx, token_for_sc=for_sc)
+        for_ctx, for_sc = _service_token_minters(settings, f"{module.id}-mcp")
+        executors[module.id] = FastMCPRemote(url, token_for_ctx=for_ctx, token_for_sc=for_sc)
     return executors
 
 
@@ -174,7 +183,7 @@ def build_services(settings: Settings) -> AppServices:
     #    supervisor does routing. The checkpointer (durable run state) only exists
     #    on the LangGraph engine — None otherwise.
     mcp = InProcessMCPClient(registry, action_gate=action_gate, logger=logger,
-                             remote_executors=_build_remote_executors(settings), settings=settings)
+                             remote_executors=_build_remote_executors(settings, registry), settings=settings)
     supervisor = Supervisor(registry, llm, settings, embedder=getattr(rag, "embedder", None))
     checkpointer = build_checkpointer(settings) if settings.agent_engine == "langgraph" else None
 
@@ -194,16 +203,14 @@ def build_services(settings: Settings) -> AppServices:
         "platform.ready",
         extra={"event": "ready", "cap_modules": ",".join(m.id for m in registry.modules() if m.enabled)},
     )
-    # 6. Hand back the whole object graph. Note a couple of services are built
-    #    inline here (ingestion service, audit logger) because nothing upstream
-    #    needed them during wiring.
+    # 6. Hand back the whole object graph. Note the audit logger is built inline
+    #    here because nothing upstream needed it during wiring.
     return AppServices(
         settings=settings, registry=registry, deps=deps, mcp=mcp, orchestrator=orchestrator,
         supervisor=supervisor, conversations=conversations, summarizer=summarizer, llm=llm,
         rag=rag, kg=kg, action_gate=action_gate,
         input_guard=orchestrator.input_guard, output_guard=orchestrator.output_guard,
         tracer=tracer, metrics=metrics, logger=logger,
-        ingestion=IngestionService(deps),
         audit=build_audit_logger(settings, logger),
         checkpointer=checkpointer,
     )

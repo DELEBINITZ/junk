@@ -260,6 +260,15 @@ class Settings(BaseSettings):
     # the testkit module runs its LOCAL stub tools; set to e.g.
     # http://localhost:3000/mcp to route execution to the real server.
     testkit_mcp_url: str = ""
+    # GENERIC MCP wiring (the easy-integration path). A {module_id: url} map that
+    # promotes ANY capability module to its own MCP server with ZERO code edits — no
+    # new config field, no bootstrap change. Set it as JSON in the env, e.g.
+    #   MCP_URLS={"easm":"http://easm-mcp:8000/mcp","newmod":"http://newmod:8000/mcp"}
+    # bootstrap iterates the registered modules and wires a FastMCPRemote for any
+    # whose id appears here (this map wins) OR that has a legacy ``<id>_mcp_url`` field
+    # above (kept for back-compat). Adding a brand-new MCP-backed module = write its
+    # manifest + add one entry here. Routing/RBAC/the action gate are unchanged.
+    mcp_urls: dict[str, str] = Field(default_factory=dict)
     # TTL of the short-lived, org-scoped service token minted to authenticate a
     # remote MCP call (identity travels in this token, never in tool args).
     mcp_service_token_ttl_seconds: int = 120

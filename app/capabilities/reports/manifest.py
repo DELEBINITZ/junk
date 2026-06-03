@@ -27,9 +27,15 @@ from app.capabilities.reports.tools import TOOLS
 from app.core.contracts import Autonomy, CapabilityManifest
 from app.core.rag.pipeline import CollectionRetriever
 
-# The name of this module's vector-store collection. Everything reports indexes or
-# retrieves lives under this collection (per-tenant isolation is layered on top via
-# org_id at query time — see the retriever and the tools).
+# The Qdrant collection holding this module's report documents (per-tenant isolation
+# is layered on top via org_id at query time — see the retriever and the tools).
+#
+# DATA LIFECYCLE — READ ONLY in this app. The platform does NOT write reports here.
+# An EXTERNAL CRON (owned/operated separately) embeds real reports into this Qdrant
+# collection out-of-band. This module's job is purely to RETRIEVE: at query time the
+# agent searches ``reports_kb`` (via the retriever + the search_reports tool) and, if
+# it finds documents relevant to the user's question, answers from them with
+# citations. So there is no ingest/seed code here — only the read path below.
 REPORTS_COLLECTION = "reports_kb"
 
 # The module's RAG binding (a :class:`Retriever` from contracts.py). It adapts the
@@ -37,6 +43,7 @@ REPORTS_COLLECTION = "reports_kb"
 # returns with ``source="reports"`` so provenance is preserved. The specialist
 # (specialist.py) calls ``retrieve`` on this during ``_retrieve`` to gather corpus
 # evidence; tenant scoping is applied from the trusted ToolContext, never the query.
+# This is a pure READ against Qdrant — the documents were written by the external cron.
 _retriever = CollectionRetriever(
     id="reports_kb_retriever", collection=REPORTS_COLLECTION, source="reports"
 )
