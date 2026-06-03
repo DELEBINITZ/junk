@@ -178,7 +178,7 @@ def build_services(settings: Settings) -> AppServices:
     #    on the LangGraph engine — None otherwise.
     mcp = InProcessMCPClient(registry, action_gate=action_gate, logger=logger,
                              remote_executors=_build_remote_executors(settings), settings=settings)
-    supervisor = Supervisor(registry, llm, settings)
+    supervisor = Supervisor(registry, llm, settings, embedder=getattr(rag, "embedder", None))
     checkpointer = build_checkpointer(settings) if settings.agent_engine == "langgraph" else None
 
     # The orchestrator ties it together: guardrails on input/output, the supervisor

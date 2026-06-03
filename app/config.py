@@ -167,8 +167,37 @@ class Settings(BaseSettings):
     injection_detection: bool = True
     topic_safety: bool = True
     groundedness_check: bool = True
+    # INDIRECT prompt-injection defense: neutralize injection instructions found in
+    # RETRIEVED documents + tool outputs (adversary-controlled) before they enter
+    # the answer prompt, and frame that context as untrusted data. Critical for an
+    # agentic RAG system that reads attacker-influenced content.
+    indirect_injection_defense: bool = True
+    # Defang data-exfiltration vectors (auto-loading markdown images, script links)
+    # in the generated answer.
+    output_exfiltration_guard: bool = True
     prompt_guard_url: str = ""   # optional model endpoint (heuristic backstop always on)
     llama_guard_url: str = ""
+    # ---- Guardrail PROVIDERS (self-hostable models/libs; heuristic = fallback) ----
+    # PII: "regex" (the built-in floor) or "presidio" (Microsoft Presidio — NER +
+    # context + checksums; runs in-process, optional dep). Tuned for a security
+    # product: IP_ADDRESS/URL/DOMAIN are intentionally NOT in pii_entities (they're
+    # the subject matter, not PII).
+    pii_provider: Literal["regex", "presidio"] = "regex"
+    pii_score_threshold: float = 0.5
+    pii_entities: list[str] = Field(default_factory=lambda: [
+        "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "CREDIT_CARD",
+        "IBAN_CODE", "US_BANK_NUMBER", "CRYPTO", "MEDICAL_LICENSE", "US_PASSPORT",
+    ])
+    # Injection: when prompt_guard_url is set, Prompt Guard 2 runs on top of the
+    # regex floor. Threshold = min score on a malicious/jailbreak label to block.
+    prompt_guard_threshold: float = 0.8
+    # Safety: when llama_guard_url is set, Llama Guard 3 (chat endpoint) runs
+    # alongside the narrow harm-regex floor.
+    llama_guard_model: str = "meta-llama/Llama-Guard-3-8B"
+    # Fail policy for the INPUT model classifiers (injection/safety) on a model
+    # error: False = fail OPEN (regex floor still ran, availability first);
+    # True = fail CLOSED (block on classifier error — for high-security tenants).
+    guardrails_fail_closed: bool = False
 
     # ---- Memory / knowledge graph -----------------------------------------
     # Long-term/cross-session memory backend. ``none`` => a NoOp graph (default);
@@ -195,6 +224,13 @@ class Settings(BaseSettings):
     # the deterministic stub), so the zero-infra path still works. Point the LLM at
     # your Qwen/SGLang and the full agentic loop (plan -> tools -> reflect) lights up.
     router_mode: Literal["heuristic", "llm"] = "llm"
+    # How the supervisor picks which module(s)/app(s) handle a query when not using
+    # the LLM router. "keyword" = token overlap on routing_hints (brittle, doesn't
+    # scale). "semantic" = EMBEDDING similarity between the query and each module's
+    # natural-language profile (description+hints+examples+tools) — scales to many
+    # apps (e.g. Composio) with no hand-written keywords. "hybrid" (default) =
+    # keyword when it matches, semantic when keyword is silent (best of both).
+    routing_strategy: Literal["keyword", "semantic", "hybrid"] = "hybrid"
     # Orchestration strategy. ``heuristic`` = the v1 supervisor->specialists graph
     # (route -> parallel dispatch -> answer). ``planner`` = the LLM-brain graph
     # (plan -> dispatch-with-dependencies -> synthesize -> bounded replan): it

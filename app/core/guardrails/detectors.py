@@ -24,6 +24,7 @@ injection / jailbreak attempts.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from app.core.guardrails.base import Action, GuardrailVerdict
@@ -81,6 +82,74 @@ _HARM_PATTERNS = [
     re.compile(r"(?i)how to (?:kill|murder|poison) (?:a |my )?(?:person|someone|people)"),
 ]
 
+# --- obfuscation normalization (defeat homoglyph / zero-width evasion) -------
+# Attackers bypass naive regex with zero-width characters ("i<zwsp>gnore"),
+# unicode homoglyphs, or fullwidth forms. Normalize to NFKC and strip zero-width /
+# bidi / soft-hyphen characters BEFORE matching, so the regex floor can't be
+# trivially evaded. (The model-backed layer, when configured, is the real defense;
+# this just makes the free floor much harder to slip past.)
+_ZERO_WIDTH = re.compile(r"[​-‏‪-‮⁠﻿­]")
+
+
+def _normalize(text: str) -> str:
+    return _ZERO_WIDTH.sub("", unicodedata.normalize("NFKC", text))
+
+
+# --- exfiltration vectors (neutralize in OUTPUT) ----------------------------
+# A successful injection's payoff is often data EXFILTRATION via the rendered
+# answer: an auto-loading markdown image fires a GET to an attacker URL with the
+# stolen data in the query string (zero click), or a javascript:/data: link runs
+# on click. We neutralize those. Bare http(s) links are LEFT — asset URLs are
+# legitimate findings in a security product.
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_BAD_SCHEME_LINK = re.compile(r"\[[^\]]*\]\(\s*(?:javascript|data|vbscript):[^)]*\)", re.IGNORECASE)
+
+
+def neutralize_injection(text: str) -> tuple[str, list[str]]:
+    """Make UNTRUSTED content (retrieved docs, tool outputs) safe to put in the
+    prompt by REDACTING any injection-instruction span in place. We deliberately
+    do NOT block the turn — an attacker could otherwise plant a trigger phrase in
+    a document purely to deny service. Returns (cleaned_text, hit_labels); the
+    original text is returned unchanged when nothing matched."""
+    norm = _normalize(text)
+    hits = [pat.pattern[:24] for pat in _INJECTION_PATTERNS if pat.search(norm)]
+    if not hits:
+        return text, []
+    cleaned = norm
+    for pat in _INJECTION_PATTERNS:
+        cleaned = pat.sub("[neutralized-instruction]", cleaned)
+    return cleaned, hits
+
+
+# Labels a classifier (Prompt Guard 2 / HF text-classification) uses for a
+# malicious prompt. We normalize across naming conventions.
+_INJECTION_LABELS = {"injection", "jailbreak", "malicious", "unsafe", "label_1"}
+
+
+def _flag_injection(payload: Any, threshold: float) -> bool:
+    """Normalize a classifier's response (which may be ``[{label,score}]``,
+    ``[[{label,score}]]``, or ``{label,score}``) and return True if any
+    malicious/jailbreak label scores at or above ``threshold``. Kept pure so the
+    parsing is unit-testable without a live model."""
+    items = payload
+    while isinstance(items, list) and items and isinstance(items[0], list):
+        items = items[0]            # unwrap [[...]] -> [...]
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return False
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        label = str(it.get("label", "")).strip().lower()
+        try:
+            score = float(it.get("score", 0) or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if label in _INJECTION_LABELS and score >= threshold:
+            return True
+    return False
+
 
 class SecretRedactor:
     """INPUT detector. Replaces any detected secret with a ``[REDACTED_*]`` marker
@@ -137,12 +206,14 @@ class PromptInjectionDetector:
 
     name = "prompt_injection"
 
-    def __init__(self, model_url: str = "") -> None:
+    def __init__(self, model_url: str = "", threshold: float = 0.8, fail_closed: bool = False) -> None:
         self.model_url = model_url                  # empty => heuristic-only (no model layer)
+        self.threshold = threshold                  # min malicious-label score to flag
+        self.fail_closed = fail_closed              # on model error: block (True) vs allow (False)
 
     async def _model_flags(self, text: str) -> bool:
-        # Optional strong layer: ask a hosted Prompt Guard classifier. If no URL is
-        # configured we skip it entirely and rely on the regex floor.
+        # Optional strong layer: Prompt Guard 2 (a hosted text-classifier). If no URL
+        # is configured we skip it and rely on the regex floor.
         if not self.model_url:
             return False
         try:
@@ -152,20 +223,17 @@ class PromptInjectionDetector:
                 r = await c.post(f"{self.model_url.rstrip('/')}/classify", json={"inputs": text})
                 r.raise_for_status()
                 data = r.json()
-            # Prompt Guard returns label scores; treat JAILBREAK/INJECTION > 0.8 as flag
-            top = data[0] if isinstance(data, list) else data
-            label = str(top.get("label", "")).upper()
-            score = float(top.get("score", 0))
-            return label in {"JAILBREAK", "INJECTION"} and score >= 0.8
+            return _flag_injection(data, self.threshold)
         except Exception:
-            # FAIL OPEN on a model error (network/timeout): the regex floor still
-            # ran, so we don't hard-fail the whole request if the classifier is down.
-            return False
+            # On a model error (network/timeout): fail CLOSED (block) if configured
+            # for high-security, else fail OPEN — the regex floor already ran.
+            return self.fail_closed
 
     async def check(self, text: str, ctx: Any) -> GuardrailVerdict:
-        # Flag if EITHER the regex floor OR the model trips. BLOCK is correct here:
-        # an injection attempt isn't something we want to "clean and continue".
-        if any(p.search(text) for p in _INJECTION_PATTERNS) or await self._model_flags(text):
+        # Match on NORMALIZED text so zero-width / homoglyph obfuscation can't slip
+        # past the floor. Flag if EITHER the regex floor OR the model trips. BLOCK is
+        # correct here: an injection attempt isn't something we "clean and continue".
+        if any(p.search(_normalize(text)) for p in _INJECTION_PATTERNS) or await self._model_flags(text):
             return GuardrailVerdict(detector=self.name, action=Action.BLOCK,
                                     reason="possible prompt injection / jailbreak attempt")
         return GuardrailVerdict(detector=self.name)
@@ -202,10 +270,121 @@ class TopicSafetyDetector:
 
     async def check(self, text: str, ctx: Any) -> GuardrailVerdict:
         # Block only on the narrow harm list OR an explicit "unsafe" from the model.
-        if any(p.search(text) for p in _HARM_PATTERNS) or await self._model_blocks(text):
+        # Normalize first so obfuscation can't dodge the floor.
+        if any(p.search(_normalize(text)) for p in _HARM_PATTERNS) or await self._model_blocks(text):
             return GuardrailVerdict(detector=self.name, action=Action.BLOCK,
                                     reason="request appears to seek harm unrelated to defense")
         return GuardrailVerdict(detector=self.name)
 
 
-__all__ = ["SecretRedactor", "PIIRedactor", "PromptInjectionDetector", "TopicSafetyDetector"]
+class OutputExfiltrationGuard:
+    """OUTPUT detector. Neutralizes data-exfiltration vectors a successful prompt
+    injection could plant in the ANSWER: auto-loading markdown images (a zero-click
+    pixel that GETs an attacker URL with stolen data in the query string) and
+    javascript:/data: links. Bare http(s) links are LEFT untouched — asset URLs are
+    legitimate findings in this product. REDACT (defang), never block."""
+
+    name = "output_exfiltration"
+
+    async def check(self, text: str, ctx: Any) -> GuardrailVerdict:
+        cleaned = _MD_IMAGE.sub("[external image removed]", text)
+        cleaned = _BAD_SCHEME_LINK.sub("[link removed]", cleaned)
+        if cleaned != text:
+            return GuardrailVerdict(detector=self.name, action=Action.REDACT, text=cleaned,
+                                    reason="neutralized exfiltration vector (auto-loading image / script link)")
+        return GuardrailVerdict(detector=self.name)
+
+
+class LlamaGuardDetector:
+    """INPUT detector backed by Llama Guard 3 (self-hosted on your GPU). Unlike the
+    simple classify-endpoint seam, Llama Guard is a CHAT model: we send the text as
+    a user turn to an OpenAI-compatible endpoint and it replies "safe" or
+    "unsafe\\nS<category>". It runs ALONGSIDE the narrow harm-regex floor
+    (defense in depth), and BLOCKS on "unsafe". Fail policy is configurable."""
+
+    name = "llama_guard"
+
+    def __init__(self, base_url: str, model: str, *, fail_closed: bool = False, timeout: float = 10.0) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.fail_closed = fail_closed
+        self.timeout = timeout
+
+    async def check(self, text: str, ctx: Any) -> GuardrailVerdict:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                r = await c.post(
+                    f"{self.base_url}/chat/completions",
+                    json={"model": self.model, "messages": [{"role": "user", "content": text}],
+                          "max_tokens": 16, "temperature": 0},
+                )
+                r.raise_for_status()
+                content = str(r.json()["choices"][0]["message"]["content"]).strip().lower()
+            unsafe = content.startswith("unsafe")
+        except Exception:
+            unsafe = self.fail_closed              # block on error only if fail-closed
+        if unsafe:
+            return GuardrailVerdict(detector=self.name, action=Action.BLOCK,
+                                    reason="content classified unsafe (llama guard)")
+        return GuardrailVerdict(detector=self.name)
+
+
+class PresidioPIIRedactor:
+    """OUTPUT detector backed by Microsoft Presidio (self-hosted, in-process). Far
+    stronger than the regex floor: NER + context + checksums catch names, emails,
+    phones, SSNs, cards, IBANs, etc. ``entities`` is the SECURITY-TUNED set — note
+    it deliberately omits IP_ADDRESS/URL/DOMAIN, which are the product's subject
+    matter, not PII. Presidio (and its spaCy model) is an optional dependency;
+    build_output_guardrails falls back to the regex redactor if it isn't installed.
+    Uses the same ``pii_redactor`` name so it slots in interchangeably."""
+
+    name = "pii_redactor"
+
+    def __init__(self, entities: tuple[str, ...] = (), threshold: float = 0.5) -> None:
+        self._entities = list(entities) or None     # None => all of Presidio's recognizers
+        self._threshold = threshold
+        self._analyzer = None
+        self._anonymizer = None
+
+    def _engines(self):
+        # Lazily build the (heavy) analyzer/anonymizer once and reuse them.
+        if self._analyzer is None:
+            from presidio_analyzer import AnalyzerEngine
+            from presidio_anonymizer import AnonymizerEngine
+
+            self._analyzer = AnalyzerEngine()
+            self._anonymizer = AnonymizerEngine()
+        return self._analyzer, self._anonymizer
+
+    async def check(self, text: str, ctx: Any) -> GuardrailVerdict:
+        import asyncio
+
+        try:
+            analyzer, anonymizer = self._engines()
+            # analyze() runs spaCy NER (CPU-bound) — push it off the event loop.
+            results = await asyncio.to_thread(
+                analyzer.analyze, text=text, entities=self._entities, language="en"
+            )
+            results = [r for r in results if r.score >= self._threshold]
+            if not results:
+                return GuardrailVerdict(detector=self.name)
+            from presidio_anonymizer.entities import OperatorConfig
+
+            anon = anonymizer.anonymize(
+                text=text, analyzer_results=results,
+                operators={"DEFAULT": OperatorConfig("replace", {"new_value": "[REDACTED_PII]"})},
+            )
+            types = sorted({r.entity_type for r in results})
+            return GuardrailVerdict(detector=self.name, action=Action.REDACT, text=anon.text,
+                                    reason="PII redacted (presidio)", metadata={"types": types})
+        except Exception:
+            # Engine/model error -> don't break the turn; emit no redaction. (Build
+            # already chose Presidio only when importable; this guards runtime faults.)
+            return GuardrailVerdict(detector=self.name)
+
+
+__all__ = ["SecretRedactor", "PIIRedactor", "PromptInjectionDetector", "TopicSafetyDetector",
+           "OutputExfiltrationGuard", "LlamaGuardDetector", "PresidioPIIRedactor",
+           "neutralize_injection"]

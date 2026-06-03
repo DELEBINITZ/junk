@@ -66,13 +66,16 @@ _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
 class Planner:
-    def __init__(self, registry, llm, settings) -> None:
+    def __init__(self, registry, llm, settings, *, embedder=None) -> None:
         self.registry = registry
         self.llm = llm
         self.settings = settings
+        self.embedder = embedder
         # The deterministic/heuristic plan reuses the supervisor's domain selection,
-        # capped at planner_max_fanout domains.
-        self.supervisor = Supervisor(registry, llm, settings, max_fanout=settings.planner_max_fanout)
+        # capped at planner_max_fanout domains. The embedder enables SEMANTIC module
+        # routing (so the plan targets the right app even without keywords).
+        self.supervisor = Supervisor(registry, llm, settings,
+                                     max_fanout=settings.planner_max_fanout, embedder=embedder)
 
     def _use_llm(self) -> bool:
         # Only plan with the model when LLM mode is on AND a real provider is wired
