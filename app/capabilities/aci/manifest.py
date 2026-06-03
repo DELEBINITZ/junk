@@ -23,7 +23,6 @@ from app.core.contracts import (
     Autonomy,
     CapabilityManifest,
     Citation,
-    RoutingHint,
     ToolContext,
     ToolResult,
     tool,
@@ -87,14 +86,9 @@ MANIFEST = CapabilityManifest(
     enabled_default=False,
     # AGENT/MCP surface: just the one read tool. No retriever (tool-backed module).
     tools=(get_threat_actors,),
-    # SUPERVISOR routing vocabulary for adversary/threat-intel questions.
-    routing_hints=(
-        RoutingHint(
-            intents=("threat actor", "adversary", "who is attacking", "campaign", "TTP",
-                     "MITRE", "dark web", "credential leak", "attribution"),
-            examples=("who is targeting us?", "which threat actors weaponize our exposed CVE?"),
-        ),
-    ),
+    # SUPERVISOR routing is DYNAMIC: adversary / threat-intel questions reach this
+    # module by MEANING, scored against the ``description`` + the tool descriptions —
+    # no curated keywords.
     # SUGGEST autonomy is the module default even though today's only tool is read-only —
     # it signals where this pillar is headed (it would later add gated actions).
     default_autonomy=Autonomy.SUGGEST,

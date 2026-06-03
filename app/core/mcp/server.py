@@ -41,6 +41,7 @@ def make_mcp_app(
     deps: CoreDeps,
     *,
     title: str = "MCP server",
+    audience: str | None = None,
 ):
     """Build a FastAPI app exposing the registry's tools over JSON-RPC at /mcp.
 
@@ -48,7 +49,12 @@ def make_mcp_app(
     module is actually run as a standalone server. The ``client`` it wraps is an
     ordinary InProcessMCPClient — meaning every tool call this server handles
     still passes through the SAME RBAC + action-gate enforcement.
-    """
+
+    ``audience`` is THIS server's identity (e.g. "easm-mcp"). When set, the bearer
+    service token must carry a matching ``aud`` claim or it is rejected — so a token
+    minted for another module's server can't be replayed here. The caller mints
+    tokens with ``create_service_token(audience="<module>-mcp")``, so pass the same
+    string (e.g. ``make_mcp_app(reg, settings, deps, audience="easm-mcp")``)."""
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
@@ -66,7 +72,7 @@ def make_mcp_app(
         caller cannot assert a different org than its token grants."""
         auth = request.headers.get("authorization", "")
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        claims = decode_token(settings, token, expected_type="access")
+        claims = decode_token(settings, token, expected_type="access", expected_audience=audience)
         return SecurityContext(
             org_id=str(claims["org_id"]), user_id=str(claims["sub"]),
             roles=tuple(claims.get("roles", []) or ("viewer",)),

@@ -30,7 +30,6 @@ from app.core.contracts import (
     CapabilityManifest,
     OntologyContribution,
     Retriever,
-    RoutingHint,
     Tool,
     role_satisfies,
 )
@@ -84,14 +83,14 @@ class RegisteredModule:
 class CapabilityView:
     """What ONE org/user can see and do — the security-filtered projection of the
     registry for a specific caller. Returned by :meth:`capability_view`; computed
-    per (org, roles). Holds only the modules they're entitled to, only the tools
-    their roles satisfy, and the routing hints for those modules. The agent and
-    API are handed this view, so a caller can never route to or call a capability
-    they aren't licensed/authorized for."""
+    per (org, roles). Holds only the modules they're entitled to and only the tools
+    their roles satisfy. The agent and API are handed this view, so a caller can
+    never route to or call a capability they aren't licensed/authorized for.
+    Routing is derived from each module's description + tools (see supervisor.py),
+    so there is no separate routing structure to carry here."""
 
     module_ids: list[str]
     tools: list[Tool]
-    routing: list[tuple[str, RoutingHint]]  # (module_id, hint)
 
 
 class CapabilityRegistry:
@@ -277,22 +276,20 @@ class CapabilityRegistry:
         So the returned tool list is exactly "modules this tenant bought ∩ tools
         this user's role permits". The agent and API only ever see this view, which
         is how a low-privilege user in one org cannot route to, see, or invoke a
-        capability outside their license/role. Routing hints are carried only for
-        the entitled modules, so even the SUPERVISOR can't route to a hidden one.
+        capability outside their license/role. Only entitled modules appear in
+        ``module_ids``, so even the SUPERVISOR (which routes over this view) can
+        never route to a module a tenant isn't entitled to.
         """
         module_ids: list[str] = []
         tools: list[Tool] = []
-        routing: list[tuple[str, RoutingHint]] = []
         for m in self._modules.values():
             if not self._entitled(m, sc):        # filter 1: org-level license gate
                 continue
             module_ids.append(m.id)
-            for hint in m.manifest.routing_hints:
-                routing.append((m.id, hint))
             for tname, tool in m.tools.items():
                 if role_satisfies(sc.roles, m.required_role(tname)):   # filter 2: per-tool RBAC
                     tools.append(tool)
-        return CapabilityView(module_ids=module_ids, tools=tools, routing=routing)
+        return CapabilityView(module_ids=module_ids, tools=tools)
 
 
 __all__ = ["CapabilityRegistry", "RegisteredModule", "CapabilityView"]

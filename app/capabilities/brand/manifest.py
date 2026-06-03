@@ -18,7 +18,6 @@ from app.core.contracts import (
     Autonomy,
     CapabilityManifest,
     Citation,
-    RoutingHint,
     ToolContext,
     ToolResult,
     tool,
@@ -66,14 +65,9 @@ MANIFEST = CapabilityManifest(
     enabled_default=False,
     # AGENT/MCP surface: the single read tool; no retriever (tool-backed module).
     tools=(get_brand_alerts,),
-    # SUPERVISOR routing vocabulary for brand-abuse / impersonation questions.
-    routing_hints=(
-        RoutingHint(
-            intents=("brand", "lookalike domain", "phishing", "impersonation", "fake app", "takedown"),
-            examples=("are there phishing sites targeting our brand?",
-                      "any lookalike domains impersonating us?"),
-        ),
-    ),
+    # SUPERVISOR routing is DYNAMIC: brand-abuse / impersonation questions reach this
+    # module by MEANING, scored against the ``description`` + the tool descriptions —
+    # no curated keywords.
     # SUGGEST: the pillar is destined to drive gated takedown actions, even though the
     # only tool today is read-only.
     default_autonomy=Autonomy.SUGGEST,

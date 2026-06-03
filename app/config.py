@@ -70,33 +70,20 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["*"])
 
     # ---- Auth --------------------------------------------------------------
-    # Identity. ``local`` mints/verifies its own JWTs (great for dev); ``oidc``
-    # defers to a real identity provider and reads org/roles from token claims.
-    # The org claim is critical: it is the verified tenant key that flows into
-    # every request's ToolContext and powers tenant isolation. The dev jwt_secret
-    # is intentionally insecure and MUST be overridden outside dev.
-    auth_provider: Literal["local", "oidc", "apikey"] = "local"
+    # ONE auth model (see security/deps.py): every request must carry (1) a valid
+    # API KEY (``X-API-Key`` header, or ``?api_key=`` for SSE) that gates access at
+    # the gateway, AND (2) a JWT (Bearer / ``?access_token=`` / cookie) whose claims
+    # carry the verified identity — ``org_id`` (the tenant key that powers isolation),
+    # ``sub`` (user id), and ``roles``. The JWT is minted upstream; this service only
+    # VERIFIES it. There is no login/password/OIDC/refresh flow.
+    #
+    # ``api_keys``: the set of accepted gateway keys. ``jwt_secret``: the HS256 key
+    # used to verify (and, via the dev mint helper, sign) JWTs — the dev default is
+    # intentionally insecure and the prod guard rejects it.
+    api_keys: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["dev-api-key-change-me"])
     jwt_secret: str = _DEV_JWT_SECRET  # CHANGE in prod — the prod guard enforces this
     jwt_algorithm: str = "HS256"
     access_token_ttl_seconds: int = 3600
-    refresh_token_ttl_seconds: int = 1209600  # 14 days
-    # OIDC (auth_provider=oidc): where to validate tokens and which claims carry
-    # the tenant id and the caller's roles (the inputs to multi-tenant RBAC).
-    oidc_issuer: str = ""
-    oidc_audience: str = ""
-    oidc_jwks_url: str = ""
-    oidc_org_claim: str = "org_id"
-    oidc_roles_claim: str = "roles"
-    # ---- API-key auth (AUTH_PROVIDER=apikey) — TESTING / trusted-gateway ONLY ----
-    # A request authenticates with one of these keys (``X-API-Key`` header or
-    # ``?api_key=`` for SSE). The org/user/roles are then taken from the request:
-    # the chat BODY, or ``X-Org-Id``/``X-User-Id``/``X-Roles`` headers, or the query
-    # string. WARNING: this TRUSTS the caller for identity — whoever holds a key can
-    # set any org_id, so it RELAXES tenant isolation. Use only behind a trusted
-    # backend or for local testing. The production guard REJECTS apikey; for prod
-    # use local/oidc (or bind each key to a fixed org).
-    api_keys: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["dev-api-key-change-me"])
-    apikey_default_roles: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["analyst"])
 
     # ---- Stores ------------------------------------------------------------
     # Where conversations/sessions persist. ``memory`` is in-process (zero infra);
@@ -237,13 +224,16 @@ class Settings(BaseSettings):
     # the deterministic stub), so the zero-infra path still works. Point the LLM at
     # your Qwen/SGLang and the full agentic loop (plan -> tools -> reflect) lights up.
     router_mode: Literal["heuristic", "llm"] = "llm"
-    # How the supervisor picks which module(s)/app(s) handle a query when not using
-    # the LLM router. "keyword" = token overlap on routing_hints (brittle, doesn't
-    # scale). "semantic" = EMBEDDING similarity between the query and each module's
-    # natural-language profile (description+hints+examples+tools) — scales to many
-    # apps (e.g. Composio) with no hand-written keywords. "hybrid" (default) =
-    # keyword when it matches, semantic when keyword is silent (best of both).
-    routing_strategy: Literal["keyword", "semantic", "hybrid"] = "hybrid"
+    # How the supervisor picks which module(s)/app(s) handle a query when NOT using
+    # the LLM router. Routing is ALWAYS dynamic (by meaning), never by curated
+    # keywords — the brittle keyword/``routing_hints`` path has been removed because
+    # it silently mis-routed any query whose wording differed from the hand-written
+    # phrases. "semantic" (default) = EMBEDDING similarity between the query and each
+    # module's natural-language profile (display_name + description + tool
+    # names/descriptions). The default embedder is deterministic + offline, so this
+    # works with no model; a real embedder sharpens recall. "llm" defers entirely to
+    # the LLM router (router_mode=llm + a real model).
+    routing_strategy: Literal["semantic", "llm"] = "semantic"
     # Orchestration strategy. ``heuristic`` = the v1 supervisor->specialists graph
     # (route -> parallel dispatch -> answer). ``planner`` = the LLM-brain graph
     # (plan -> dispatch-with-dependencies -> synthesize -> bounded replan): it
@@ -253,7 +243,12 @@ class Settings(BaseSettings):
     # so the zero-infra path still works and tests stay green.
     orchestrator_mode: Literal["heuristic", "planner"] = "planner"
     max_plan_steps: int = 6      # hard cap on steps the planner may emit (bounds fan-out + cost)
-    max_replans: int = 1         # how many times reflection may revise after a gap (0 = never)
+    # DEEP REASONING depth: how many times the reflect gate may revise the plan after
+    # finding a gap (LLM mode only; the deterministic path always finishes in one
+    # pass). 2 lets the agent iterate twice — gather, notice what's missing, fetch the
+    # missing data, and (if still short) fetch once more — before answering. Bounds
+    # cost/latency; raise for harder questions, set 0 to disable reflection.
+    max_replans: int = 2
     planner_max_fanout: int = 2  # max modules a single (deterministic) plan spreads across
 
     # ---- Remote MCP servers + tool-context budget --------------------------
@@ -265,6 +260,10 @@ class Settings(BaseSettings):
     easm_mcp_url: str = ""
     brand_mcp_url: str = ""
     aci_mcp_url: str = ""
+    # Utility module backed by the external `mcp-test-kits` MCP server. Empty =>
+    # the testkit module runs its LOCAL stub tools; set to e.g.
+    # http://localhost:3000/mcp to route execution to the real server.
+    testkit_mcp_url: str = ""
     # TTL of the short-lived, org-scoped service token minted to authenticate a
     # remote MCP call (identity travels in this token, never in tool args).
     mcp_service_token_ttl_seconds: int = 120
@@ -308,6 +307,7 @@ class Settings(BaseSettings):
     cap_easm_enabled: bool = True
     cap_brand_enabled: bool = False
     cap_aci_enabled: bool = False
+    cap_testkit_enabled: bool = True
     # Seed each enabled module's demo corpus at boot (dev convenience; off in prod).
     seed_demo_data: bool = True
 
@@ -337,7 +337,7 @@ class Settings(BaseSettings):
             return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
-    @field_validator("api_keys", "apikey_default_roles", "pii_entities", mode="before")
+    @field_validator("api_keys", "pii_entities", mode="before")
     @classmethod
     def _csv_list(cls, v: object) -> object:
         """Same CSV-or-JSON convenience for the other list-valued settings, so an
@@ -375,16 +375,14 @@ class Settings(BaseSettings):
             bad.append("SEED_DEMO_DATA=true — must be false in prod (no demo corpora)")
         if self.debug:
             bad.append("DEBUG=true — must be false in prod")
-        if self.auth_provider == "local":
-            if self.jwt_secret == _DEV_JWT_SECRET:
-                bad.append("JWT_SECRET is the insecure dev default — set a strong secret")
-            elif len(self.jwt_secret) < 32:
-                bad.append("JWT_SECRET shorter than 32 bytes")
-        if self.auth_provider == "apikey":
-            bad.append("AUTH_PROVIDER=apikey is testing-only (it trusts caller identity) "
-                       "— use local or oidc in prod")
-        if self.auth_provider == "oidc" and not (self.oidc_issuer and self.oidc_jwks_url):
-            bad.append("AUTH_PROVIDER=oidc but OIDC_ISSUER/OIDC_JWKS_URL not set")
+        # JWT verifies caller identity — the secret must be strong in prod.
+        if self.jwt_secret == _DEV_JWT_SECRET:
+            bad.append("JWT_SECRET is the insecure dev default — set a strong secret")
+        elif len(self.jwt_secret) < 32:
+            bad.append("JWT_SECRET shorter than 32 bytes")
+        # API keys gate the gateway — the dev default must not ship to prod.
+        if not self.api_keys or "dev-api-key-change-me" in set(self.api_keys):
+            bad.append("API_KEYS is empty or still the dev default — set real gateway key(s)")
         # Tool-backed modules MUST point at a real MCP server in prod, else they
         # would serve their built-in mock data. (Corpus modules like reports are
         # covered by RETRIEVAL_BACKEND=qdrant above.)

@@ -40,8 +40,6 @@ from app.core.observability import build_tracer, configure_logging, get_logger, 
 from app.core.observability.audit import build_audit_logger
 from app.core.rag import build_rag
 from app.core.registry import CapabilityRegistry
-from app.core.security.tokens import build_revocation_store
-from app.core.security.users import build_default_user_store
 
 
 @dataclass
@@ -70,8 +68,6 @@ class AppServices:
     tracer: Any
     metrics: Any
     logger: Any
-    revocation_store: Any
-    user_store: Any
     ingestion: Any = None
     audit: Any = None
     checkpointer: Any = None
@@ -120,7 +116,8 @@ def _build_remote_executors(settings: Settings) -> dict[str, Any]:
     — add a URL, done."""
     from app.core.mcp.fastmcp_client import FastMCPRemote
 
-    urls = {"easm": settings.easm_mcp_url, "brand": settings.brand_mcp_url, "aci": settings.aci_mcp_url}
+    urls = {"easm": settings.easm_mcp_url, "brand": settings.brand_mcp_url,
+            "aci": settings.aci_mcp_url, "testkit": settings.testkit_mcp_url}
     executors: dict[str, Any] = {}
     for module_id, url in urls.items():
         if not url:
@@ -197,17 +194,15 @@ def build_services(settings: Settings) -> AppServices:
         "platform.ready",
         extra={"event": "ready", "cap_modules": ",".join(m.id for m in registry.modules() if m.enabled)},
     )
-    # 6. Hand back the whole object graph. Note a few services are built inline
-    #    here (revocation/user stores, ingestion service, audit logger) because
-    #    nothing upstream needed them during wiring.
+    # 6. Hand back the whole object graph. Note a couple of services are built
+    #    inline here (ingestion service, audit logger) because nothing upstream
+    #    needed them during wiring.
     return AppServices(
         settings=settings, registry=registry, deps=deps, mcp=mcp, orchestrator=orchestrator,
         supervisor=supervisor, conversations=conversations, summarizer=summarizer, llm=llm,
         rag=rag, kg=kg, action_gate=action_gate,
         input_guard=orchestrator.input_guard, output_guard=orchestrator.output_guard,
         tracer=tracer, metrics=metrics, logger=logger,
-        revocation_store=build_revocation_store(settings),
-        user_store=build_default_user_store(),
         ingestion=IngestionService(deps),
         audit=build_audit_logger(settings, logger),
         checkpointer=checkpointer,

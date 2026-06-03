@@ -35,7 +35,7 @@ def test_prod_accepts_full_real_config():
         llm_provider="sglang", embedding_provider="tei",
         retrieval_backend="qdrant", store_backend="postgres",
         database_url="postgresql://u:p@h:5432/db",
-        auth_provider="local", jwt_secret="x" * 40,
+        jwt_secret="x" * 40, api_keys=["prod-gateway-key-001"],
         cap_reports_enabled=True, cap_easm_enabled=False,
         cap_brand_enabled=False, cap_aci_enabled=False,
     )
@@ -50,7 +50,7 @@ def test_prod_requires_mcp_url_for_enabled_tool_module():
             llm_provider="sglang", embedding_provider="tei",
             retrieval_backend="qdrant", store_backend="postgres",
             database_url="postgresql://u:p@h:5432/db",
-            auth_provider="local", jwt_secret="x" * 40,
+            jwt_secret="x" * 40, api_keys=["prod-gateway-key-001"],
             cap_easm_enabled=True, easm_mcp_url="",
             cap_brand_enabled=False, cap_aci_enabled=False,
         )

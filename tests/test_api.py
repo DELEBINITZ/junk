@@ -60,11 +60,3 @@ def test_rbac_viewer_cannot_ingest(client):
     r = client.post("/v1/ingest", json={"documents": [{"doc_id": "x", "text": "y"}]},
                     headers={"Authorization": f"Bearer {ct}"})
     assert r.status_code == 403
-
-
-def test_logout_revokes(client):
-    at = login(client)
-    H = {"Authorization": f"Bearer {at}"}
-    assert client.post("/v1/auth/logout", headers=H).json()["status"] == "logged_out"
-    # token now revoked
-    assert client.get("/v1/auth/me", headers=H).status_code == 401

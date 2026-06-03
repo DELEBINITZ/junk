@@ -1,7 +1,7 @@
 """Dynamic routing: capabilities are chosen by MEANING (module description + tool
-descriptions), not by hand-written keyword routing_hints. With a real LLM the
-planner/router decides; the deterministic fallback uses semantic similarity.
-routing_hints are now an optional signal, not the mechanism.
+descriptions), not by hand-written keyword routing_hints (which have been removed).
+With a real LLM the LLM router decides; the deterministic default uses semantic
+embedding similarity over each module's profile.
 """
 
 from __future__ import annotations
@@ -49,10 +49,24 @@ def test_module_profile_uses_description_and_tools(services):
 
 
 @pytest.mark.asyncio
-async def test_hybrid_preserves_keyword_routes(services, acme):
-    """Hybrid (default) keeps precise keyword routes when keywords match — semantic
-    only breaks ties — so existing routing is unchanged."""
+async def test_semantic_routes_attack_surface_question(services, acme):
+    """A plainly-worded attack-surface question routes to easm by MEANING (semantic
+    similarity over description + tools), with no keyword/routing_hints involved."""
     sup = Supervisor(services.registry, services.deps.llm, services.deps.settings,
                      embedder=services.deps.rag.embedder, max_fanout=2)
     r = await sup.route("what assets do we have exposed to the internet?", acme)
+    assert r.mode == "semantic"
     assert "easm" in r.modules
+
+
+@pytest.mark.asyncio
+async def test_cross_domain_question_fans_out(services, acme):
+    """A genuinely cross-domain question routes to max_fanout specialists by meaning.
+    The threat-actor clause reliably surfaces aci; the second slot is the next-best
+    semantic match. (On the real LLM-router path this is easm + aci; the offline
+    embedder is approximate — see test_contracts routing test.)"""
+    sup = Supervisor(services.registry, services.deps.llm, services.deps.settings,
+                     embedder=services.deps.rag.embedder, max_fanout=2)
+    r = await sup.route("what is our biggest exposure and which threat actor weaponizes it?", acme)
+    assert len(r.modules) == 2          # fanned out
+    assert "aci" in r.modules           # the adversary clause routed to aci by meaning

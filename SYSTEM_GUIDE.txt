@@ -147,13 +147,14 @@ LEVEL 1 — WHICH CAPABILITY (module/app)?        agent/supervisor.py
    (routing_strategy / router_mode):
      * llm (router_mode=llm, the PROD default) — the LLM reads each module's
        capability and PICKS. No keywords. This is the real production decider.
-     * semantic — EMBEDDING similarity between the query and each module's PROFILE
-       (display name + description + tool names/descriptions + hints-as-text).
+     * semantic (the default fallback) — EMBEDDING similarity between the query and
+       each module's PROFILE (display name + description + tool names/descriptions).
        Routes by MEANING. Profiles are embedded ONCE and cached (_MODULE_VEC_CACHE).
-     * hybrid (default) — keyword when it has a signal, semantic when it's silent.
-     * keyword — token overlap on routing_hints (the old, brittle floor).
-   IMPORTANT: routing_hints are now an OPTIONAL signal. A module routes from its
-   description + tool descriptions alone — delete its hints and it still works.
+       Works offline via the deterministic embedder; sharper with a real one.
+   IMPORTANT: routing is FULLY DYNAMIC — there are no routing keywords. The old
+   keyword/hybrid strategies and per-module routing_hints have been REMOVED because
+   they silently mis-routed any query worded differently from the curated phrases.
+   A module routes purely from its description + tool descriptions; keep those crisp.
 
 LEVEL 2 — WHICH TOOLS (within the chosen capability)?   agent/specialist.py
    The specialist assembles candidates = this module's LOCAL read tools + tools
@@ -392,8 +393,8 @@ memory store, demo seed, dev JWT secret, an enabled tool-module without its MCP
 url, ...). It prints exactly what to fix. So prod can never silently run on stubs.
 
 Key agentic config: ORCHESTRATOR_MODE=planner, ROUTER_MODE=llm,
-ROUTING_STRATEGY=hybrid|semantic, MAX_TOOLS_ADVERTISED, MAX_PLAN_STEPS/REPLANS,
-*_MCP_URL, MCP_DYNAMIC_TRUST_UNANNOTATED.
+ROUTING_STRATEGY=semantic (the non-LLM fallback), MAX_TOOLS_ADVERTISED,
+MAX_PLAN_STEPS/REPLANS, *_MCP_URL, MCP_DYNAMIC_TRUST_UNANNOTATED.
 
 
 ===============================================================================
