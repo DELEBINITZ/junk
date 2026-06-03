@@ -4,27 +4,25 @@ the whole app is assembled from.
 MENTAL MODEL: this one Settings object is the "control panel" for the platform.
 bootstrap.py reads it and decides which concrete backend to wire for every seam
 (LLM, embeddings, vector store, chat store, agent engine, tracing). That pattern
-is "config-gating": the *same* code path serves either a deterministic, self-
-hosted default or a real production backend, chosen purely by a value here. No
-code change is needed to switch — only an env var.
+is "config-gating": the *same* code path serves whichever real backend a value
+here selects. No code change is needed to switch — only an env var.
 
-WHY DETERMINISTIC DEFAULTS MATTER (read this twice): every external dependency
-defaults to a zero-infra local path, so the system boots and serves with no GPU,
-no API keys, and no network. Two payoffs:
+REAL INFRA IS REQUIRED: the offline/deterministic stubs have been removed. The
+platform needs a real LLM (SGLang/OpenAI-compatible), a real embedder (TEI/OpenAI),
+Qdrant, and Postgres to boot and serve. Two payoffs of the data-governance posture:
   * onboarding / tests / CI run anywhere, instantly and reproducibly; and
   * SECURITY — on the defaults, no contract or security-intelligence text is ever
     sent to an external LLM/embedding API. Sensitive data only leaves this process
     if an operator EXPLICITLY flips a provider to a hosted service and supplies
     creds. Self-hosted-by-default is a deliberate data-governance posture.
 
-  * ``llm_provider=deterministic``      -> no LLM server needed
-  * ``embedding_provider=deterministic``-> hash embeddings, no TEI
-  * ``retrieval_backend=memory``        -> in-process vector store, no Qdrant
-  * ``store_backend=memory``            -> in-process chat/session store, no PG
+  * ``llm_provider=sglang|openai``      -> a real LLM server is required
+  * ``embedding_provider=tei|openai``   -> a real embedder is required
+  * ``retrieval_backend=qdrant``        -> Qdrant is required
+  * ``store_backend=postgres``          -> Postgres (+RLS) is required
   * ``agent_engine=internal``           -> built-in graph engine, no langgraph dep
 
-Flip the corresponding env var + provide creds to use the real production
-backends (SGLang, TEI, Qdrant, Postgres+RLS, Redis, Langfuse, LangGraph).
+Provide each backend's URL + creds via env. There is no zero-infra fallback.
 
 HOW pydantic-settings WORKS: each field below is read from the environment (or a
 ``.env`` file) by its UPPER_CASE name; if absent, the default here is used and is
@@ -70,33 +68,20 @@ class Settings(BaseSettings):
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["*"])
 
     # ---- Auth --------------------------------------------------------------
-    # Identity. ``local`` mints/verifies its own JWTs (great for dev); ``oidc``
-    # defers to a real identity provider and reads org/roles from token claims.
-    # The org claim is critical: it is the verified tenant key that flows into
-    # every request's ToolContext and powers tenant isolation. The dev jwt_secret
-    # is intentionally insecure and MUST be overridden outside dev.
-    auth_provider: Literal["local", "oidc", "apikey"] = "local"
+    # ONE auth model (see security/deps.py): every request must carry (1) a valid
+    # API KEY (``X-API-Key`` header, or ``?api_key=`` for SSE) that gates access at
+    # the gateway, AND (2) a JWT (Bearer / ``?access_token=`` / cookie) whose claims
+    # carry the verified identity — ``org_id`` (the tenant key that powers isolation),
+    # ``sub`` (user id), and ``roles``. The JWT is minted upstream; this service only
+    # VERIFIES it. There is no login/password/OIDC/refresh flow.
+    #
+    # ``api_keys``: the set of accepted gateway keys. ``jwt_secret``: the HS256 key
+    # used to verify (and, via the dev mint helper, sign) JWTs — the dev default is
+    # intentionally insecure and the prod guard rejects it.
+    api_keys: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["dev-api-key-change-me"])
     jwt_secret: str = _DEV_JWT_SECRET  # CHANGE in prod — the prod guard enforces this
     jwt_algorithm: str = "HS256"
     access_token_ttl_seconds: int = 3600
-    refresh_token_ttl_seconds: int = 1209600  # 14 days
-    # OIDC (auth_provider=oidc): where to validate tokens and which claims carry
-    # the tenant id and the caller's roles (the inputs to multi-tenant RBAC).
-    oidc_issuer: str = ""
-    oidc_audience: str = ""
-    oidc_jwks_url: str = ""
-    oidc_org_claim: str = "org_id"
-    oidc_roles_claim: str = "roles"
-    # ---- API-key auth (AUTH_PROVIDER=apikey) — TESTING / trusted-gateway ONLY ----
-    # A request authenticates with one of these keys (``X-API-Key`` header or
-    # ``?api_key=`` for SSE). The org/user/roles are then taken from the request:
-    # the chat BODY, or ``X-Org-Id``/``X-User-Id``/``X-Roles`` headers, or the query
-    # string. WARNING: this TRUSTS the caller for identity — whoever holds a key can
-    # set any org_id, so it RELAXES tenant isolation. Use only behind a trusted
-    # backend or for local testing. The production guard REJECTS apikey; for prod
-    # use local/oidc (or bind each key to a fixed org).
-    api_keys: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["dev-api-key-change-me"])
-    apikey_default_roles: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["analyst"])
 
     # ---- Stores ------------------------------------------------------------
     # Where conversations/sessions persist. ``memory`` is in-process (zero infra);
@@ -104,8 +89,8 @@ class Settings(BaseSettings):
     # is the Postgres session variable set to the org id inside each transaction,
     # so the database itself enforces "an org can only read its own rows" — a
     # second, defense-in-depth layer of tenant isolation under the app checks.
-    store_backend: Literal["memory", "postgres"] = "memory"
-    database_url: str = ""  # postgresql://user:pass@host:5432/db
+    store_backend: Literal["postgres"] = "postgres"
+    database_url: str = ""  # postgresql://user:pass@host:5432/db (REQUIRED — no in-memory fallback)
     rls_setting_name: str = "app.organization_id"
     db_pool_min: int = 1
     db_pool_max: int = 10
@@ -118,14 +103,12 @@ class Settings(BaseSettings):
     semantic_cache_threshold: float = 0.95
 
     # ---- LLM ---------------------------------------------------------------
-    # The model backend. ``deterministic`` is a stub that returns fixed, grounded
-    # output with NO network call — the security-relevant default (no prompt or
-    # retrieved text leaves the box). ``sglang`` is the self-hosted production
-    # path; ``openai`` is a hosted dev convenience and, by design, never for
-    # sensitive prod data. Three model "lanes" (fast/standard/deep) let cheap
-    # steps (routing, tool planning) use a small model and the answer use a bigger
-    # one — see llm/lanes.py.
-    llm_provider: Literal["deterministic", "sglang", "openai"] = "deterministic"
+    # The model backend. ``sglang`` is the self-hosted production path; ``openai``
+    # is a hosted/OpenAI-compatible endpoint. A real LLM server is REQUIRED — there
+    # is no offline stub. Three model "lanes" (fast/standard/deep) let cheap steps
+    # (routing, tool planning) use a small model and the answer use a bigger one —
+    # see llm/lanes.py.
+    llm_provider: Literal["sglang", "openai"] = "sglang"
     # SGLang (OpenAI-compatible) — three lanes
     sglang_base_url: str = "http://localhost:30000/v1"
     sglang_api_key: str = "EMPTY"
@@ -141,22 +124,22 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
 
     # ---- Embeddings --------------------------------------------------------
-    # Vectorizer for RAG. ``deterministic`` hashes text into a vector locally (no
-    # model, no network — keeps the default offline and reproducible); ``tei`` is
-    # the self-hosted embedding server. ``embedding_dim`` MUST match whatever the
-    # vector store was created with.
-    embedding_provider: Literal["deterministic", "tei", "openai"] = "deterministic"
+    # Vectorizer for RAG. ``tei`` is the self-hosted embedding server; ``openai`` is
+    # an OpenAI-compatible embedding endpoint. A real embedder is REQUIRED — there is
+    # no offline stub. ``embedding_dim`` MUST match whatever the vector store was
+    # created with.
+    embedding_provider: Literal["tei", "openai"] = "tei"
     tei_embed_url: str = "http://localhost:8080"
     embedding_dim: int = 1024
     embedding_model: str = "Qwen/Qwen3-Embedding-8B"
 
     # ---- Retrieval ---------------------------------------------------------
-    # The vector store + RAG knobs. ``memory`` is an in-process store (zero infra);
-    # ``qdrant`` is the production vector DB. ``top_k`` = how many candidates to
-    # fetch; reranking (a cross-encoder, optional) reorders them for precision and
+    # The vector store + RAG knobs. ``qdrant`` is the production vector DB and the
+    # only backend — there is no in-process fallback. ``top_k`` = how many candidates
+    # to fetch; reranking (a cross-encoder, optional) reorders them for precision and
     # keeps the best ``rerank_top_k``. ``recency_half_life_days`` lets fresher docs
     # outrank stale ones — important for security intel that ages fast.
-    retrieval_backend: Literal["memory", "qdrant"] = "memory"
+    retrieval_backend: Literal["qdrant"] = "qdrant"
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     retrieval_top_k: int = 20
@@ -237,13 +220,16 @@ class Settings(BaseSettings):
     # the deterministic stub), so the zero-infra path still works. Point the LLM at
     # your Qwen/SGLang and the full agentic loop (plan -> tools -> reflect) lights up.
     router_mode: Literal["heuristic", "llm"] = "llm"
-    # How the supervisor picks which module(s)/app(s) handle a query when not using
-    # the LLM router. "keyword" = token overlap on routing_hints (brittle, doesn't
-    # scale). "semantic" = EMBEDDING similarity between the query and each module's
-    # natural-language profile (description+hints+examples+tools) — scales to many
-    # apps (e.g. Composio) with no hand-written keywords. "hybrid" (default) =
-    # keyword when it matches, semantic when keyword is silent (best of both).
-    routing_strategy: Literal["keyword", "semantic", "hybrid"] = "hybrid"
+    # How the supervisor picks which module(s)/app(s) handle a query when NOT using
+    # the LLM router. Routing is ALWAYS dynamic (by meaning), never by curated
+    # keywords — the brittle keyword/``routing_hints`` path has been removed because
+    # it silently mis-routed any query whose wording differed from the hand-written
+    # phrases. "semantic" (default) = EMBEDDING similarity between the query and each
+    # module's natural-language profile (display_name + description + tool
+    # names/descriptions). The default embedder is deterministic + offline, so this
+    # works with no model; a real embedder sharpens recall. "llm" defers entirely to
+    # the LLM router (router_mode=llm + a real model).
+    routing_strategy: Literal["semantic", "llm"] = "semantic"
     # Orchestration strategy. ``heuristic`` = the v1 supervisor->specialists graph
     # (route -> parallel dispatch -> answer). ``planner`` = the LLM-brain graph
     # (plan -> dispatch-with-dependencies -> synthesize -> bounded replan): it
@@ -253,7 +239,12 @@ class Settings(BaseSettings):
     # so the zero-infra path still works and tests stay green.
     orchestrator_mode: Literal["heuristic", "planner"] = "planner"
     max_plan_steps: int = 6      # hard cap on steps the planner may emit (bounds fan-out + cost)
-    max_replans: int = 1         # how many times reflection may revise after a gap (0 = never)
+    # DEEP REASONING depth: how many times the reflect gate may revise the plan after
+    # finding a gap (LLM mode only; the deterministic path always finishes in one
+    # pass). 2 lets the agent iterate twice — gather, notice what's missing, fetch the
+    # missing data, and (if still short) fetch once more — before answering. Bounds
+    # cost/latency; raise for harder questions, set 0 to disable reflection.
+    max_replans: int = 2
     planner_max_fanout: int = 2  # max modules a single (deterministic) plan spreads across
 
     # ---- Remote MCP servers + tool-context budget --------------------------
@@ -265,6 +256,10 @@ class Settings(BaseSettings):
     easm_mcp_url: str = ""
     brand_mcp_url: str = ""
     aci_mcp_url: str = ""
+    # Utility module backed by the external `mcp-test-kits` MCP server. Empty =>
+    # the testkit module runs its LOCAL stub tools; set to e.g.
+    # http://localhost:3000/mcp to route execution to the real server.
+    testkit_mcp_url: str = ""
     # TTL of the short-lived, org-scoped service token minted to authenticate a
     # remote MCP call (identity travels in this token, never in tool args).
     mcp_service_token_ttl_seconds: int = 120
@@ -308,6 +303,7 @@ class Settings(BaseSettings):
     cap_easm_enabled: bool = True
     cap_brand_enabled: bool = False
     cap_aci_enabled: bool = False
+    cap_testkit_enabled: bool = True
     # Seed each enabled module's demo corpus at boot (dev convenience; off in prod).
     seed_demo_data: bool = True
 
@@ -337,7 +333,7 @@ class Settings(BaseSettings):
             return [item.strip() for item in s.split(",") if item.strip()]
         return v
 
-    @field_validator("api_keys", "apikey_default_roles", "pii_entities", mode="before")
+    @field_validator("api_keys", "pii_entities", mode="before")
     @classmethod
     def _csv_list(cls, v: object) -> object:
         """Same CSV-or-JSON convenience for the other list-valued settings, so an
@@ -353,38 +349,29 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _enforce_prod_no_stub(self) -> Settings:
-        """PRODUCTION GUARD — fail-closed if ENVIRONMENT=prod is running on any stub
-        or insecure setting. This is how "no stub in production" is GUARANTEED: the
-        process refuses to boot and prints exactly what to fix, instead of silently
-        serving a security product on hash-embeddings + in-memory data. Dev/staging
-        are unaffected, so the zero-infra path and tests still work."""
+        """PRODUCTION GUARD — fail-closed if ENVIRONMENT=prod is running on an
+        insecure or incomplete setting. The deterministic/in-memory stubs no longer
+        exist (a real LLM/embedder/Qdrant/Postgres is always required), so this now
+        checks the remaining footguns: a missing DB URL, dev secrets, and demo
+        toggles. The process refuses to boot and prints exactly what to fix."""
         if self.environment != "prod":
             return self
         bad: list[str] = []
-        if self.llm_provider == "deterministic":
-            bad.append("LLM_PROVIDER=deterministic — set sglang (self-hosted Qwen)")
-        if self.embedding_provider == "deterministic":
-            bad.append("EMBEDDING_PROVIDER=deterministic — set tei (Qwen3-Embedding)")
-        if self.retrieval_backend == "memory":
-            bad.append("RETRIEVAL_BACKEND=memory — set qdrant")
-        if self.store_backend == "memory":
-            bad.append("STORE_BACKEND=memory — set postgres (RLS)")
-        if self.store_backend == "postgres" and not self.database_url:
-            bad.append("STORE_BACKEND=postgres but DATABASE_URL is empty")
+        # Postgres is the only store backend — a DB URL is mandatory to run at all.
+        if not self.database_url:
+            bad.append("DATABASE_URL is empty — Postgres is required (no in-memory store)")
         if self.seed_demo_data:
             bad.append("SEED_DEMO_DATA=true — must be false in prod (no demo corpora)")
         if self.debug:
             bad.append("DEBUG=true — must be false in prod")
-        if self.auth_provider == "local":
-            if self.jwt_secret == _DEV_JWT_SECRET:
-                bad.append("JWT_SECRET is the insecure dev default — set a strong secret")
-            elif len(self.jwt_secret) < 32:
-                bad.append("JWT_SECRET shorter than 32 bytes")
-        if self.auth_provider == "apikey":
-            bad.append("AUTH_PROVIDER=apikey is testing-only (it trusts caller identity) "
-                       "— use local or oidc in prod")
-        if self.auth_provider == "oidc" and not (self.oidc_issuer and self.oidc_jwks_url):
-            bad.append("AUTH_PROVIDER=oidc but OIDC_ISSUER/OIDC_JWKS_URL not set")
+        # JWT verifies caller identity — the secret must be strong in prod.
+        if self.jwt_secret == _DEV_JWT_SECRET:
+            bad.append("JWT_SECRET is the insecure dev default — set a strong secret")
+        elif len(self.jwt_secret) < 32:
+            bad.append("JWT_SECRET shorter than 32 bytes")
+        # API keys gate the gateway — the dev default must not ship to prod.
+        if not self.api_keys or "dev-api-key-change-me" in set(self.api_keys):
+            bad.append("API_KEYS is empty or still the dev default — set real gateway key(s)")
         # Tool-backed modules MUST point at a real MCP server in prod, else they
         # would serve their built-in mock data. (Corpus modules like reports are
         # covered by RETRIEVAL_BACKEND=qdrant above.)
@@ -397,7 +384,7 @@ class Settings(BaseSettings):
                 bad.append(f"{var} not set while its module is enabled — would serve mock data")
         if bad:
             raise ValueError(
-                "ENVIRONMENT=prod but stub/insecure configuration detected. Fix:\n  - "
+                "ENVIRONMENT=prod but insecure/incomplete configuration detected. Fix:\n  - "
                 + "\n  - ".join(bad)
             )
         return self

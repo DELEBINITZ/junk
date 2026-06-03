@@ -8,13 +8,18 @@ no core file is touched. The platform discovers and wires this at boot.
 from __future__ import annotations
 
 from app.capabilities.<feature>.tools import TOOLS
-from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
+from app.core.contracts import Autonomy, CapabilityManifest
 # from app.core.rag.pipeline import CollectionRetriever   # if this feature has a corpus
 
 MANIFEST = CapabilityManifest(
     id="<feature>",
     version="0.1.0",
     display_name="<Feature display name>",
+    # ROUTING IS DYNAMIC: the supervisor/planner route to this module by the MEANING
+    # of the question, scored against this `description` + the tools' names and
+    # descriptions (semantic similarity, or an LLM router). Make `description` a crisp
+    # one-liner of what this module answers, and describe each tool well — that text IS
+    # the routing signal. There are no routing keywords to maintain.
     description="<one line: what this feature answers>",
     license_tiers=("platform", "<feature>"),
     enabled_flag="cap_<feature>_enabled",     # add this bool to app/config.py Settings
@@ -23,12 +28,6 @@ MANIFEST = CapabilityManifest(
     tools=TOOLS,
     # retrievers=(CollectionRetriever(id="<feature>_retriever", collection="<feature>_kb"),),
     system_prompt="prompts/v1.md",
-    routing_hints=(
-        RoutingHint(
-            intents=("<intent phrase>", "<another>"),
-            examples=("<example user question>",),
-        ),
-    ),
     default_autonomy=Autonomy.READ,           # READ | SUGGEST | AUTO
     rbac={"<tool_name>": "viewer"},           # min role per tool
     owners=("team-<feature>",),

@@ -10,7 +10,8 @@ The flow (same order both engines run):
   * input_guardrail — screen the user's question (redact secrets, block prompt
     injection / unsafe topics). Can short-circuit the whole turn to END.
   * route           — the SUPERVISOR picks which capability module(s) should
-    answer, using only each module's manifest routing hints.
+    answer, DYNAMICALLY: by the meaning of the question (embedding similarity over
+    each module's description + tools, or an LLM router) — no keyword matching.
   * gather_context  — dispatch ONE specialist per routed module, IN PARALLEL.
     Each specialist is scoped to its OWN module's tools (so tool schemas never
     pile up in one context — this is the key to scaling to hundreds of tools).
@@ -257,10 +258,13 @@ async def triage_node(state: ChatState, ctx: AgentContext) -> dict:
 async def route_node(state: ChatState, ctx: AgentContext) -> dict:
     """NODE 2 — the SUPERVISOR decides which capability module(s) handle this turn.
 
-    This is the "router agent" pattern. It does NOT answer; it only classifies
-    the question to one or more modules (reports / easm / aci / ...) using their
-    manifest routing hints. With one module it behaves like a single agent; with
-    many it can fan out (see dispatch_node). See supervisor.py for the scoring.
+    This is the "router agent" pattern. It does NOT answer; it only classifies the
+    question to one or more modules (reports / easm / aci / ...) DYNAMICALLY — by
+    meaning, using embedding similarity over each module's description + tool
+    descriptions, or an LLM router. No curated keywords, so a query routes correctly
+    even when its wording differs from anything pre-listed. With one module it behaves
+    like a single agent; with many it fans out adaptively (see dispatch_node and
+    supervisor.py for the scoring + threshold).
     """
     rr = await ctx.supervisor.route(state.get("safe_question", ""), ctx.sc)
     await ctx.fire("route", modules=rr.modules, mode=rr.mode, fallback=rr.fallback)
@@ -523,8 +527,17 @@ async def plan_dispatch_node(state: ChatState, ctx: AgentContext) -> dict:
         if not ready:                     # unsatisfiable deps -> run the rest anyway (degrade, never hang)
             ready = remaining
         wave = await asyncio.gather(*[run_step(s) for s in ready], return_exceptions=True)
-        for item in wave:
+        # Pair each result with the step that produced it (gather preserves order),
+        # so a step that RAISED is still marked done + recorded — otherwise it would
+        # stay in ``remaining`` and be retried every wave until the guard trips, and
+        # its failure would never reach plan_results/events.
+        for ready_step, item in zip(ready, wave, strict=False):
             if isinstance(item, Exception):
+                done.add(ready_step["id"])
+                plan_results.append({"id": ready_step["id"], "domain": ready_step["domain"],
+                                     "subq": ready_step["subq"], "ok": False, "found": 0})
+                events.append({"step": ready_step["id"], "domain": ready_step["domain"],
+                               "ok": False, "error": str(item)})
                 continue
             s, res = item
             done.add(s["id"])
@@ -571,13 +584,20 @@ async def reflect_gate_node(state: ChatState, ctx: AgentContext) -> dict:
     answer = state.get("answer", "")
     subqs = "; ".join(r.get("subq", "") for r in results) or question
 
-    # A cheap completeness critic on the FAST lane. Reflection must never break a
-    # turn, so any failure just finishes with the answer we have.
+    # A cheap completeness+groundedness critic on the FAST lane (deep-reasoning gate).
+    # It pushes the loop to fetch BETTER data, not just fill blanks: it flags a gap
+    # when the answer misses part of the question OR a sub-question, AND when a key
+    # claim is unsupported/vague and a more specific, grounded answer is reachable by
+    # querying more. The replan note becomes the next round's targeted sub-question.
+    # Reflection must never break a turn, so any failure just finishes with what we have.
     critic = [
         ChatMessage(role="system", content=(
-            "You are a strict completeness critic. Decide if the ANSWER fully addresses the "
-            "QUESTION and every SUB-QUESTION. If complete, reply exactly 'COMPLETE'. Otherwise "
-            "reply 'GAP: <what specifically is missing or unanswered>'.")),
+            "You are a strict completeness and groundedness critic for a security-intelligence "
+            "agent. Judge whether the ANSWER (a) fully addresses the QUESTION and every "
+            "SUB-QUESTION, and (b) is specific and grounded in retrieved evidence rather than "
+            "vague or asserted. If it is complete AND grounded, reply exactly 'COMPLETE'. "
+            "Otherwise reply 'GAP: <the single most valuable thing to retrieve or resolve next, "
+            "phrased as a concrete follow-up query>'.")),
         ChatMessage(role="user", content=f"QUESTION: {question}\nSUB-QUESTIONS: {subqs}\nANSWER: {answer}"),
     ]
     try:

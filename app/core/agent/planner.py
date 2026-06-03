@@ -2,11 +2,11 @@
 
 WHERE THIS SITS: in planner mode the agent graph is
     input_guard -> PLAN -> dispatch -> replan_gate -> synthesize -> output_guard
-and THIS file owns the PLAN step. Instead of the heuristic supervisor picking a
-couple of modules by keyword overlap, the planner reads compact CAPABILITY CARDS
-(one per module the caller may see) and decides a PLAN: a list of steps, each
-naming a target domain + a self-contained sub-question, with optional
-``depends_on`` links when one step needs an earlier step's findings first.
+and THIS file owns the PLAN step. The planner reads compact CAPABILITY CARDS (one
+per module the caller may see — description + tools) and decides a PLAN by MEANING:
+a list of steps, each naming a target domain + a self-contained sub-question, with
+optional ``depends_on`` links when one step needs an earlier step's findings first.
+Domains are chosen from the cards' meaning, never from curated keywords.
 
 WHY CARDS, NOT RAW TOOLS: the planner must stay cheap and un-bloated even with
 hundreds of tools across many modules. So the brain sees a one-line card per
@@ -86,12 +86,11 @@ class Planner:
         """Build the compact capability cards the planner reasons over — one line
         per module the caller is entitled to see (capability_view already applies
         license + RBAC filtering, so the planner can never plan against a hidden
-        module). Each card: id | what it's good for (routing-hint intents) | tools."""
+        module). Each card is description-led: id | what it answers (description) |
+        tools. The planner picks domains by MEANING from this text — no curated
+        routing keywords are involved (same dynamic-routing principle as the
+        supervisor)."""
         view = self.registry.capability_view(sc)
-        # Group routing-hint intents by module for the "good for" blurb.
-        intents_by_mod: dict[str, list[str]] = {}
-        for mid, hint in view.routing:
-            intents_by_mod.setdefault(mid, []).extend(hint.intents)
         lines: list[str] = []
         for mid in dict.fromkeys(view.module_ids):
             m = self.registry.module(mid)
@@ -103,9 +102,8 @@ class Planner:
             tools = [t.name for t in m.tools.values()]
             cap = 8
             shown = ", ".join(tools[:cap]) + (f", …(+{len(tools) - cap} more)" if len(tools) > cap else "")
-            good = ", ".join(dict.fromkeys(intents_by_mod.get(mid, []))) or m.manifest.description
             lines.append(
-                f"- {mid}: {m.manifest.description} | good for: {good} | tools: {shown or 'RAG search'}"
+                f"- {mid}: {m.manifest.description} | tools: {shown or 'RAG search'}"
             )
         return "\n".join(lines)
 
@@ -150,11 +148,16 @@ class Planner:
         cards = self._cards(sc)
         sys = (
             "You are the planning brain of a multi-tenant security-intelligence assistant. "
-            "Decompose the user's question into the MINIMAL plan over the capability domains below. "
-            "Use a single step when one domain suffices; use multiple steps only for genuinely "
-            "cross-domain questions. When a step needs another step's findings first, put that step's "
-            "id in depends_on (a step may ONLY depend on steps listed before it). Each subq must be "
-            "self-contained — resolve pronouns/follow-ups using the conversation context if given.\n\n"
+            "Think step by step about what EVIDENCE is needed to answer well, then decompose the "
+            "question into the SMALLEST plan that gathers it over the capability domains below.\n"
+            "Principles:\n"
+            "- Pick domains by MEANING, from each domain's description + tools — not by shared words.\n"
+            "- Use ONE step when a single domain suffices; add steps only for genuinely cross-domain "
+            "questions or when answering well requires finding X first, THEN using X.\n"
+            "- For a dependent step, set depends_on to the earlier step's id (a step may ONLY depend "
+            "on steps listed before it) — that earlier step's findings are fed into this sub-question.\n"
+            "- Make each subq SPECIFIC and self-contained (resolve pronouns/follow-ups from the "
+            "conversation context if given) so the specialist retrieves precise, grounded evidence.\n\n"
             f"Domains:\n{cards}\n\n"
             'Reply with ONLY JSON of the form: '
             '{"steps":[{"id":"s1","domain":"<domain-id>","subq":"...","depends_on":[]}],"synthesis":"..."}'

@@ -1,4 +1,4 @@
-"""Local JWT mint/verify (HS256). OIDC verification lives in ``oidc.py``.
+"""JWT verify/mint (HS256) + the org-scoped MCP service token.
 
 ================================ WHAT IS A JWT ============================
 A JWT (JSON Web Token) is a small, SIGNED bundle of "claims" (facts) — here:
@@ -7,21 +7,14 @@ who you are (``sub``), your tenant (``org_id``), your ``roles``, when it expires
 key, so the server can later VERIFY the token wasn't forged or tampered with: if
 even one byte changed, the signature no longer matches and we reject it.
 
-This file is the "local" identity provider — the zero-infrastructure default
-used in dev / on-prem when no external IdP is wired. It does two jobs:
-  * MINT tokens at login (``create_access_token`` / ``create_refresh_token``).
-  * VERIFY a token on every request (``decode_token``).
-
-Two token TYPES, a standard pattern:
-  * ACCESS token  — short-lived, sent on every API call to prove identity.
-  * REFRESH token — longer-lived, used ONLY to mint a fresh access token so the
-    user doesn't have to log in again. Keeping access tokens short-lived limits
-    the damage window if one leaks; the refresh token is presented far less often.
+The auth model: a JWT carries the caller's identity on every request and this
+service VERIFIES it (``decode_token``); the token itself is minted UPSTREAM (a
+gateway / IdP). ``create_access_token`` is kept as a convenience for dev/tests to
+mint a valid ACCESS token locally — the only token type used for auth.
 
 HS256 = a SYMMETRIC signature: the same ``jwt_secret`` both signs and verifies.
-That is fine when one app owns identity. When an EXTERNAL IdP owns it, you switch
-to OIDC (oidc.py), which uses ASYMMETRIC keys (the IdP signs with a private key,
-we verify with its public key) so we never hold the signing secret.
+This file ALSO mints the short-lived, org-scoped SERVICE token used for remote MCP
+calls (``create_service_token``) — see core/mcp for how identity crosses that wire.
 ===========================================================================
 """
 
@@ -79,19 +72,6 @@ def create_access_token(
     return IssuedToken(_encode(settings, claims), jti, exp)
 
 
-def create_refresh_token(settings: Settings, *, sub: str, org_id: str) -> IssuedToken:
-    """Mint a longer-lived REFRESH token. Deliberately CARRIES NO ROLES: its only
-    job is to obtain a new access token, at which point fresh roles are looked up
-    again — so a role change isn't "frozen" into a long-lived credential."""
-    jti = uuid.uuid4().hex
-    exp = _now() + settings.refresh_token_ttl_seconds  # longer TTL than the access token
-    claims = {
-        "sub": sub, "org_id": org_id, "type": "refresh",
-        "jti": jti, "iat": _now(), "exp": exp,
-    }
-    return IssuedToken(_encode(settings, claims), jti, exp)
-
-
 def create_service_token(
     settings: Settings, *, sub: str, org_id: str, roles: tuple[str, ...],
     audience: str, ttl_seconds: int,
@@ -116,30 +96,47 @@ def create_service_token(
     return _encode(settings, claims)
 
 
-def decode_token(settings: Settings, token: str, *, expected_type: str | None = None) -> dict[str, Any]:
+def decode_token(
+    settings: Settings, token: str, *,
+    expected_type: str | None = None, expected_audience: str | None = None,
+) -> dict[str, Any]:
     """VERIFY a token and return its claims, or raise AuthError. This is the gate
     every local-auth request passes through.
 
     ``jwt.decode`` does the cryptographic heavy lifting: it checks the signature
     (forgery/tamper) AND the ``exp`` expiry, raising if either fails. We then add
-    two application-level checks on top:
+    application-level checks on top:
       * the token is of the EXPECTED type (don't accept a refresh token as access);
+      * (for service tokens) the ``aud`` matches the server's EXPECTED AUDIENCE, so
+        a token minted for one MCP server cannot be replayed against another — PyJWT
+        does NOT enforce ``aud`` unless asked, so we verify it explicitly here;
       * it actually carries the tenant + subject we require (``org_id`` / ``sub``).
-    Every failure is normalized to AuthError so callers handle auth uniformly.
+    Every failure is normalized to AuthError so callers handle auth uniformly, and
+    the message stays generic so we never echo token internals back to a caller.
     """
     try:
-        claims = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        # verify_aud=False: PyJWT would otherwise REJECT any token that carries an
+        # ``aud`` claim (every service token does) whenever no audience is passed —
+        # so we disable its automatic audience check and enforce ``aud`` ourselves
+        # below via ``expected_audience`` (None => skip, matching the main API path).
+        claims = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm],
+                            options={"verify_aud": False})
     except jwt.ExpiredSignatureError as exc:        # signature was valid but the token aged out
         raise AuthError("token expired") from exc
     except jwt.PyJWTError as exc:                    # bad signature / malformed / etc.
-        raise AuthError(f"invalid token: {exc}") from exc
+        # Keep the message generic (don't leak which check failed); the original
+        # exception is still chained via ``from exc`` for server-side debugging.
+        raise AuthError("invalid token") from exc
     if expected_type and claims.get("type") != expected_type:
         raise AuthError(f"expected {expected_type} token")
+    if expected_audience is not None and claims.get("aud") != expected_audience:
+        # Audience mismatch => this token was minted for a DIFFERENT server. Refuse,
+        # so a valid service token for module A can't be replayed against module B.
+        raise AuthError("token audience mismatch")
     if not claims.get("org_id") or not claims.get("sub"):
         # No tenant/subject => we cannot establish a trustworthy identity. Refuse.
         raise AuthError("token missing org_id/sub")
     return claims
 
 
-__all__ = ["IssuedToken", "create_access_token", "create_refresh_token",
-           "create_service_token", "decode_token"]
+__all__ = ["IssuedToken", "create_access_token", "create_service_token", "decode_token"]

@@ -21,21 +21,10 @@ care which is wired.
 
 from __future__ import annotations
 
-import hashlib
-import re
 from collections.abc import Sequence
 from typing import Protocol
 
-import numpy as np
-
 from app.config import Settings
-
-_WORD = re.compile(r"[a-z0-9]+")
-
-
-def _tokens(text: str) -> list[str]:
-    # Lowercase word tokenizer — the unit the deterministic embedder hashes.
-    return _WORD.findall(text.lower())
 
 
 class Embedder(Protocol):
@@ -48,52 +37,6 @@ class Embedder(Protocol):
     async def embed_query(self, text: str) -> list[float]: ...                 # single: the question at query time
 
     async def aclose(self) -> None: ...                                        # release any HTTP client
-
-
-class DeterministicEmbedder:
-    """Infra-free embedder: a hashed bag-of-words ("feature hashing"). No model,
-    no GPU, no network — yet it produces stable vectors where lexically similar
-    texts score high cosine similarity. Perfect for dev/tests; swap to ``tei`` or
-    ``openai`` for real semantic quality."""
-
-    provider = "deterministic"
-
-    def __init__(self, dim: int = 1024) -> None:
-        self.dim = dim
-
-    def _vec(self, text: str) -> np.ndarray:
-        # Build the vector by HASHING each token to a dimension and bumping that
-        # slot — the "hashing trick" that maps an unbounded vocabulary into a
-        # fixed ``dim`` without storing a vocabulary table.
-        v = np.zeros(self.dim, dtype=np.float32)
-        toks = _tokens(text)
-        for tok in toks:
-            # blake2b is a STABLE hash (unlike Python's per-process-salted hash()),
-            # so the same word maps to the same dimension on every run/host — the
-            # property that makes cosine similarity reproducible.
-            h = int.from_bytes(hashlib.blake2b(tok.encode(), digest_size=8).digest(), "big")
-            v[h % self.dim] += 1.0
-        # add bigrams for a little word-order signal — pure bag-of-words ignores
-        # order entirely; hashing adjacent pairs recovers a hint of it.
-        for a, b in zip(toks, toks[1:], strict=False):
-            h = int.from_bytes(hashlib.blake2b(f"{a}_{b}".encode(), digest_size=8).digest(), "big")
-            v[h % self.dim] += 0.5
-        # L2-normalize so dot product == cosine similarity downstream (and so long
-        # documents don't get artificially large vectors just for being long).
-        n = float(np.linalg.norm(v))
-        return v / n if n > 0 else v
-
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        # Embed a batch of documents (index time).
-        return [self._vec(t).tolist() for t in texts]
-
-    async def embed_query(self, text: str) -> list[float]:
-        # Embed one query (search time). Same function as documents — query and
-        # corpus MUST be embedded the same way to live in the same vector space.
-        return self._vec(text).tolist()
-
-    async def aclose(self) -> None:
-        return None     # nothing to release — no network client
 
 
 class TEIEmbedder:
@@ -194,8 +137,6 @@ def build_embedder(settings: Settings) -> Embedder:
     # one model trained so you can truncate the vector to a shorter ``dim`` and
     # still get usable similarity, trading a little accuracy for speed/storage).
     p = settings.embedding_provider
-    if p == "deterministic":
-        return DeterministicEmbedder(dim=settings.embedding_dim)
     if p == "tei":
         return TEIEmbedder(settings.tei_embed_url, dim=settings.embedding_dim)
     if p == "openai":
@@ -210,7 +151,6 @@ def build_embedder(settings: Settings) -> Embedder:
 
 __all__ = [
     "Embedder",
-    "DeterministicEmbedder",
     "TEIEmbedder",
     "OpenAIEmbedder",
     "build_embedder",

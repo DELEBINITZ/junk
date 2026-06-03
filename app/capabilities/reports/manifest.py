@@ -24,7 +24,7 @@ adds routing targets without touching core or this file.
 from __future__ import annotations
 
 from app.capabilities.reports.tools import TOOLS
-from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
+from app.core.contracts import Autonomy, CapabilityManifest
 from app.core.rag.pipeline import CollectionRetriever
 
 # The name of this module's vector-store collection. Everything reports indexes or
@@ -53,8 +53,13 @@ MANIFEST = CapabilityManifest(
     version="1.0.0",
     display_name="Security Reports",
     description=(
-        "Q&A over analyst- and AI-generated security reports — EASM scan results, "
-        "brand-protection findings, threat-intel write-ups, and executive briefings."
+        "Q&A over the organization's analyst- and AI-generated security REPORTS, "
+        "scans and findings — what a report or scan FOUND or SAID. Covers: EASM scan "
+        "results and exposed internet-facing assets/open ports; critical CVEs and "
+        "vulnerabilities (e.g. on a Confluence server); leaked employee credentials "
+        "and dark-web exposure; phishing and lookalike-domain findings; threat-intel "
+        "write-ups; top risks for the quarter; remediation guidance; and executive "
+        "briefings."
     ),
     # Licensing tiers this module belongs to (commercial packaging metadata).
     license_tiers=("platform", "reports"),
@@ -73,25 +78,11 @@ MANIFEST = CapabilityManifest(
     # (resolves to app/capabilities/reports/prompts/v1.md). When this module is
     # routed, answer_node prepends that text to the base persona for domain flavour.
     system_prompt="prompts/v1.md",
-    # SUPERVISOR ROUTING: the only signals the supervisor scores a question against
-    # to decide whether this module should handle it. ``intents`` are short phrases
-    # the module covers; ``examples`` are representative questions. No routing logic
-    # is ever hardcoded in core — it is entirely derived from these hints.
-    routing_hints=(
-        RoutingHint(
-            intents=(
-                "report", "finding", "summary", "analyst", "briefing", "scan result",
-                "executive summary", "remediation", "vulnerability", "what does the report say",
-                "top risks", "credential leak", "phishing", "threat intel",
-            ),
-            examples=(
-                "summarize the latest report",
-                "what did the EASM scan find on our confluence server?",
-                "what are our top risks this quarter?",
-                "were any of our credentials leaked?",
-            ),
-        ),
-    ),
+    # SUPERVISOR ROUTING is DYNAMIC: the supervisor/planner route to this module by
+    # the MEANING of the question, scored against this manifest's ``description`` +
+    # the tools' names/descriptions (semantic similarity, or an LLM router). Keep the
+    # ``description`` above crisp and the tools well-described — that text IS the
+    # routing signal. No keywords are maintained here.
     # AUTONOMY: this module only READS (answers/recommends), it never acts. Compare
     # with easm, which is SUGGEST because it ships a gated side-effecting tool.
     default_autonomy=Autonomy.READ,

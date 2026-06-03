@@ -13,9 +13,8 @@ directly. The router does two small jobs:
      could choose for them.)
 
 ``build_llm(settings)`` is the factory: read config, construct the matching
-client (the deterministic stub, or an OpenAI-compatible HTTP client pointed at
-SGLang or OpenAI), and wrap it in a LaneRouter. This is the single seam where a
-deployment swaps its LLM backend.
+client (an OpenAI-compatible HTTP client pointed at SGLang or OpenAI), and wrap it
+in a LaneRouter. This is the single seam where a deployment swaps its LLM backend.
 """
 
 from __future__ import annotations
@@ -87,20 +86,12 @@ class LaneRouter:
 def build_llm(settings: Settings) -> LaneRouter:
     """Construct the configured LLM client and wrap it in a LaneRouter.
 
-    The ``llm_provider`` setting selects ONE of three backends. Note that the
-    imports are deferred inside each branch: the chosen provider's dependencies
-    (e.g. httpx for the HTTP client) are only imported if actually used, so the
-    default deterministic path needs nothing extra installed.
+    The ``llm_provider`` setting selects one of two real backends. The HTTP client
+    import is deferred so it's only loaded when build_llm actually runs.
     """
     provider = settings.llm_provider
-    if provider == "deterministic":
-        # Default: the zero-infra stub. No model, no network, reproducible.
-        from app.core.llm.deterministic import DeterministicLLM
-
-        return LaneRouter(DeterministicLLM(settings))
-
-    # Both remaining providers speak the SAME OpenAI-compatible HTTP API, so they
-    # share one client class and differ only in URL/keys and the lane->model map.
+    # Both providers speak the SAME OpenAI-compatible HTTP API, so they share one
+    # client class and differ only in URL/keys and the lane->model map.
     from app.core.llm.openai_compat import OpenAICompatClient
 
     if provider == "sglang":

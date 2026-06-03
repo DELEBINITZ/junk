@@ -112,6 +112,10 @@ def make_initial_state(
         history=history or [], summary=summary, blocked=False,
         route_modules=[], context_chunks=[], context_block="", tool_events=[],
         answer="", citations=[], output_flags={},
+        # Deep-reasoning (planner) loop state — initialized so the reflect gate's
+        # bound is correct from the FIRST pass and a turn never inherits stale
+        # replan counters/notes. The reflect gate increments replan_count each loop.
+        replan_count=0, replan_notes="",
     )
 
 

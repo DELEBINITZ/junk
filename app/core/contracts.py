@@ -447,18 +447,8 @@ class ActionHandler(Protocol):
 
 
 # --------------------------------------------------------------------------- #
-# Routing & manifest (declarative wiring)
+# Manifest (declarative wiring)
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class RoutingHint:
-    """The signals the supervisor routes on. ``intents`` are short phrases the
-    module handles ("threat actor", "attack surface"); ``examples`` are sample
-    questions. The supervisor scores a question against these — no routing logic
-    is ever hardcoded in core (see supervisor.py)."""
-    intents: tuple[str, ...]
-    examples: tuple[str, ...] = ()
-
-
 @dataclass(frozen=True)
 class CapabilityManifest:
     """The CARTRIDGE: everything the platform needs to wire one feature. Read once
@@ -467,9 +457,16 @@ class CapabilityManifest:
     module = writing one of these + its tools. That's the extension story.
 
     Every field maps to a core subsystem:
-      tools/retrievers/specialist -> the agent & RAG          routing_hints -> supervisor
-      rbac/default_autonomy       -> the MCP boundary & gate  ontology      -> the KG
-      ingestion/action_handlers   -> ingestion & action gate  enabled_flag  -> deployment
+      tools/retrievers/specialist -> the agent & RAG          description+tools -> supervisor
+      rbac/default_autonomy       -> the MCP boundary & gate  ontology          -> the KG
+      ingestion/action_handlers   -> ingestion & action gate  enabled_flag      -> deployment
+
+    ROUTING is DYNAMIC: the supervisor/planner decide which module(s) answer a
+    question by MEANING — embedding similarity over each module's ``display_name``
+    + ``description`` + tool names/descriptions (deterministic, offline) or an LLM
+    router. There are no hand-maintained routing keywords: a vague query whose
+    intent matches a module is still routed correctly. So a module is routable the
+    moment it has a clear ``description`` and well-described tools.
     """
 
     id: str
@@ -484,7 +481,6 @@ class CapabilityManifest:
     retrievers: tuple[Retriever, ...] = ()
     specialist: SpecialistFactory | None = None  # None => use the generic specialist
     system_prompt: str = ""         # path (relative to the module dir) to a prompt file
-    routing_hints: tuple[RoutingHint, ...] = ()
     default_autonomy: Autonomy = Autonomy.READ
     rbac: Mapping[str, str] = field(default_factory=dict)  # tool_name -> min role override
     ontology: OntologyContribution | None = None
@@ -546,7 +542,6 @@ __all__ = [
     "ActionPreview",
     "ActionResult",
     "ActionHandler",
-    "RoutingHint",
     "CapabilityManifest",
     "CoreDeps",
 ]

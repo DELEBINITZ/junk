@@ -10,13 +10,12 @@ from app.core.rag.pipeline import (
     build_vector_store,
 )
 from app.core.rag.reranker import Reranker, build_reranker
-from app.core.rag.vector_store import InMemoryVectorStore, SearchFilters, VectorRecord, VectorStore
+from app.core.rag.vector_store import SearchFilters, VectorRecord, VectorStore
 
 __all__ = [
     "Embedder",
     "build_embedder",
     "VectorStore",
-    "InMemoryVectorStore",
     "VectorRecord",
     "SearchFilters",
     "Reranker",

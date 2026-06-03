@@ -62,11 +62,6 @@ async def lifespan(app: FastAPI):
     # handlers) can reach them without rebuilding anything per request.
     app.state.services = services
     app.state.settings = settings
-    app.state.revocation_store = services.revocation_store
-    if settings.auth_provider == "oidc":
-        from app.core.security.oidc import get_oidc_verifier
-
-        app.state.oidc_verifier = get_oidc_verifier(settings)
 
     await seed_demo(services)   # dev-only corpus seeding (no-op in prod, gated by config)
     log.info("startup.complete", extra={"event": "startup"})

@@ -12,8 +12,8 @@ hard line: identity is established ONCE, by VERIFYING the caller's token, and is
 captured in this immutable object. Everything downstream reads org/roles from
 HERE and nowhere else.
 
-A :class:`SecurityContext` is built once, from a *verified* token (local JWT or
-OIDC — see jwt.py / oidc.py), and threaded everywhere. Tools receive a derived
+A :class:`SecurityContext` is built once, from a *verified* JWT (its signature +
+expiry checked — see jwt.py / deps.py), and threaded everywhere. Tools receive a derived
 ``ToolContext`` whose ``org_id`` comes from here — never from tool arguments —
 so a prompt can never talk the agent into crossing tenants. ("Verified token" =
 its signature/expiry/issuer were checked; an attacker can't forge or alter it.)

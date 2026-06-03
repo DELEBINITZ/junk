@@ -36,7 +36,6 @@ from app.core.api.schemas import (
 )
 from app.core.errors import NotFound
 from app.core.security.context import SecurityContext
-from app.core.security.deps import resolve_identity
 from app.core.streaming import sse_from_events
 
 router = APIRouter(prefix="/v1", tags=["chat"])
@@ -57,16 +56,16 @@ def _message_info(m) -> MessageInfo:
 
 # ---- chat ----
 @router.post("/chat", response_model=ChatResponse)
-async def chat(body: ChatRequest, request: Request) -> ChatResponse:
+async def chat(body: ChatRequest, request: Request,
+               sc: SecurityContext = Depends(require_user)) -> ChatResponse:
     """Run ONE non-streaming chat turn and return the complete answer.
 
-    Identity is resolved via ``resolve_identity``: from the verified token
-    (local/oidc), or — in apikey mode — from the API key + the body's org_id/
-    user_id/roles. Then the whole turn goes to the orchestrator (the agent graph:
-    guard -> triage -> route -> gather -> answer -> guard) scoped to that caller.
-    The response carries everything the UI needs: answer, citations, the session +
-    message it persisted to, the routed modules, guardrail flags, and a trace id."""
-    sc = resolve_identity(request, org_id=body.org_id, user_id=body.user_id, roles=body.roles)
+    Identity comes from ``require_user`` — the verified JWT (gated by the API key),
+    exactly like every other endpoint; nothing is read from the request body. The
+    whole turn then goes to the orchestrator (the agent graph: guard -> triage ->
+    route -> gather -> answer -> guard) scoped to that caller. The response carries
+    everything the UI needs: answer, citations, the session + message it persisted
+    to, the routed modules, guardrail flags, and a trace id."""
     services = get_services(request)
     with services.metrics.timer("chat_turn_ms"):
         r = await services.orchestrator.run_turn(sc, question=body.message, session_id=body.session_id)

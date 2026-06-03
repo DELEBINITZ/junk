@@ -16,7 +16,7 @@ Read this file alongside reports/manifest.py — same fields, different choices
 from __future__ import annotations
 
 from app.capabilities.easm.tools import TOOLS
-from app.core.contracts import Autonomy, CapabilityManifest, RoutingHint
+from app.core.contracts import Autonomy, CapabilityManifest
 
 MANIFEST = CapabilityManifest(
     # Stable id + display metadata (see reports/manifest.py for the field-by-field
@@ -35,24 +35,10 @@ MANIFEST = CapabilityManifest(
     # tool-backed, so its specialist gathers evidence purely by calling these tools.
     tools=TOOLS,
     system_prompt="prompts/v1.md",
-    # SUPERVISOR routing signals — attack-surface vocabulary. The supervisor scores a
-    # question against these to decide EASM should answer; nothing is hardcoded in core.
-    routing_hints=(
-        RoutingHint(
-            intents=(
-                "attack surface", "exposed asset", "exposure", "open port", "asset inventory",
-                "asset count", "how many assets", "live assets", "external scan", "what's exposed",
-                "subdomain", "shadow IT", "internet-facing", "rescan", "surface change",
-            ),
-            examples=(
-                "what assets do we have exposed to the internet?",
-                "how many assets are live?",
-                "show me our current exposures",
-                "what changed on our attack surface this week?",
-                "rescan admin.acme.test",
-            ),
-        ),
-    ),
+    # SUPERVISOR routing is DYNAMIC: EASM is chosen by the MEANING of the question,
+    # scored against the ``description`` above + the tools' names/descriptions
+    # (semantic similarity, or an LLM router). The attack-surface vocabulary lives in
+    # those descriptions, not in curated keywords here.
     # AUTONOMY SUGGEST (not READ): this module can DRAFT an action for a human to
     # approve — because of the side-effecting ``trigger_rescan`` tool. The drafting
     # still goes through the gate; SUGGEST never means "act on its own".

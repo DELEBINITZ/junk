@@ -22,47 +22,22 @@ from pydantic import BaseModel, Field
 
 
 # ---- auth ----
-class LoginRequest(BaseModel):
-    # Local-login credentials; verified against the user store in auth_router.
-    email: str
-    password: str
-
-
 class UserInfo(BaseModel):
-    # The non-secret identity returned to the client (also embedded in TokenResponse).
+    # The non-secret identity echoed by /v1/auth/me, derived from the verified JWT.
     id: str
     email: str
     org_id: str
     roles: list[str]
 
 
-class TokenResponse(BaseModel):
-    # What /login and /refresh hand back: the short-lived access token, the
-    # longer-lived refresh token, and the caller's identity. ``expires_in`` lets
-    # the client know when to refresh.
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-    expires_in: int
-    user: UserInfo
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
 # ---- chat ----
 class ChatRequest(BaseModel):
     # One user turn. ``min_length=1`` rejects empty messages at the edge (422).
     # ``session_id`` is optional: omit it to start a brand-new conversation.
+    # Note: NO identity fields — the tenant/user/roles always come from the verified
+    # JWT (SecurityContext), never from the request body.
     message: str = Field(min_length=1)
     session_id: str | None = None
-    # Caller identity — used ONLY in AUTH_PROVIDER=apikey mode (a trusted gateway
-    # passes the end-user context in the body). In token/oidc mode these are
-    # ignored and identity comes from the verified token.
-    org_id: str | None = None
-    user_id: str | None = None
-    roles: list[str] | None = None
 
 
 class ChatResponse(BaseModel):

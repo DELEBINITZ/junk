@@ -1,4 +1,4 @@
-"""Vector store contract + in-memory backend.
+"""Vector store contract (the Qdrant backend implements it).
 
 WHAT A VECTOR STORE IS: the database that holds every chunk's embedding vector and
 answers "given this query vector, return the most similar chunks". It's the
@@ -13,7 +13,7 @@ REQUIRES an ``org_id`` and only ever returns points tagged with that org. Crucia
 carried in ToolContext) — NEVER from the user's query text or any tool argument, so
 a user cannot ask their way into another org's data. This is the single most
 important isolation boundary for RAG (blueprint §11). The Qdrant backend enforces
-the identical rule with a mandatory ``must`` filter at the database itself.
+the rule with a mandatory ``must`` filter at the database itself.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Protocol
 
-import numpy as np
 from pydantic import BaseModel, Field
 
 from app.core.contracts import Chunk
@@ -55,9 +54,9 @@ class SearchFilters(BaseModel):
 
 
 class VectorStore(Protocol):
-    # The backend-agnostic interface (Protocol = duck-typed). InMemoryVectorStore
-    # below and QdrantVectorStore both implement it, so the pipeline is indifferent
-    # to which is wired. Note ``org_id`` is a REQUIRED keyword on the read methods.
+    # The backend-agnostic interface (Protocol = duck-typed). QdrantVectorStore
+    # implements it, so the pipeline is indifferent to the concrete backend. Note
+    # ``org_id`` is a REQUIRED keyword on the read methods.
     async def ensure_collection(self, collection: str, dim: int) -> None: ...
 
     async def upsert(self, collection: str, records: Sequence[VectorRecord]) -> int: ...
@@ -79,119 +78,4 @@ class VectorStore(Protocol):
     async def aclose(self) -> None: ...
 
 
-def _passes_filters(rec: VectorRecord, f: SearchFilters | None) -> bool:
-    # Apply the OPTIONAL SearchFilters to one record (the in-memory equivalent of
-    # Qdrant's payload filter). Note this does NOT check org_id — that hard tenant
-    # check happens separately in search(), so it can never be accidentally skipped
-    # by an empty filter object.
-    if f is None:
-        return True
-    if f.source and rec.source != f.source:
-        return False
-    if f.doc_ids and rec.doc_id not in f.doc_ids:
-        return False
-    # Lexicographic string compare works as a date compare because the timestamps
-    # are zero-padded ISO-8601 (the recency window from filters.py).
-    if f.date_from and (rec.published_at or "") < f.date_from:
-        return False
-    if f.date_to and rec.published_at and rec.published_at > f.date_to:
-        return False
-    for k, v in (f.extra or {}).items():
-        if rec.metadata.get(k) != v:
-            return False
-    return True
-
-
-class InMemoryVectorStore:
-    """Brute-force cosine search. Fine for dev/tests and small corpora.
-
-    No real index — it scores the query against EVERY record in the collection.
-    Simple and dependency-free; swap to the Qdrant backend for production scale."""
-
-    backend = "memory"
-
-    def __init__(self) -> None:
-        # collection name -> {record id -> record}. A nested dict IS the "database".
-        self._cols: dict[str, dict[str, VectorRecord]] = {}
-        self._mat: dict[str, np.ndarray | None] = {}  # cache (invalidated on write)
-
-    async def ensure_collection(self, collection: str, dim: int) -> None:
-        # Create the collection if absent. ``dim`` is ignored here (no fixed-width
-        # index to allocate); the Qdrant backend does use it.
-        self._cols.setdefault(collection, {})
-
-    async def upsert(self, collection: str, records: Sequence[VectorRecord]) -> int:
-        col = self._cols.setdefault(collection, {})
-        for r in records:
-            # Refuse to store an untagged record — a chunk with no org_id could be
-            # returned to ANY tenant, so this guard protects isolation at write time.
-            if not r.org_id:
-                raise ValueError("VectorRecord.org_id is required (tenant isolation)")
-            col[r.id] = r        # upsert: same id overwrites
-        self._mat[collection] = None   # invalidate any cached matrix
-        return len(records)
-
-    async def search(
-        self,
-        collection: str,
-        query_vector: Sequence[float],
-        *,
-        org_id: str,
-        top_k: int,
-        filters: SearchFilters | None = None,
-    ) -> list[Chunk]:
-        # Fail closed: a search without a tenant scope is a bug, never a "return
-        # everything". This mirrors the mandatory org_id filter the Qdrant backend
-        # applies at the database.
-        if not org_id:
-            raise ValueError("search requires org_id (tenant isolation)")
-        col = self._cols.get(collection, {})
-        q = np.asarray(query_vector, dtype=np.float32)
-        qn = float(np.linalg.norm(q)) or 1.0     # query norm (||q||) for cosine
-        scored: list[tuple[float, VectorRecord]] = []
-        for rec in col.values():
-            if rec.org_id != org_id:  # hard tenant boundary — skip other orgs' rows entirely
-                continue
-            if not _passes_filters(rec, filters):   # then apply the optional narrowing
-                continue
-            # Cosine similarity = dot(q, v) / (||q|| * ||v||): the angle-based
-            # closeness that ranks chunks by semantic relevance to the query.
-            v = np.asarray(rec.vector, dtype=np.float32)
-            vn = float(np.linalg.norm(v)) or 1.0
-            scored.append((float(np.dot(q, v) / (qn * vn)), rec))
-        scored.sort(key=lambda t: t[0], reverse=True)   # best (most similar) first
-        out: list[Chunk] = []
-        # Keep the top_k and project each record into a Chunk (carrying score +
-        # provenance) for the pipeline. This is the "fetch" that over-fetch-then-
-        # rerank in pipeline.py builds on.
-        for score, rec in scored[: max(0, top_k)]:
-            out.append(Chunk(
-                id=rec.id, text=rec.text, score=score, org_id=rec.org_id,
-                source=rec.source, doc_id=rec.doc_id, title=rec.title,
-                section=rec.section, published_at=rec.published_at, metadata=rec.metadata,
-            ))
-        return out
-
-    async def delete_by_doc(self, collection: str, org_id: str, doc_id: str) -> int:
-        # Delete is also org-scoped: only rows matching BOTH this org and this doc
-        # are removed, so one tenant can never purge another's data.
-        col = self._cols.get(collection, {})
-        ids = [i for i, r in col.items() if r.org_id == org_id and r.doc_id == doc_id]
-        for i in ids:
-            col.pop(i, None)
-        if ids:
-            self._mat[collection] = None
-        return len(ids)
-
-    async def count(self, collection: str, org_id: str | None = None) -> int:
-        # Total rows, or rows for one tenant when org_id is given (admin/metrics use).
-        col = self._cols.get(collection, {})
-        if org_id is None:
-            return len(col)
-        return sum(1 for r in col.values() if r.org_id == org_id)
-
-    async def aclose(self) -> None:
-        return None
-
-
-__all__ = ["VectorRecord", "SearchFilters", "VectorStore", "InMemoryVectorStore"]
+__all__ = ["VectorRecord", "SearchFilters", "VectorStore"]
