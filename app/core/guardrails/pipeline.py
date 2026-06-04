@@ -31,11 +31,9 @@ from app.core.guardrails.base import Action, Detector, GuardrailResult, Guardrai
 from app.core.guardrails.detectors import (
     LlamaGuardDetector,
     OutputExfiltrationGuard,
-    PIIRedactor,
     PresidioPIIRedactor,
     PromptInjectionDetector,
     SecretRedactor,
-    TopicSafetyDetector,
 )
 from app.core.llm.base import NO_CONTEXT_REFUSAL
 from app.core.rag.citations import verify_groundedness
@@ -135,41 +133,45 @@ class OutputGuardrailPipeline:
 
 
 def build_input_guardrails(settings) -> InputGuardrailPipeline:
-    """Assemble the input pipeline FROM CONFIG. Secret redaction is the always-on
-    floor whenever guardrails are enabled; injection screening and topic safety
-    are each opt-in (and each can be backed by a model URL). Guardrails fully off
-    => an empty pipeline that passes everything through unchanged."""
+    """Assemble the input pipeline FROM CONFIG. ``SecretRedactor`` is the always-on
+    floor whenever guardrails are enabled (the one piece no library covers inline);
+    prompt-injection and content-safety are LIBRARY/MODEL backed — Llama Prompt
+    Guard 2 and Llama Guard 3 respectively — wired when their model URL is set (the
+    prod guard requires the URLs in production). Guardrails fully off => an empty
+    pipeline that passes everything through unchanged."""
     if not settings.guardrails_enabled:
         return InputGuardrailPipeline([])
     detectors: list[Detector] = [SecretRedactor()]   # always first: scrub secrets before anything
     if settings.injection_detection:
-        # regex floor + Prompt Guard 2 (when prompt_guard_url is set)
+        # Llama Prompt Guard 2 (no-op in dev if no URL; required in prod).
         detectors.append(PromptInjectionDetector(
             settings.prompt_guard_url, threshold=settings.prompt_guard_threshold,
             fail_closed=settings.guardrails_fail_closed))
-    if settings.topic_safety:
-        # the narrow harm-regex floor always runs...
-        detectors.append(TopicSafetyDetector(""))
-        # ...and Llama Guard 3 runs alongside it when configured (defense in depth).
-        if settings.llama_guard_url:
-            detectors.append(LlamaGuardDetector(
-                settings.llama_guard_url, settings.llama_guard_model,
-                fail_closed=settings.guardrails_fail_closed))
+    if settings.topic_safety and settings.llama_guard_url:
+        # Llama Guard 3 is THE content-safety classifier (the harm-regex floor was removed).
+        detectors.append(LlamaGuardDetector(
+            settings.llama_guard_url, settings.llama_guard_model,
+            fail_closed=settings.guardrails_fail_closed))
     return InputGuardrailPipeline(detectors)
 
 
 def _build_pii_detector(settings) -> Detector:
-    """Pick the PII redactor: Presidio when configured AND importable, else the
-    regex floor. Falling back keeps the system bootable without the optional dep."""
-    if settings.pii_provider == "presidio":
-        try:
-            import presidio_analyzer  # noqa: F401
-            import presidio_anonymizer  # noqa: F401
+    """The PII redactor is Microsoft **Presidio** (NER-based). Fails FAST if the
+    ``pii`` extra isn't installed, rather than silently degrading — PII redaction is
+    a security control, so a missing dependency must be a loud boot error, not a
+    quiet no-op."""
+    try:
+        import presidio_analyzer  # noqa: F401
+        import presidio_anonymizer  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        from app.core.errors import ConfigError
 
-            return PresidioPIIRedactor(tuple(settings.pii_entities), settings.pii_score_threshold)
-        except Exception:
-            pass   # presidio (or its model) not available -> regex fallback
-    return PIIRedactor()
+        raise ConfigError(
+            "PII redaction is enabled but Microsoft Presidio is not installed. Install "
+            "the extra:  pip install -e '.[pii]'  and download a spaCy model:  "
+            "python -m spacy download en_core_web_lg   (or set PII_REDACTION=false to disable)."
+        ) from exc
+    return PresidioPIIRedactor(tuple(settings.pii_entities), settings.pii_score_threshold)
 
 
 def build_output_guardrails(settings) -> OutputGuardrailPipeline:
@@ -179,7 +181,7 @@ def build_output_guardrails(settings) -> OutputGuardrailPipeline:
     grounded info" is never flagged as ungrounded."""
     detectors: list[Detector] = []
     if settings.guardrails_enabled and settings.pii_redaction:
-        detectors.append(_build_pii_detector(settings))   # Presidio or regex per config
+        detectors.append(_build_pii_detector(settings))   # Microsoft Presidio (fail-fast if missing)
     # Defang exfiltration vectors (auto-loading images / script links) in the answer.
     if settings.guardrails_enabled and getattr(settings, "output_exfiltration_guard", True):
         detectors.append(OutputExfiltrationGuard())

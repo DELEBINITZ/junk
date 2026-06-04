@@ -17,6 +17,8 @@ _REAL = dict(
     _env_file=None, environment="prod", debug=False, seed_demo_data=False,
     database_url="postgresql://u:p@h:5432/db",
     jwt_secret="x" * 40, api_keys=["prod-gateway-key-001"],
+    # Guardrail model endpoints are required in prod (Prompt Guard 2 + Llama Guard 3).
+    prompt_guard_url="http://prompt-guard:8085", llama_guard_url="http://llama-guard:8086/v1",
     cap_reports_enabled=True, cap_easm_enabled=False,
     cap_brand_enabled=False, cap_aci_enabled=False,
 )
@@ -49,6 +51,13 @@ def test_prod_error_lists_what_to_fix():
 
 def test_prod_accepts_full_real_config():
     assert Settings(**_REAL).is_prod
+
+
+def test_prod_rejects_missing_guard_models():
+    # guardrails on (default) but no Prompt Guard / Llama Guard URL -> reject
+    cfg = {**_REAL, "prompt_guard_url": "", "llama_guard_url": ""}
+    with pytest.raises(ValidationError):
+        Settings(**cfg)
 
 
 def test_prod_requires_mcp_url_for_enabled_tool_module():

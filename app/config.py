@@ -150,47 +150,45 @@ class Settings(BaseSettings):
     recency_half_life_days: float = 180.0
 
     # ---- Guardrails --------------------------------------------------------
-    # The safety spine, applied to BOTH the incoming question and the outgoing
-    # answer. Each toggle gates one check: redact PII, detect prompt injection,
-    # screen unsafe topics, and verify the answer is grounded in retrieved context
-    # (anti-hallucination). The optional *_url endpoints are ML backstops; a
-    # heuristic implementation is always on so guardrails never silently disable.
+    # The safety spine, applied to BOTH the incoming question and the outgoing answer.
+    # The heavy lifting is done by LIBRARIES/MODELS, not hand-rolled rules:
+    #   PII             -> Microsoft Presidio (the ``pii`` extra; fails fast if absent)
+    #   prompt injection-> Llama Prompt Guard 2 (PROMPT_GUARD_URL classifier endpoint)
+    #   content safety  -> Llama Guard 3        (LLAMA_GUARD_URL chat endpoint)
+    # The only hand-coded pieces are the ones no library covers inline: secret
+    # redaction, indirect-injection neutralization of retrieved content, output
+    # exfiltration defang, and groundedness verification (see guardrails/detectors.py).
+    # In PROD the model URLs are REQUIRED (the prod guard refuses to boot without them).
     guardrails_enabled: bool = True
     pii_redaction: bool = True
     injection_detection: bool = True
     topic_safety: bool = True
     groundedness_check: bool = True
-    # INDIRECT prompt-injection defense: neutralize injection instructions found in
-    # RETRIEVED documents + tool outputs (adversary-controlled) before they enter
-    # the answer prompt, and frame that context as untrusted data. Critical for an
-    # agentic RAG system that reads attacker-influenced content.
+    # INDIRECT prompt-injection defense (custom, no library): neutralize injection
+    # instructions found in RETRIEVED documents + tool outputs (adversary-controlled)
+    # before they enter the answer prompt, and frame that context as untrusted data.
+    # Critical for an agentic RAG system that reads attacker-influenced content.
     indirect_injection_defense: bool = True
     # Defang data-exfiltration vectors (auto-loading markdown images, script links)
-    # in the generated answer.
+    # in the generated answer (custom — LLM-output-specific).
     output_exfiltration_guard: bool = True
-    prompt_guard_url: str = ""   # optional model endpoint (heuristic backstop always on)
-    llama_guard_url: str = ""
-    # ---- Guardrail PROVIDERS (self-hostable models/libs; heuristic = fallback) ----
-    # PII: "regex" (the built-in floor) or "presidio" (Microsoft Presidio — NER +
-    # context + checksums; runs in-process, optional dep). Tuned for a security
-    # product: IP_ADDRESS/URL/DOMAIN are intentionally NOT in pii_entities (they're
-    # the subject matter, not PII).
-    pii_provider: Literal["regex", "presidio"] = "regex"
+    # ---- Guardrail model endpoints (self-hosted classifiers) ----
+    prompt_guard_url: str = ""   # Llama Prompt Guard 2 classify endpoint (REQUIRED in prod)
+    prompt_guard_threshold: float = 0.8   # min malicious/jailbreak label score to block
+    llama_guard_url: str = ""    # Llama Guard 3 OpenAI-compatible chat endpoint (REQUIRED in prod)
+    llama_guard_model: str = "meta-llama/Llama-Guard-3-8B"
+    # ---- PII (Microsoft Presidio) ----
+    # Security-tuned entity set: IP_ADDRESS/URL/DOMAIN are intentionally OMITTED —
+    # they are the product's subject matter, not PII.
     pii_score_threshold: float = 0.5
     pii_entities: Annotated[list[str], NoDecode] = Field(default_factory=lambda: [
         "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "CREDIT_CARD",
         "IBAN_CODE", "US_BANK_NUMBER", "CRYPTO", "MEDICAL_LICENSE", "US_PASSPORT",
     ])
-    # Injection: when prompt_guard_url is set, Prompt Guard 2 runs on top of the
-    # regex floor. Threshold = min score on a malicious/jailbreak label to block.
-    prompt_guard_threshold: float = 0.8
-    # Safety: when llama_guard_url is set, Llama Guard 3 (chat endpoint) runs
-    # alongside the narrow harm-regex floor.
-    llama_guard_model: str = "meta-llama/Llama-Guard-3-8B"
-    # Fail policy for the INPUT model classifiers (injection/safety) on a model
-    # error: False = fail OPEN (regex floor still ran, availability first);
-    # True = fail CLOSED (block on classifier error — for high-security tenants).
-    guardrails_fail_closed: bool = False
+    # Fail policy for the model classifiers (injection/safety) on a model error:
+    # True = fail CLOSED (block on classifier error — the production-safe default for a
+    # security product); False = fail OPEN (availability over strictness).
+    guardrails_fail_closed: bool = True
 
     # ---- Memory / knowledge graph -----------------------------------------
     # Long-term/cross-session memory backend. ``none`` => a NoOp graph (default);
@@ -381,6 +379,15 @@ class Settings(BaseSettings):
         # API keys gate the gateway — the dev default must not ship to prod.
         if not self.api_keys or "dev-api-key-change-me" in set(self.api_keys):
             bad.append("API_KEYS is empty or still the dev default — set real gateway key(s)")
+        # Guardrail MODELS are required in prod: the hand-rolled regex floors were
+        # removed, so injection/content-safety depend entirely on the classifiers.
+        if self.guardrails_enabled:
+            if self.injection_detection and not self.prompt_guard_url:
+                bad.append("PROMPT_GUARD_URL not set — Llama Prompt Guard 2 is required for "
+                           "injection detection (or set INJECTION_DETECTION=false)")
+            if self.topic_safety and not self.llama_guard_url:
+                bad.append("LLAMA_GUARD_URL not set — Llama Guard 3 is required for content "
+                           "safety (or set TOPIC_SAFETY=false)")
         # Tool-backed modules MUST point at a real MCP server in prod, else they
         # would serve their built-in mock data. (Corpus modules like reports are
         # covered by RETRIEVAL_BACKEND=qdrant above.)

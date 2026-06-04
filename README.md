@@ -25,7 +25,8 @@ LLM + embeddings (just an API key) and local Qdrant + Postgres.
 
 ```bash
 uv venv --python 3.11 && source .venv/bin/activate
-uv pip install -e ".[dev,qdrant,postgres]"      # add ,observability,langgraph,redis as needed
+uv pip install -e ".[prod,dev]"                 # one-shot: full real stack + test tools
+python -m spacy download en_core_web_lg          # Presidio PII model (one manual step)
 # bring up Qdrant + Postgres (see infra/), then:
 cp .env.example .env                            # set OPENAI_API_KEY, DATABASE_URL, QDRANT_URL, API_KEYS, JWT_SECRET
 #   LLM_PROVIDER=openai  EMBEDDING_PROVIDER=openai   (easiest, no GPU)
