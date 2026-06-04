@@ -6,9 +6,10 @@ WHY THIS REWRITE EXISTS (the bugs it fixes vs. the old Ollama version):
   1. COLLECTION NAME — must equal the app's ``REPORTS_COLLECTION`` ("reports_kb"),
      not "aci_reports", or the app queries an empty collection.
   2. EMBEDDER + DIM — must be the SAME embedder the app queries with: TEI
-     Qwen3-Embedding-8B at dim 1024 (settings.embedding_dim). The old Ollama
-     ``qwen3-embedding:4b`` @ 2560 produced vectors in a different space AND a
-     wrong dimension — Qdrant rejects a 1024-dim query against a 2560-dim store.
+     Qwen3-Embedding-4B at dim 2560 (settings.embedding_dim, the 24GB quant profile).
+     The old Ollama ``qwen3-embedding:4b`` was the right dim by accident but a
+     different runtime/space; index via the SAME TEI server the app queries, or
+     vectors won't match and Qdrant rejects dim mismatches.
   3. PAYLOAD KEYS — must match what the retriever reads (qdrant_backend.py): the
      chunk text goes in ``text`` (not ``chunk_content``), the id in ``doc_id`` (not
      ``_id``), the date in ``published_at`` as RFC3339 (not ``information_date``).
@@ -44,7 +45,7 @@ from qdrant_client import QdrantClient, models
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "") or None
 TEI_EMBED_URL = os.getenv("TEI_EMBED_URL", "http://localhost:8080").rstrip("/")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))   # MUST equal settings.embedding_dim
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2560"))   # MUST equal settings.embedding_dim (Qwen3-Embedding-4B)
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "reports_kb")  # MUST equal REPORTS_COLLECTION
 SOURCE = os.getenv("REPORTS_SOURCE", "aci_reports")       # provenance tag, NOT the collection name
 DELETE_FIRST = os.getenv("REINDEX_DELETE_FIRST", "0") == "1"
