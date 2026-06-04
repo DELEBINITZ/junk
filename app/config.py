@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     #   vllm   -> self-hosted (e.g. one 32B for staging); the three lanes collapse to
     #             the single served ``vllm_model``.
     #   openai -> any hosted/OpenAI-compatible endpoint; lanes collapse to one model.
-    llm_provider: Literal["sglang", "vllm", "openai"] = "sglang"
+    llm_provider: Literal["sglang", "vllm", "openai"] = "vllm"  # in-house: one 72B on vLLM
     # SGLang (OpenAI-compatible) — three lanes, three models
     sglang_base_url: str = "http://localhost:30000/v1"
     sglang_api_key: str = "EMPTY"
@@ -121,7 +121,7 @@ class Settings(BaseSettings):
     # vLLM (OpenAI-compatible) — one served model, all three lanes map to it.
     vllm_base_url: str = "http://localhost:8000/v1"
     vllm_api_key: str = "EMPTY"
-    vllm_model: str = "Qwen/Qwen2.5-32B-Instruct"
+    vllm_model: str = "Qwen/Qwen2.5-72B-Instruct"  # in-house vLLM: one 72B serves all lanes
     # OpenAI-compatible hosted provider (never for sensitive prod data)
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
@@ -129,6 +129,12 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.1   # low temperature => more deterministic, factual answers
     llm_max_tokens: int = 1024
     llm_timeout_seconds: float = 60.0
+    # OVERFLOW FUSE: cap the answer prompt to this many CHARACTERS before sending, so a
+    # large retrieved-context block can't exceed the model window and crash the turn
+    # (UpstreamError). Char-based, not exact token accounting — the lowest-ranked context
+    # is trimmed first. Keep comfortably below the window in chars (~3-4 chars/token);
+    # 80k suits a 32k-token model. LOWER this if you serve a smaller context window.
+    max_prompt_chars: int = 80000
 
     # ---- Embeddings --------------------------------------------------------
     # Vectorizer for RAG. ``tei`` is the self-hosted embedding server; ``openai`` is
@@ -222,6 +228,12 @@ class Settings(BaseSettings):
     history_window_messages: int = 12     # how many prior messages run_turn loads
     answer_history_turns: int = 6         # how many of those the answer prompt includes verbatim
     summary_trigger_messages: int = 20
+    # CROSS-SESSION RECALL: pull a few relevant snippets from the user's OTHER (past)
+    # conversations into context, so follow-ups that reference earlier chats have
+    # continuity ("like we discussed last week"). Org+user scoped by the store — never
+    # crosses tenant/user. Injected as background context only, NOT citable evidence.
+    cross_session_recall: bool = True
+    cross_session_recall_k: int = 3       # max past-conversation snippets to inject
     # The agentic path is ON by default: the planner brain + LLM tool-calling. Both
     # DEGRADE GRACEFULLY to deterministic behaviour when no real LLM is wired (the
     # provider gate inside the supervisor/planner/specialist makes them no-ops on
@@ -249,10 +261,11 @@ class Settings(BaseSettings):
     max_plan_steps: int = 6      # hard cap on steps the planner may emit (bounds fan-out + cost)
     # DEEP REASONING depth: how many times the reflect gate may revise the plan after
     # finding a gap (LLM mode only; the deterministic path always finishes in one
-    # pass). 2 lets the agent iterate twice — gather, notice what's missing, fetch the
-    # missing data, and (if still short) fetch once more — before answering. Bounds
-    # cost/latency; raise for harder questions, set 0 to disable reflection.
-    max_replans: int = 2
+    # pass). 3 lets the agent iterate a few times — gather, notice what's missing,
+    # fetch the missing data, and re-check — before answering. Bounds cost/latency
+    # (each round is a full plan+answer+critic pass); raise for harder questions, set
+    # 0 to disable reflection. On a single 72B every round is ~several model calls.
+    max_replans: int = 3
     planner_max_fanout: int = 2  # max modules a single (deterministic) plan spreads across
 
     # ---- Remote MCP servers + tool-context budget --------------------------

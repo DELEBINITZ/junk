@@ -28,6 +28,7 @@ EV_SESSION = "session"
 EV_STATUS = "status"
 EV_ROUTE = "route"
 EV_TOOL = "tool"
+EV_THINKING = "thinking"   # human-readable reasoning steps (plan decomposition, reflect verdicts)
 EV_TOKEN = "token"
 EV_CITATION = "citation"
 EV_DONE = "done"
@@ -65,6 +66,7 @@ __all__ = [
     "EV_STATUS",
     "EV_ROUTE",
     "EV_TOOL",
+    "EV_THINKING",
     "EV_TOKEN",
     "EV_CITATION",
     "EV_DONE",

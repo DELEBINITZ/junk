@@ -31,6 +31,7 @@ specialists. There are two ways a specialist decides which tools to call:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
@@ -177,6 +178,18 @@ def summarize_tool_result(name: str, result: ToolResult) -> str:
     return f"{name}: " + ", ".join(bits)
 
 
+def _observe(name: str, out) -> str:
+    """Render one tool OUTCOME for the model's ReAct feedback. On success, the
+    structured gist; on error, the FULL error (code + message) so the model can
+    self-correct — fix the arguments or pick a different tool — instead of being
+    told only that 'something failed'."""
+    if isinstance(out, ToolResult):
+        return f"{name} -> {summarize_tool_result(name, out)}"
+    code = getattr(out, "code", "error")
+    msg = getattr(out, "message", "") or code
+    return f"{name} -> ERROR[{code}]: {msg}"
+
+
 # --------------------------------------------------------------------------- #
 # generic specialist
 # --------------------------------------------------------------------------- #
@@ -294,6 +307,18 @@ class GenericSpecialist:
             and bool(self._read_tools())
         )
 
+    async def _call_tool_resilient(self, name: str, arguments: dict, ctx: ToolContext, *, retries: int = 1):
+        """Call a tool through the MCP boundary (RBAC + gate enforced there), retrying
+        on a RETRIABLE error (transient transport/upstream). Errors-as-data: returns
+        the ToolResult or the final ToolError. A non-retriable error returns immediately
+        so the model sees it and self-corrects."""
+        out = await self.mcp.call_tool(name, arguments, ctx)
+        attempt = 0
+        while not isinstance(out, ToolResult) and getattr(out, "retriable", False) and attempt < retries:
+            attempt += 1
+            out = await self.mcp.call_tool(name, arguments, ctx)
+        return out
+
     def _fold(self, name: str, out, chunks: list[Chunk], events: list[dict], org_id: str) -> None:
         """Turn one tool OUTCOME into findings. Tool calls return data, not
         exceptions (the "errors-as-data" contract), so we branch on the type:
@@ -330,7 +355,9 @@ class GenericSpecialist:
         question (see autocall_args), call it through the MCP boundary and fold
         the result into findings. No LLM involved — fully deterministic."""
         # Only consider the shortlisted read tools (flood guard) — _select_tools
-        # already excludes side-effecting tools.
+        # already excludes side-effecting tools. Collect the callable (tool, args)
+        # pairs first, then fire them all in PARALLEL.
+        calls: list[tuple[str, dict]] = []
         for tool in await self._select_tools(question, self.deps.settings.max_tools_advertised):
             # Skip tools a module marked auto_invoke=False (LLM/planner-only, e.g.
             # a RAG search tool that would duplicate the module's bound retriever).
@@ -339,8 +366,12 @@ class GenericSpecialist:
             args = autocall_args(tool, question)
             if args is None:                       # can't infer args -> skip this tool
                 continue
-            out = await self.mcp.call_tool(tool.name, args, ctx)
-            self._fold(tool.name, out, chunks, events, ctx.org_id)
+            calls.append((tool.name, args))
+        if not calls:
+            return
+        outs = await asyncio.gather(*[self._call_tool_resilient(n, a, ctx) for n, a in calls])
+        for (name, _), out in zip(calls, outs, strict=True):
+            self._fold(name, out, chunks, events, ctx.org_id)
 
     async def _llm_tools(self, question: str, ctx: ToolContext, chunks: list[Chunk], events: list[dict]) -> None:
         """LLM tool-calling planner: advertise this module's tools to the model and
@@ -361,14 +392,20 @@ class GenericSpecialist:
             resp = await self.deps.llm.complete_with_tools(messages, tools, lane=Lane.FAST, tool_choice="auto")
             if not resp.tool_calls:                # model is done asking for tools
                 break
+            # Execute the model's tool calls IN PARALLEL (SOTA parallel tool calling) —
+            # independent calls in one turn no longer run one-at-a-time. Each goes
+            # through the RBAC + gate boundary and gets a bounded retry on retriable errors.
+            outs = await asyncio.gather(*[
+                self._call_tool_resilient(tc.name, tc.arguments, ctx) for tc in resp.tool_calls
+            ])
             observations = []
-            for tc in resp.tool_calls:
-                out = await self.mcp.call_tool(tc.name, tc.arguments, ctx)   # still goes through RBAC+gate
+            for tc, out in zip(resp.tool_calls, outs, strict=True):
                 self._fold(tc.name, out, chunks, events, ctx.org_id)
-                observations.append(f"{tc.name} -> {summarize_tool_result(tc.name, out) if isinstance(out, ToolResult) else out.code}")
-            # Feed the tool results back so the model can decide its next move
-            # (classic ReAct-style observe-then-act tool loop).
-            messages.append(ChatMessage(role="system", content="Tool observations: " + "; ".join(observations)))
+                observations.append(_observe(tc.name, out))   # full error fed back -> self-correct
+            # Feed the results back so the model can decide its next move (ReAct
+            # observe-then-act loop). Errors carry their message, so the next round can
+            # fix arguments or switch tools rather than just retrying blindly.
+            messages.append(ChatMessage(role="system", content="Tool results:\n" + "\n".join(observations)))
 
     async def investigate(self, question: str, ctx: ToolContext) -> SpecialistResult:
         """The Specialist protocol method. Orchestrates one module's evidence

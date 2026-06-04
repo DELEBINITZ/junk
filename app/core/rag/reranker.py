@@ -81,7 +81,9 @@ class TEIReranker:
 
     provider = "tei"
 
-    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 8.0) -> None:
+        # 8s, not 30s: rerank is a precision stage, so a slow/hung server should trip
+        # the fail-open fast rather than stall the user's request.
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client = None
@@ -97,31 +99,41 @@ class TEIReranker:
     async def rerank(self, query: str, chunks: Sequence[Chunk], top_k: int) -> list[Chunk]:
         if not chunks:
             return []
+        # The fail-open answer: the vector store already returned these similarity-
+        # sorted, so the worst case is "skip reranking", never "drop results".
+        fallback = list(chunks[:top_k])
         try:
             # Send the query alongside every candidate's text; the server returns a
-            # relevance score per candidate (by its index in the list we sent).
+            # relevance score per candidate, keyed by its index in the list we sent.
             r = await self._http().post(
                 f"{self._base_url}/rerank",
                 json={"query": query, "texts": [c.text for c in chunks]},
             )
             r.raise_for_status()
-            results = r.json()  # [{"index": i, "score": s}, ...]
+            # Parse + VALIDATE inside the try, so a malformed/old-shape response
+            # degrades gracefully instead of crashing retrieval. Keep only well-formed
+            # items whose index actually points at one of the candidates we sent.
+            payload = r.json()                            # expects [{"index": i, "score": s}, ...]
+            ranked = [
+                (int(it["index"]), float(it.get("score", 0.0)))
+                for it in payload
+                if isinstance(it, dict)
+                and isinstance(it.get("index"), int)
+                and 0 <= it["index"] < len(chunks)
+            ]
+            if not ranked:                                # empty / wrong shape -> degrade, never return []
+                raise ValueError(f"no usable rerank scores in response: {str(payload)[:120]}")
         except Exception as exc:  # noqa: BLE001
             # FAIL OPEN: reranking is a PRECISION booster, not a correctness
-            # requirement. A rerank-server blip must NOT take down RAG search — fall
-            # back to the vector store's own ordering (already similarity-sorted) and
-            # truncate to top_k. WARNING-logged so the degradation is visible, not silent.
+            # requirement. A rerank-server blip OR an unexpected response shape must NOT
+            # take down RAG search — fall back to vector order. WARNING-logged so the
+            # degradation is visible, not silent.
             _log.warning("TEI rerank failed (%s) — falling back to vector order", exc)
-            return list(chunks[:top_k])
-        # Reorder by the cross-encoder's score (best first) and keep top_k. Each
-        # surviving chunk's score is overwritten with the reranker's score so
-        # downstream sees the better signal; model_copy avoids mutating the input.
-        order = sorted(results, key=lambda x: x.get("score", 0.0), reverse=True)
-        out: list[Chunk] = []
-        for item in order[:top_k]:
-            c = chunks[item["index"]]
-            out.append(c.model_copy(update={"score": float(item.get("score", c.score))}))
-        return out
+            return fallback
+        # Best score first, keep top_k. Overwrite each chunk's score with the cross-
+        # encoder's (the stronger signal); model_copy avoids mutating the input.
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        return [chunks[i].model_copy(update={"score": s}) for i, s in ranked[:top_k]]
 
     async def aclose(self) -> None:
         if self._client is not None:
