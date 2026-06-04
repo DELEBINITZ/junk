@@ -99,6 +99,7 @@ class RetrievalPipeline:
         top_k: int | None = None,
         filters: SearchFilters | None = None,
         apply_time_filters: bool = True,
+        visibility: str = "tenant",
     ) -> list[Chunk]:
         """The READ path — the full retrieve sequence for one query. This is the
         method specialists/retrievers ultimately call to get evidence chunks."""
@@ -118,7 +119,7 @@ class RetrievalPipeline:
         # tenant scope, taken from the trusted context — never from the query.
         over_fetch = max(self.settings.retrieval_top_k, top_k or 0)
         chunks = await self.store.search(
-            collection, qv, org_id=ctx.org_id, top_k=over_fetch, filters=sf
+            collection, qv, org_id=ctx.org_id, top_k=over_fetch, filters=sf, visibility=visibility
         )
         # Apply soft time-decay before the final cut.
         chunks = self._apply_recency(chunks)
@@ -147,11 +148,15 @@ class CollectionRetriever:
     time it uses the live pipeline from ``ctx.deps.rag``. Pass an explicit
     ``pipeline`` for programmatic use."""
 
-    def __init__(self, id: str, collection: str, pipeline: RetrievalPipeline | None = None, source: str = "") -> None:
+    def __init__(self, id: str, collection: str, pipeline: RetrievalPipeline | None = None,
+                 source: str = "", visibility: str = "tenant") -> None:
         self.id = id
         self.collection = collection
         self.pipeline = pipeline
         self.source = source
+        # "tenant" = hard org isolation (default, private corpora). "shared" = the
+        # public-OR-customer_tags allow-list, for cross-tenant shared corpora.
+        self.visibility = visibility
 
     async def retrieve(
         self, query: str, filters: Mapping[str, Any], ctx: ToolContext
@@ -161,7 +166,8 @@ class CollectionRetriever:
         # and delegate. ctx carries the org_id that scopes the search.
         pipeline = self.pipeline or ctx.deps.rag
         sf = SearchFilters(**dict(filters)) if filters else None
-        return await pipeline.retrieve(query, collection=self.collection, ctx=ctx, filters=sf)
+        return await pipeline.retrieve(query, collection=self.collection, ctx=ctx,
+                                       filters=sf, visibility=self.visibility)
 
 
 def build_vector_store(settings: Settings) -> VectorStore:

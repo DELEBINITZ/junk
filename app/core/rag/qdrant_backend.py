@@ -70,6 +70,7 @@ class QdrantVectorStore:
             ("source", qm.PayloadSchemaType.KEYWORD),
             ("doc_id", qm.PayloadSchemaType.KEYWORD),
             ("published_at", qm.PayloadSchemaType.DATETIME),  # powers recency range filtering
+            ("customer_tags", qm.PayloadSchemaType.KEYWORD),  # shared-corpus allow-list (array); Match + IsEmpty
         ]:
             try:
                 await self._client.create_payload_index(collection, field_name=field, field_schema=schema)
@@ -101,17 +102,34 @@ class QdrantVectorStore:
             await self._client.upsert(collection_name=collection, points=points)
         return len(points)
 
-    def _filter(self, org_id: str, f: SearchFilters | None):
-        """Build the Qdrant filter. THE security-critical line is the first one:
-        ``org_id`` is ALWAYS in ``must`` (logical AND), so every search is hard-
-        scoped to one tenant at the database. The optional SearchFilters are merely
-        added on top — they can narrow results but can never remove or override the
-        org_id condition."""
+    def _filter(self, org_id: str, f: SearchFilters | None, visibility: str = "tenant"):
+        """Build the Qdrant filter. THE security-critical clause is the FIRST one,
+        and it has two modes:
+
+        * ``visibility="tenant"`` (DEFAULT) — ``org_id`` is in ``must`` (logical AND),
+          so every search is HARD-scoped to one tenant. This is the isolation boundary
+          for PRIVATE, single-owner corpora; nothing below can widen it.
+        * ``visibility="shared"`` — a SHARED-intel corpus (e.g. CERT/ACI reports) where
+          one document is visible to many orgs. Visible when the report is PUBLIC
+          (``customer_tags`` empty/absent) OR explicitly allow-listed for this org
+          (``customer_tags`` array contains ``org_id``). NOTE: this is FAIL-OPEN — a
+          report with no tags is visible to EVERY tenant — so only bind it to corpora
+          that are genuinely cross-tenant shareable.
+
+        The optional SearchFilters are added on top in either mode (narrow only)."""
         from qdrant_client import models as qm
 
-        # MANDATORY: org_id must match. This is the tenant-isolation boundary,
-        # enforced by Qdrant itself rather than by post-filtering in Python.
-        must = [qm.FieldCondition(key="org_id", match=qm.MatchValue(value=org_id))]
+        if visibility == "shared":
+            # (public OR tagged-for-this-org). Wrapped in its own Filter so it ANDs
+            # cleanly with any source/date/doc musts appended below.
+            must = [qm.Filter(should=[
+                qm.FieldCondition(key="customer_tags", match=qm.MatchValue(value=org_id)),   # array contains org_id
+                qm.IsEmptyCondition(is_empty=qm.PayloadField(key="customer_tags")),          # missing / null / []
+            ])]
+        else:
+            # MANDATORY: org_id must match. The tenant-isolation boundary for private
+            # corpora, enforced by Qdrant itself rather than post-filtering in Python.
+            must = [qm.FieldCondition(key="org_id", match=qm.MatchValue(value=org_id))]
         if f:
             if f.source:
                 must.append(qm.FieldCondition(key="source", match=qm.MatchValue(value=f.source)))
@@ -138,17 +156,19 @@ class QdrantVectorStore:
         org_id: str,
         top_k: int,
         filters: SearchFilters | None = None,
+        visibility: str = "tenant",
     ) -> list[Chunk]:
-        # Fail closed without a tenant scope (same rule as the in-memory store).
+        # Fail closed without a tenant scope — required even in shared mode, since the
+        # allow-list is matched against THIS org's id from the trusted context.
         if not org_id:
             raise ValueError("search requires org_id (tenant isolation)")
-        # ANN search: Qdrant returns the nearest vectors to ``query_vector`` that
-        # also satisfy ``query_filter`` — and the filter ALWAYS carries the org_id
-        # must-match, so results are tenant-scoped by construction.
+        # ANN search: Qdrant returns the nearest vectors to ``query_vector`` that also
+        # satisfy ``query_filter`` — the filter always carries the tenant/visibility
+        # clause, so results are scoped by construction.
         res = await self._client.query_points(
             collection_name=collection,
             query=list(query_vector),
-            query_filter=self._filter(org_id, filters),
+            query_filter=self._filter(org_id, filters, visibility),
             limit=max(1, top_k),
             with_payload=True,                # we need the payload to rebuild Chunks
         )

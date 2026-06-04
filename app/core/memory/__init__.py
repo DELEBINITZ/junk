@@ -1,7 +1,6 @@
-"""Memory: chat persistence, rolling summary, long-term KG seam."""
+"""Memory: chat persistence (Postgres) + the rolling conversation summary."""
 
 from app.core.memory.conversations import ConversationStore, Message, Session
-from app.core.memory.kg import KnowledgeGraph, NoOpKnowledgeGraph, build_kg
 from app.core.memory.summarizer import RollingSummarizer
 
 
@@ -18,8 +17,5 @@ __all__ = [
     "Session",
     "ConversationStore",
     "RollingSummarizer",
-    "KnowledgeGraph",
-    "NoOpKnowledgeGraph",
-    "build_kg",
     "build_conversation_store",
 ]

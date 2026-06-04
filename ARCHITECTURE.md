@@ -17,14 +17,14 @@ orchestrator plans → dispatches → reflects.
 ```
 ┌──────────────── CORE  (app/core — built once, rarely touched) ───────────────┐
 │ supervisor/router · graph engine (built-in + LangGraph) · retrieval pipeline │
-│ guardrails · memory (sessions + KG seam) · MCP tool boundary · action gate   │
+│ guardrails · memory (sessions + summary) · MCP tool boundary · action gate   │
 │ streaming (SSE) · security (authN/Z, org isolation) · observability · registry│
 └───────────────────────────────┬──────────────────────────────────────────────┘
                                  │ discovers + wires by manifest at boot
 ┌────────────────────────────────┴──────────────────────────────────────────────┐
 │      CAPABILITY MODULES  (app/capabilities/* — drop-in features)               │
 │   reports │ easm │ brand │ aci │ <next> ...   each = manifest + tools (+ prompt,│
-│                                                retriever, evals, ontology, …)   │
+│                                                retriever, evals, …)            │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,7 +62,7 @@ Orchestrator.run_turn / stream_turn
    answer (synthesize)           LLM joins findings, cites [n]; streams tokens (llm/)
    output_guardrail              groundedness + citation check; PII-leak redact
    ▼
-persist assistant msg · update summary · KG observation · emit `done`
+persist assistant msg · update summary · emit `done`
 ```
 
 Tenant identity flows from the **verified token only** (never tool args), so a
@@ -84,7 +84,7 @@ prompt cannot make the agent cross orgs.
 | Orchestrator | `app/core/agent/orchestrator.py` | sessions, persistence, SSE streaming |
 | LLM lanes | `app/core/llm/` | SGLang · OpenAI-compat; fast/standard/deep |
 | Retrieval | `app/core/rag/` | embeddings (TEI/OpenAI), **org-filtered** Qdrant store, reranker, time filters, citations |
-| Memory | `app/core/memory/` | sessions+messages (Postgres-RLS), rolling summary, KG seam |
+| Memory | `app/core/memory/` | sessions+messages (Postgres-RLS), rolling summary |
 | Guardrails | `app/core/guardrails/` | input/output spine; model seams (Prompt/Llama Guard) |
 | MCP boundary | `app/core/mcp/` | in-process now; remote client + standalone server seams |
 | Action gate | `app/core/action_gate/` | human-approval inbox for side-effecting tools |
@@ -117,7 +117,7 @@ MANIFEST = CapabilityManifest(
 ```
 
 At boot the registry **discovers** manifests, validates contracts, merges
-ontology, and computes per-org views. The supervisor/planner routes by MEANING
+and computes per-org views. The supervisor/planner routes by MEANING
 (embedding similarity over each module's description + tool descriptions, or the LLM
 router — no keyword lists); RBAC + the action gate come from the manifest. **Adding
 a feature edits no core file**, and pointing it at an MCP server is config-only
@@ -159,7 +159,6 @@ system before a module needs it.
 | Chat store | Postgres **RLS** via `org_transaction` (`db/postgres.py`, `0001_init.sql`) |
 | Tools | `org_id` from `ToolContext` (token-derived), never args |
 | Action gate | approvals are org-scoped (`action_gate/gate.py`) |
-| KG | per-`org:user` namespace (`memory/kg.py`) |
 
 **Injection defense** (the agent reads adversary-controlled text): retrieved
 content is labeled untrusted in the prompt and treated as data; user input is
@@ -174,9 +173,7 @@ is a launch gate.
 
 `app/core/memory/` — durable sessions + full message history per (org, user),
 auto titles, **rolling summaries** to bound context, and **cross-session recall**
-(`/v1/sessions/search`, Postgres FTS in prod). Long-term entity memory is a seam
-(`kg.py`, NoOp default → Zep/Graphiti when `KG_PROVIDER=zep`) — the connective
-tissue for future cross-pillar reasoning.
+(`/v1/sessions/search`, Postgres FTS in prod).
 
 ---
 
@@ -202,7 +199,7 @@ tissue for future cross-pillar reasoning.
 | EASM (read) | ✅ example module (mock data) — proves multi-module + MCP routing |
 | **Parallel specialist sub-agents** | ✅ active: one specialist/module, parallel fan-out, tool-isolated, synthesize step (`agent/specialist.py`) — the 100s-of-tools scaling design |
 | Brand + ACI (read) | ✅ drop-in stubs (flip the flag) — wire real backends/MCP servers |
-| Scheduled briefings + KG entity-join | ⛶ seams: shared KG (`memory/kg.py`), proactive cron |
+| Scheduled briefings | ⛶ seam: proactive cron over the agent |
 | Action layer + approval inbox | ⛶ gate machinery + `ActionHandler` interface shipped; handlers later |
 | Graduated autonomy (Layer A) | ⛶ `auto_approves` hook present; promote per-action after proven precision |
 

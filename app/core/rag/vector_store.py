@@ -69,6 +69,8 @@ class VectorStore(Protocol):
         org_id: str,                                # mandatory tenant scope
         top_k: int,
         filters: SearchFilters | None = None,
+        visibility: str = "tenant",                 # "tenant" = hard org isolation (default);
+                                                    # "shared" = public-OR-customer_tags allow-list
     ) -> list[Chunk]: ...
 
     async def delete_by_doc(self, collection: str, org_id: str, doc_id: str) -> int: ...

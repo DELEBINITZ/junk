@@ -48,11 +48,13 @@ class TEIEmbedder:
 
     provider = "tei"
 
-    def __init__(self, base_url: str, dim: int, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, dim: int, timeout: float = 30.0, query_instruction: str = "") -> None:
         self.dim = dim
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client = None
+        # Instruct-embedder query prefix (Qwen3). Applied to embed_query ONLY; "" = off.
+        self._query_instruction = query_instruction
 
     def _http(self):
         # Lazily create (and reuse) the async HTTP client on first use, so merely
@@ -76,8 +78,10 @@ class TEIEmbedder:
             raise UpstreamError(f"TEI embed failed: {exc}") from exc
 
     async def embed_query(self, text: str) -> list[float]:
-        # Embed one text by reusing the batch path and taking the only result.
-        return (await self.embed([text]))[0]
+        # Embed one text by reusing the batch path and taking the only result. Prepend
+        # the instruction prefix (Qwen3 query side) when configured; docs stay raw.
+        q = f"{self._query_instruction}{text}" if self._query_instruction else text
+        return (await self.embed([q]))[0]
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -91,13 +95,14 @@ class OpenAIEmbedder:
 
     provider = "openai"
 
-    def __init__(self, base_url: str, api_key: str, model: str, dim: int, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, api_key: str, model: str, dim: int, timeout: float = 30.0, query_instruction: str = "") -> None:
         self.dim = dim
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
         self._timeout = timeout
         self._client = None
+        self._query_instruction = query_instruction
 
     def _http(self):
         # Lazy client, with the bearer token set once as a default header.
@@ -123,7 +128,8 @@ class OpenAIEmbedder:
             raise UpstreamError(f"OpenAI embed failed: {exc}") from exc
 
     async def embed_query(self, text: str) -> list[float]:
-        return (await self.embed([text]))[0]
+        q = f"{self._query_instruction}{text}" if self._query_instruction else text
+        return (await self.embed([q]))[0]
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -137,12 +143,13 @@ def build_embedder(settings: Settings) -> Embedder:
     # one model trained so you can truncate the vector to a shorter ``dim`` and
     # still get usable similarity, trading a little accuracy for speed/storage).
     p = settings.embedding_provider
+    qi = settings.embedding_query_instruction
     if p == "tei":
-        return TEIEmbedder(settings.tei_embed_url, dim=settings.embedding_dim)
+        return TEIEmbedder(settings.tei_embed_url, dim=settings.embedding_dim, query_instruction=qi)
     if p == "openai":
         return OpenAIEmbedder(
             settings.openai_base_url, settings.openai_api_key,
-            settings.embedding_model, dim=settings.embedding_dim,
+            settings.embedding_model, dim=settings.embedding_dim, query_instruction=qi,
         )
     from app.core.errors import ConfigError
 
