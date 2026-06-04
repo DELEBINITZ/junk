@@ -71,5 +71,5 @@ def test_dev_defaults_are_real_providers():
     # No more deterministic default — dev now points at the real (self-hosted) stack.
     s = Settings(_env_file=None, environment="dev")
     assert not s.is_prod
-    assert s.llm_provider == "sglang" and s.embedding_provider == "tei"
+    assert s.llm_provider == "vllm" and s.embedding_provider == "tei"
     assert s.retrieval_backend == "qdrant" and s.store_backend == "postgres"

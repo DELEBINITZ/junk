@@ -60,6 +60,7 @@ class PostgresConversationStore:
         return Session(
             id=row["id"], org_id=row["org_id"], user_id=row["user_id"], title=row["title"],
             summary=row["summary"], message_count=row["message_count"],
+            summarized_upto=row.get("summarized_upto", 0) or 0,
             metadata=row.get("metadata") or {},
             created_at=_iso(row["created_at"]), updated_at=_iso(row["updated_at"]),
         )
@@ -114,7 +115,7 @@ class PostgresConversationStore:
                 )
                 return [self._session(r) for r in await cur.fetchall()]
 
-    async def update_session(self, org_id: str, session_id: str, *, title=None, summary=None) -> Session | None:
+    async def update_session(self, org_id: str, session_id: str, *, title=None, summary=None, summarized_upto=None) -> Session | None:
         # Build a dynamic SET clause from only the fields that were provided. The
         # column names are hardcoded (not user input) and values go through bound
         # %s params, so this stays injection-safe despite the f-string assembly.
@@ -125,6 +126,9 @@ class PostgresConversationStore:
         if summary is not None:
             sets.append("summary=%s")
             params.append(summary)
+        if summarized_upto is not None:
+            sets.append("summarized_upto=%s")
+            params.append(summarized_upto)
         if not sets:                               # nothing to change -> just read it back
             return await self.get_session(org_id, session_id)
         sets.append("updated_at=now()")
@@ -170,13 +174,21 @@ class PostgresConversationStore:
                 )
                 return msg
 
-    async def get_messages(self, org_id, session_id, *, limit=None) -> list[Message]:
-        # Default: full history in chronological order. With ``limit`` we want the
-        # most RECENT N but still returned oldest->newest, so we grab the newest N
-        # in a subquery (ORDER BY ... DESC LIMIT) then re-sort ascending outside.
+    async def get_messages(self, org_id, session_id, *, limit=None, offset=0) -> list[Message]:
+        # Three shapes, all returned oldest->newest:
+        #  * offset>0  -> the OLDEST slice starting at ``offset`` (used to fold the
+        #    turns evicted from the live window into the rolling summary).
+        #  * limit only -> the most RECENT N (newest N via a DESC subquery, re-sorted).
+        #  * neither   -> full history in chronological order.
         q = "SELECT * FROM chat_messages WHERE session_id=%s ORDER BY created_at"
         params: list = [session_id]
-        if limit:
+        if offset:
+            q = "SELECT * FROM chat_messages WHERE session_id=%s ORDER BY created_at ASC OFFSET %s"
+            params = [session_id, offset]
+            if limit:
+                q += " LIMIT %s"
+                params.append(limit)
+        elif limit:
             q = ("SELECT * FROM (SELECT * FROM chat_messages WHERE session_id=%s "
                  "ORDER BY created_at DESC LIMIT %s) t ORDER BY created_at")
             params = [session_id, limit]

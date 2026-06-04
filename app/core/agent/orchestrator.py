@@ -154,9 +154,12 @@ class Orchestrator:
         #    RUN the graph. ``thread_id=session.id`` lets LangGraph checkpoint per
         #    session. ``dict(state)`` passes a copy so the engine mutates its own.
         engine = build_engine(ctx, self.settings, checkpointer=self.checkpointer)
+        # Cross-session memory: pull relevant snippets from the user's OTHER conversations
+        # so follow-ups referencing past chats have continuity (best-effort).
+        recalled = await self._recall(sc, session.id, question)
         state = make_initial_state(
             sc=sc, question=question, session_id=session.id, trace_id=trace_id,
-            request_id=request_id, history=history, summary=session.summary,
+            request_id=request_id, history=history, summary=session.summary, recalled=recalled,
         )
         final = await engine.run(dict(state), thread_id=session.id)
 
@@ -212,20 +215,69 @@ class Orchestrator:
                     break
                 yield ev
         finally:
-            await task   # ensure the background turn is fully finished/cleaned up
+            # The generator is closed either because the turn finished (task already
+            # done -> cancel is a no-op) OR because the CLIENT DISCONNECTED (Starlette
+            # throws GeneratorExit in here). In the disconnect case we must CANCEL the
+            # background turn, not await it: a gone client must never keep the full
+            # agent — and its expensive 72B calls — running. Cancellation propagates
+            # into the in-flight LLM stream, so vLLM aborts generation too; DB work
+            # unwinds via its transaction context managers (rollback). CancelledError
+            # is expected here and swallowed.
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _recall(self, sc: SecurityContext, session_id: str, question: str) -> list[dict]:
+        """CROSS-SESSION MEMORY: return a few relevant snippets from the user's OTHER
+        conversations (not the current session), so a follow-up that references an earlier
+        chat has continuity. The store scopes the search to (org_id, user_id) — recall can
+        never cross tenant or user lines. Best-effort: a failure returns nothing rather
+        than breaking the turn. Injected as background context only (not citable evidence)."""
+        if not getattr(self.settings, "cross_session_recall", False):
+            return []
+        k = getattr(self.settings, "cross_session_recall_k", 3)
+        try:
+            hits = await self.conversations.search_messages(sc.org_id, sc.user_id, question, limit=k * 4)
+        except Exception:  # noqa: BLE001 - recall must never break a turn
+            return []
+        out: list[dict] = []
+        for m in hits:
+            if m.session_id == session_id or not (m.content or "").strip():
+                continue                                  # skip the current chat + empties
+            out.append({"role": m.role, "content": m.content.strip()[:300], "session_id": m.session_id})
+            if len(out) >= k:
+                break
+        return out
 
     async def _maybe_summarize(self, sc: SecurityContext, session_id: str) -> None:
-        """Roll older turns into a compact summary once the message count crosses
-        ``summary_trigger_messages``. This is how the system keeps context bounded
-        on long chats (ChatGPT/Claude-style memory) instead of resending the full
-        transcript every turn."""
+        """Fold the turns that just fell OUT of the live history window into the
+        rolling summary — ChatGPT/Claude-style compaction that loses nothing.
+
+        The live prompt shows only the newest ``history_window_messages`` raw; every
+        message older than that must be carried by ``summary`` instead. ``summarized_upto``
+        is the watermark of how many oldest messages are already summarized, so each turn
+        we compact ONLY the slice that is (a) now evicted from the window and (b) not yet
+        summarized — never the recent turns (the old bug re-summarized the recent ones
+        while the genuinely old turns were dropped from context forever)."""
         s = await self.conversations.get_session(sc.org_id, session_id)
-        if s and s.message_count >= self.settings.summary_trigger_messages:
-            msgs = await self.conversations.get_messages(
-                sc.org_id, session_id, limit=self.settings.history_window_messages
-            )
-            summary = await self.summarizer.summarize(s.summary, msgs)
-            await self.conversations.update_session(sc.org_id, session_id, summary=summary)
+        if not s:
+            return
+        # Everything older than the newest ``window`` messages belongs in the summary.
+        target = s.message_count - self.settings.history_window_messages
+        if target <= s.summarized_upto:
+            return                              # nothing newly evicted -> skip (watermark guard)
+        evicted = await self.conversations.get_messages(
+            sc.org_id, session_id, offset=s.summarized_upto, limit=target - s.summarized_upto
+        )
+        if not evicted:
+            return
+        summary = await self.summarizer.summarize(s.summary, evicted)
+        await self.conversations.update_session(
+            sc.org_id, session_id, summary=summary, summarized_upto=target
+        )
 
 
 __all__ = ["Orchestrator", "TurnResult"]

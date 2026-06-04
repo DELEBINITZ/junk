@@ -64,6 +64,7 @@ class ChatState(TypedDict, total=False):
     question: str                    # the raw user message
     history: list[dict[str, Any]]    # prior turns in this session (for context)
     summary: str                     # rolling summary of older turns (bounds context size)
+    recalled: list[dict[str, Any]]   # snippets from the user's OTHER sessions (cross-session memory)
     # --- produced by input_guardrail_node ---
     safe_question: str   # the question after redaction/screening (what we actually use)
     blocked: bool        # True => guardrail refused; engine jumps to END
@@ -102,6 +103,7 @@ def make_initial_state(
     request_id: str,
     history: list[dict[str, Any]] | None = None,
     summary: str = "",
+    recalled: list[dict[str, Any]] | None = None,
 ) -> ChatState:
     """Build the starting state for a turn. Only identity + input keys are set;
     everything the nodes produce starts empty/false. Notice ``org_id`` etc. come
@@ -110,7 +112,7 @@ def make_initial_state(
     return ChatState(
         org_id=sc.org_id, user_id=sc.user_id, roles=sc.roles, session_id=session_id,
         trace_id=trace_id, request_id=request_id, question=question,
-        history=history or [], summary=summary, blocked=False,
+        history=history or [], summary=summary, recalled=recalled or [], blocked=False,
         route_modules=[], context_chunks=[], context_block="", tool_events=[],
         answer="", citations=[], output_flags={},
         # Deep-reasoning (planner) loop state — initialized so the reflect gate's
