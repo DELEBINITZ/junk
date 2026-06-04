@@ -24,6 +24,9 @@ from typing import Protocol
 
 from app.config import Settings
 from app.core.contracts import Chunk
+from app.core.observability import get_logger
+
+_log = get_logger("asi.rag.rerank")
 
 _WORD = re.compile(r"[a-z0-9]+")     # word tokenizer for the lexical reranker
 
@@ -92,8 +95,6 @@ class TEIReranker:
         return self._client
 
     async def rerank(self, query: str, chunks: Sequence[Chunk], top_k: int) -> list[Chunk]:
-        from app.core.errors import UpstreamError
-
         if not chunks:
             return []
         try:
@@ -106,7 +107,12 @@ class TEIReranker:
             r.raise_for_status()
             results = r.json()  # [{"index": i, "score": s}, ...]
         except Exception as exc:  # noqa: BLE001
-            raise UpstreamError(f"TEI rerank failed: {exc}") from exc
+            # FAIL OPEN: reranking is a PRECISION booster, not a correctness
+            # requirement. A rerank-server blip must NOT take down RAG search — fall
+            # back to the vector store's own ordering (already similarity-sorted) and
+            # truncate to top_k. WARNING-logged so the degradation is visible, not silent.
+            _log.warning("TEI rerank failed (%s) — falling back to vector order", exc)
+            return list(chunks[:top_k])
         # Reorder by the cross-encoder's score (best first) and keep top_k. Each
         # surviving chunk's score is overwritten with the reranker's score so
         # downstream sees the better signal; model_copy avoids mutating the input.

@@ -137,8 +137,11 @@ class Settings(BaseSettings):
     # created with.
     embedding_provider: Literal["tei", "openai"] = "tei"
     tei_embed_url: str = "http://localhost:8080"
-    embedding_dim: int = 1024
-    embedding_model: str = "Qwen/Qwen3-Embedding-8B"
+    # QUANT PROFILE (fits a single 24GB GPU): Qwen3-Embedding-4B, native dim 2560.
+    # ~1 MTEB point below the 8B — negligible. ``embedding_dim`` MUST equal what TEI
+    # returns AND the Qdrant collection dim AND the ingest cron's EMBEDDING_DIM.
+    embedding_dim: int = 2560
+    embedding_model: str = "Qwen/Qwen3-Embedding-4B"
     # Qwen3-Embedding (and similar INSTRUCT embedders) expect an instruction prefix on
     # the QUERY side ONLY — documents/chunks are embedded raw (the ingest cron must NOT
     # add it). Off by default ("") so behavior is unchanged; set it ONLY if your TEI
