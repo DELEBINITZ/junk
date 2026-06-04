@@ -94,4 +94,34 @@ def build_tracer(settings):
     return NoOpTracer()
 
 
-__all__ = ["NoOpTracer", "LangfuseTracer", "build_tracer"]
+def build_langfuse_handler(settings):
+    """Return a LangChain/LangGraph ``CallbackHandler`` that AUTO-traces the whole
+    graph — every node, every LLM call, tokens, latency — to Langfuse, or ``None``
+    when tracing isn't configured.
+
+    WHY ALONGSIDE build_tracer: ``build_tracer`` gives manual spans (you wrap what
+    you choose). This handler is the LangSmith-style auto-instrumenter: pass it in
+    the LangGraph invoke ``config`` and the full per-node trace tree appears in the
+    dashboard with zero manual spans. Same config gate as the tracer; same swallow-
+    all-errors posture — observability must never break the request it observes.
+
+    NOTE: this builds its OWN Langfuse client (separate from build_tracer's). The
+    SDK flushes batched events on a background timer and at process exit, so a
+    long-running server ships traces without an explicit flush; nothing is lost."""
+    if settings.tracing_provider != "langfuse" or not settings.langfuse_public_key:
+        return None
+    try:
+        from langfuse.callback import CallbackHandler  # langfuse v2 import path
+
+        return CallbackHandler(
+            host=settings.langfuse_host or None,
+            public_key=settings.langfuse_public_key,
+            secret_key=settings.langfuse_secret_key,
+        )
+    except Exception:
+        # SDK missing / wrong version / bad creds -> no auto-tracing, but the app
+        # runs exactly as before. Tracing is strictly best-effort.
+        return None
+
+
+__all__ = ["NoOpTracer", "LangfuseTracer", "build_tracer", "build_langfuse_handler"]

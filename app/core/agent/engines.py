@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from app.core.observability import build_langfuse_handler
 from app.core.agent.nodes import (
     NODE_SPECS,
     PLANNER_NODE_SPECS,
@@ -131,10 +132,30 @@ class LangGraphEngine:
         # ``compile(checkpointer=...)`` is what enables resumable, persisted runs.
         self._compiled = sg.compile(checkpointer=checkpointer)
 
+        # Auto-trace seam: a Langfuse callback handler (or None when tracing is
+        # off) that LangGraph invokes for every node/LLM step, building the full
+        # per-node trace tree in the dashboard — the LangSmith-style view, self-
+        # hosted. Built ONCE here because the keys are static; the per-run session
+        # /user metadata is attached in run(). ``sc`` is the acting identity, used
+        # to group traces by chat session, user, and tenant.
+        self._lf_handler = build_langfuse_handler(ctx.settings)
+        self._sc = ctx.sc
+
     async def run(self, state: dict, *, thread_id: str) -> dict:
         # ``thread_id`` keys the checkpoint — reuse the same id (we use the chat
         # session id) and LangGraph can associate/resume the run.
         cfg = {"configurable": {"thread_id": thread_id}}
+        # When Langfuse is configured, attach the auto-tracing handler and tag the
+        # run so the dashboard groups this chat session's turns together
+        # (langfuse_session_id) under the acting user/tenant. The langfuse_* keys
+        # are read by the handler; they are inert when no handler is attached.
+        if self._lf_handler is not None:
+            cfg["callbacks"] = [self._lf_handler]
+            cfg["metadata"] = {
+                "langfuse_session_id": thread_id,
+                "langfuse_user_id": self._sc.user_id,
+                "langfuse_tags": [f"org:{self._sc.org_id}", f"engine:{self.name}"],
+            }
         return await self._compiled.ainvoke(state, cfg)
 
 

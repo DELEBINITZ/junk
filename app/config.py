@@ -103,19 +103,26 @@ class Settings(BaseSettings):
     semantic_cache_threshold: float = 0.95
 
     # ---- LLM ---------------------------------------------------------------
-    # The model backend. ``sglang`` is the self-hosted production path; ``openai``
-    # is a hosted/OpenAI-compatible endpoint. A real LLM server is REQUIRED — there
-    # is no offline stub. Three model "lanes" (fast/standard/deep) let cheap steps
-    # (routing, tool planning) use a small model and the answer use a bigger one —
-    # see llm/lanes.py.
-    llm_provider: Literal["sglang", "openai"] = "sglang"
-    # SGLang (OpenAI-compatible) — three lanes
+    # The model backend (all OpenAI-compatible HTTP). A real LLM server is REQUIRED —
+    # there is no offline stub. Three model "lanes" (fast/standard/deep) let cheap
+    # steps (routing, tool planning) use a small model and the answer use a bigger
+    # one — see llm/lanes.py.
+    #   sglang -> self-hosted, serves THREE models (one per lane).
+    #   vllm   -> self-hosted (e.g. one 32B for staging); the three lanes collapse to
+    #             the single served ``vllm_model``.
+    #   openai -> any hosted/OpenAI-compatible endpoint; lanes collapse to one model.
+    llm_provider: Literal["sglang", "vllm", "openai"] = "sglang"
+    # SGLang (OpenAI-compatible) — three lanes, three models
     sglang_base_url: str = "http://localhost:30000/v1"
     sglang_api_key: str = "EMPTY"
     model_fast: str = "Qwen/Qwen2.5-7B-Instruct"
     model_standard: str = "Qwen/Qwen2.5-72B-Instruct"
     model_deep: str = "deepseek-ai/DeepSeek-V3.1"
-    # OpenAI-compatible dev provider (off by default; never for sensitive prod data)
+    # vLLM (OpenAI-compatible) — one served model, all three lanes map to it.
+    vllm_base_url: str = "http://localhost:8000/v1"
+    vllm_api_key: str = "EMPTY"
+    vllm_model: str = "Qwen/Qwen2.5-32B-Instruct"
+    # OpenAI-compatible hosted provider (never for sensitive prod data)
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
@@ -132,6 +139,13 @@ class Settings(BaseSettings):
     tei_embed_url: str = "http://localhost:8080"
     embedding_dim: int = 1024
     embedding_model: str = "Qwen/Qwen3-Embedding-8B"
+    # Qwen3-Embedding (and similar INSTRUCT embedders) expect an instruction prefix on
+    # the QUERY side ONLY — documents/chunks are embedded raw (the ingest cron must NOT
+    # add it). Off by default ("") so behavior is unchanged; set it ONLY if your TEI
+    # server doesn't already apply the instruction, e.g.:
+    #   "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+    # Adding it when the server already does = double instruction = WORSE recall, so verify first.
+    embedding_query_instruction: str = ""
 
     # ---- Retrieval ---------------------------------------------------------
     # The vector store + RAG knobs. ``qdrant`` is the production vector DB and the
@@ -189,13 +203,6 @@ class Settings(BaseSettings):
     # True = fail CLOSED (block on classifier error — the production-safe default for a
     # security product); False = fail OPEN (availability over strictness).
     guardrails_fail_closed: bool = True
-
-    # ---- Memory / knowledge graph -----------------------------------------
-    # Long-term/cross-session memory backend. ``none`` => a NoOp graph (default);
-    # ``zep`` wires a real temporal knowledge-graph service.
-    kg_provider: Literal["none", "zep"] = "none"
-    zep_api_url: str = ""
-    zep_api_key: str = ""
 
     # ---- Agent -------------------------------------------------------------
     # How the agent runs a turn. ``agent_engine`` chooses the built-in graph engine

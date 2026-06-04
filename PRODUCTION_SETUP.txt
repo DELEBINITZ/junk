@@ -137,10 +137,11 @@
      RERANK_TOP_K=6
 
 ------------------------------------------------------------------------------
- 7. SGLANG LLM  (Qwen 7B/72B + DeepSeek; 3 lanes)  — REQUIRED
+ 7. LLM SERVER  (3 lanes)  — REQUIRED   [sglang | vllm | openai]
 ------------------------------------------------------------------------------
  Role: the reasoning model. Three "lanes": FAST (routing/planning/summary),
- STANDARD (answers), DEEP (hard multi-step/cross-domain synthesis).
+ STANDARD (answers), DEEP (hard multi-step/cross-domain synthesis). All three
+ provider options speak the OpenAI-compatible HTTP API.
 
  7.1 Serve an OpenAI-compatible endpoint with SGLang (one model shown; you can run
      several SGLang instances, one per lane, or one endpoint serving multiple ids):
@@ -161,8 +162,18 @@
      actually serves. If you only have one model, point all three at it (the DEEP
      lane simply collapses to it).
 
- 7.3 Alternative (quick start, no GPU): LLM_PROVIDER=openai + OPENAI_API_KEY +
-     OPENAI_MODEL (all lanes collapse to one model). External API — dev only.
+ 7.3 vLLM (e.g. one 32B for STAGING — OpenAI-compatible; all 3 lanes collapse to the
+     single served model):
+     python -m vllm.entrypoints.openai.api_server \
+       --model Qwen/Qwen2.5-32B-Instruct --host 0.0.0.0 --port 8000 --api-key <key>
+     LLM_PROVIDER=vllm
+     VLLM_BASE_URL=http://vllm:8000/v1
+     VLLM_API_KEY=<key>
+     VLLM_MODEL=Qwen/Qwen2.5-32B-Instruct
+
+ 7.4 OpenAI / hosted (quick start, no GPU): LLM_PROVIDER=openai + OPENAI_API_KEY +
+     OPENAI_MODEL (all lanes collapse to one model). External API — not for sensitive
+     prod data.
 
 ------------------------------------------------------------------------------
  8. PROMPT INJECTION GUARDRAIL — LLAMA PROMPT GUARD 2  — REQUIRED in prod

@@ -64,9 +64,8 @@ class Orchestrator:
         input_guard,
         output_guard,
         supervisor,
-        conversations,   # the session/message store (memory or Postgres+RLS)
+        conversations,   # the session/message store (Postgres + RLS)
         summarizer,      # rolls long histories into a short summary
-        kg,              # knowledge-graph memory seam (NoOp by default)
         checkpointer=None,
     ) -> None:
         # All services are INJECTED (built once in bootstrap.py and passed in).
@@ -81,7 +80,6 @@ class Orchestrator:
         self.supervisor = supervisor
         self.conversations = conversations
         self.summarizer = summarizer
-        self.kg = kg
         self.checkpointer = checkpointer
 
     # -- helpers -------------------------------------------------------------
@@ -173,14 +171,9 @@ class Orchestrator:
             sc.org_id, session.id, "assistant", answer, citations=citations,
             meta={"route": route, "flags": flags, "trace_id": trace_id},
         )
-        # 7. Maybe roll the summary (if the session got long) and record a
-        #    long-term memory observation. The KG write is best-effort: a memory
-        #    failure must never break a successful answer, hence the bare except.
+        # 7. Maybe roll the summary (if the session got long) so a long conversation
+        #    stays bounded for the next turn.
         await self._maybe_summarize(sc, session.id)
-        try:
-            await self.kg.add_observation(sc.org_id, sc.user_id, f"Q: {question}\nA: {answer}")
-        except Exception:
-            pass
 
         # 8. Emit the terminal "done" event (streaming) and return the result.
         await ctx.fire("done", answer=answer, citations=citations, session_id=session.id,

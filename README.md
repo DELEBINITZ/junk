@@ -124,7 +124,7 @@ tests/   frontend/   infra/
 ## Security posture (this is a security product)
 
 Multi-tenant isolation at every layer (API key + verified JWT → Postgres RLS →
-vector-store org filter → per-org KG/gate), injection-resistant prompting, secrets
+vector-store org filter → per-org action gate), injection-resistant prompting, secrets
 redaction, **all side-effecting actions human-gated**, append-only audit. Remote MCP
 calls carry a short-lived, audience-bound, org-scoped service token. Asset
 domains/IPs are treated as subjects, not PII. Details in `ARCHITECTURE.md` §6.

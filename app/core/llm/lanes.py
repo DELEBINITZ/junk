@@ -86,11 +86,11 @@ class LaneRouter:
 def build_llm(settings: Settings) -> LaneRouter:
     """Construct the configured LLM client and wrap it in a LaneRouter.
 
-    The ``llm_provider`` setting selects one of two real backends. The HTTP client
-    import is deferred so it's only loaded when build_llm actually runs.
+    The ``llm_provider`` setting selects one of three real backends (sglang / vllm /
+    openai). The HTTP client import is deferred so it's only loaded at build time.
     """
     provider = settings.llm_provider
-    # Both providers speak the SAME OpenAI-compatible HTTP API, so they share one
+    # All providers speak the SAME OpenAI-compatible HTTP API, so they share one
     # client class and differ only in URL/keys and the lane->model map.
     from app.core.llm.openai_compat import OpenAICompatClient
 
@@ -107,6 +107,21 @@ def build_llm(settings: Settings) -> LaneRouter:
                 Lane.DEEP: settings.model_deep,
             },
             provider="sglang",
+            default_temperature=settings.llm_temperature,
+            default_max_tokens=settings.llm_max_tokens,
+            timeout=settings.llm_timeout_seconds,
+        )
+        return LaneRouter(client)
+
+    if provider == "vllm":
+        # vLLM (self-hosted, OpenAI-compatible) typically serves ONE model per
+        # server (e.g. a 32B for staging), so all three lanes map to that single
+        # ``vllm_model`` — the tiers collapse, same as the openai case.
+        client = OpenAICompatClient(
+            base_url=settings.vllm_base_url,
+            api_key=settings.vllm_api_key,
+            lane_models={lane: settings.vllm_model for lane in Lane},
+            provider="vllm",
             default_temperature=settings.llm_temperature,
             default_max_tokens=settings.llm_max_tokens,
             timeout=settings.llm_timeout_seconds,

@@ -6,16 +6,15 @@ validates each cartridge against the core contract, and builds an index of what
 the platform can do. From then on the registry is the authority that answers two
 different questions:
 
-  * "what is installed?"  -> every loaded module, its tools, retrievers, ontology
-    (used to wire the system: routing, ingestion, the KG).
+  * "what is installed?"  -> every loaded module, its tools and retrievers (used to
+    wire routing + the agent surface).
   * "what may THIS caller see?"  -> :meth:`capability_view`, a per-(org, roles)
     slice filtered by entitlement/license AND RBAC. This is the security-relevant
     one: two callers hit the same registry and get DIFFERENT visible tool sets.
 
-Everything is COMPUTED from manifests, never hardcoded — the supervisor's routing
-hints, each org's visible tools, RBAC role requirements, and the merged ontology
-all derive from what modules declared. Adding a feature = dropping in a module
-dir; no core edit. (Blueprint file 15.)
+Everything is COMPUTED from manifests, never hardcoded — routing (by meaning), each
+org's visible tools, and RBAC role requirements all derive from what modules
+declared. Adding a feature = dropping in a module dir; no core edit.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ from pathlib import Path
 from app.core.contracts import (
     CONTRACTS_VERSION,
     CapabilityManifest,
-    OntologyContribution,
     Retriever,
     Tool,
     role_satisfies,
@@ -99,10 +97,6 @@ class CapabilityRegistry:
 
     def __init__(self) -> None:
         self._modules: dict[str, RegisteredModule] = {}      # id -> loaded module
-        # The merged knowledge-graph schema, accumulated as modules register their
-        # ontology slices. Node names map to their key tuple; edges are flat triples.
-        self._ontology_nodes: dict[str, tuple[str, ...]] = {}
-        self._ontology_edges: list[tuple[str, str, str]] = []
 
     # -- registration --------------------------------------------------------
     def register(self, manifest: CapabilityManifest, *, enabled: bool, module_pkg: str = "") -> RegisteredModule:
@@ -114,7 +108,7 @@ class CapabilityRegistry:
           * module ids must be unique, and tool names unique within a module;
           * every RBAC override must name a real tool.
         On success it stamps each tool with its owning ``module_id``, resolves the
-        specialist prompt, folds in any ontology, and stores a RegisteredModule.
+        specialist prompt, and stores a RegisteredModule.
         """
         if _version_tuple(manifest.min_core_version) > _version_tuple(CONTRACTS_VERSION):
             raise RegistryError(
@@ -146,8 +140,6 @@ class CapabilityRegistry:
 
         retrievers = {r.id: r for r in manifest.retrievers}
         prompt_text = self._load_prompt(manifest, module_pkg)
-        if manifest.ontology:
-            self._merge_ontology(manifest.id, manifest.ontology)   # contribute KG schema
 
         mod = RegisteredModule(manifest=manifest, enabled=enabled, tools=tools,
                                retrievers=retrievers, prompt_text=prompt_text)
@@ -170,23 +162,6 @@ class CapabilityRegistry:
         except Exception:
             pass
         return f"You are the {manifest.display_name} specialist. Answer only from retrieved, cited sources."
-
-    def _merge_ontology(self, module_id: str, contrib: OntologyContribution) -> None:
-        """Fold one module's ontology slice into the shared knowledge-graph schema.
-        Different modules contribute different node/edge types (easm adds Asset,
-        aci adds ThreatActor, ...); the registry is where those slices MERGE into
-        one schema. A node type defined by two modules with DIFFERENT keys is a
-        real conflict (the graph couldn't join them) so we raise; edges just
-        accumulate. This keeps the cross-module KG coherent."""
-        for n in contrib.nodes:
-            existing = self._ontology_nodes.get(n.name)
-            if existing is not None and existing != n.keys:
-                raise RegistryError(
-                    f"ontology collision on node '{n.name}' (module '{module_id}'): keys differ"
-                )
-            self._ontology_nodes[n.name] = n.keys
-        for e in contrib.edges:
-            self._ontology_edges.append((e.src, e.relation, e.dst))
 
     # -- discovery -----------------------------------------------------------
     def discover(self, settings) -> CapabilityRegistry:
@@ -243,12 +218,6 @@ class CapabilityRegistry:
             if tool_name in m.tools:
                 return m, m.tools[tool_name]
         return None
-
-    @property
-    def ontology(self) -> dict:
-        """The merged knowledge-graph schema across all modules (a copy, so callers
-        can't mutate the registry's internals)."""
-        return {"nodes": dict(self._ontology_nodes), "edges": list(self._ontology_edges)}
 
     # -- per-org view (entitlement + RBAC, computed not coded) ---------------
     def _entitled(self, module: RegisteredModule, sc: SecurityContext) -> bool:

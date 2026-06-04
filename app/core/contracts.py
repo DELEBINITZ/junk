@@ -355,32 +355,6 @@ SpecialistFactory = Callable[..., Specialist]
 
 
 # --------------------------------------------------------------------------- #
-# Ontology — the KG slice a module contributes
-# --------------------------------------------------------------------------- #
-# These describe the entity/relationship TYPES a module adds to the shared
-# knowledge graph (e.g. easm contributes Asset nodes; aci contributes ThreatActor
-# nodes and a "weaponizes" edge). The KG join across modules is a future feature;
-# the types are declared now so modules can carry their slice.
-@dataclass(frozen=True)
-class NodeType:
-    name: str
-    keys: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class EdgeType:
-    src: str
-    relation: str
-    dst: str
-
-
-@dataclass(frozen=True)
-class OntologyContribution:
-    nodes: tuple[NodeType, ...] = ()
-    edges: tuple[EdgeType, ...] = ()
-
-
-# --------------------------------------------------------------------------- #
 # Action handler — gated side effects (interface now, handlers later)
 # --------------------------------------------------------------------------- #
 class ActionPreview(BaseModel):
@@ -426,8 +400,8 @@ class CapabilityManifest:
 
     Every field maps to a core subsystem:
       tools/retrievers/specialist -> the agent & RAG          description+tools -> supervisor
-      rbac/default_autonomy       -> the MCP boundary & gate  ontology          -> the KG
-      action_handlers             -> the action gate           enabled_flag      -> deployment
+      rbac/default_autonomy       -> the MCP boundary & gate  enabled_flag      -> deployment
+      action_handlers             -> the action gate
 
     ROUTING is DYNAMIC: the supervisor/planner decide which module(s) answer a
     question by MEANING — embedding similarity over each module's ``display_name``
@@ -451,7 +425,6 @@ class CapabilityManifest:
     system_prompt: str = ""         # path (relative to the module dir) to a prompt file
     default_autonomy: Autonomy = Autonomy.READ
     rbac: Mapping[str, str] = field(default_factory=dict)  # tool_name -> min role override
-    ontology: OntologyContribution | None = None
     action_handlers: tuple[ActionHandler, ...] = ()
 
     min_core_version: str = "1.0.0"   # the registry checks this against CONTRACTS_VERSION
@@ -475,7 +448,6 @@ class CoreDeps:
     rag: Any            # app.core.rag.pipeline.RetrievalPipeline
     registry: Any       # app.core.registry.CapabilityRegistry
     conversations: Any  # session/message store
-    kg: Any             # app.core.memory.kg.KnowledgeGraph (NoOp default)
     action_gate: Any    # app.core.action_gate.gate.ActionGate
     tracer: Any         # observability tracer (NoOp default)
     logger: Any
@@ -499,9 +471,6 @@ __all__ = [
     "Specialist",
     "SpecialistResult",
     "SpecialistFactory",
-    "NodeType",
-    "EdgeType",
-    "OntologyContribution",
     "ActionPreview",
     "ActionResult",
     "ActionHandler",

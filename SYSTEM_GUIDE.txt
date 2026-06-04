@@ -81,7 +81,7 @@ Entry: POST /v1/chat  (or GET /v1/chat/stream for SSE)   api/chat_router.py:56
     |
     v [4] PERSIST + RESPOND                      orchestrator.py
           - persist assistant message (+ citations + routing meta)
-          - roll summary if long; record a memory observation (kg seam)
+          - roll summary if long (keeps a long conversation bounded)
           - return TurnResult (POST) or emit `done` event (SSE)
 
 Subsystems touched in ONE turn (the "connected" view):
@@ -452,7 +452,7 @@ Both run the IDENTICAL node set; switching is one flag.
  app/core/rag/qdrant_backend.py  Qdrant vector store (org-filtered search)
  app/core/guardrails/         input/output spine + detectors (regex + providers)
  app/core/action_gate/        human approval inbox for side-effecting tools
- app/core/memory/             sessions + messages + rolling summary + KG seam
+ app/core/memory/             sessions + messages + rolling summary
  app/capabilities/reports/    full RAG module (corpus + tools + seed)
  app/capabilities/easm/       tool-backed module (tools incl. gated rescan + count)
  app/capabilities/brand|aci/  stub modules (flip flag / point at MCP)

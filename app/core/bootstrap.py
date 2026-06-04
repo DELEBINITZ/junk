@@ -9,7 +9,7 @@ testable). Read top to bottom and you see the entire object graph being built:
     config (Settings)  ->  build_services()  ->  AppServices bundle
                                 |
         logging/metrics/tracer  |  registry (discovers capability modules)
-        llm / rag / kg / store  |  mcp boundary  +  supervisor  +  orchestrator
+        llm / rag / store       |  mcp boundary  +  supervisor  +  orchestrator
 
 WHY IT STAYS FEATURE-AGNOSTIC: nothing here names a specific capability (reports,
 easm, aci, ...). Modules are DISCOVERED by the registry from disk and ENABLED by
@@ -34,7 +34,7 @@ from app.core.contracts import CoreDeps
 from app.core.guardrails import build_input_guardrails, build_output_guardrails
 from app.core.llm import build_llm
 from app.core.mcp import InProcessMCPClient
-from app.core.memory import RollingSummarizer, build_conversation_store, build_kg
+from app.core.memory import RollingSummarizer, build_conversation_store
 from app.core.observability import build_tracer, configure_logging, get_logger, get_metrics
 from app.core.observability.audit import build_audit_logger
 from app.core.rag import build_rag
@@ -60,7 +60,6 @@ class AppServices:
     summarizer: RollingSummarizer
     llm: Any
     rag: Any
-    kg: Any
     action_gate: ActionGate
     input_guard: Any
     output_guard: Any
@@ -75,7 +74,7 @@ class AppServices:
         (HTTP clients, DB pools, tracer flush). Best-effort and order-tolerant —
         we swallow per-service errors so one stubborn handle can't block the
         rest of shutdown. Called from the FastAPI lifespan's ``finally``."""
-        for c in (self.llm, self.rag, self.conversations, self.kg, self.mcp, self.tracer):
+        for c in (self.llm, self.rag, self.conversations, self.mcp, self.tracer):
             close = getattr(c, "aclose", None)   # duck-typed: only close what can be closed
             if close:
                 try:
@@ -142,7 +141,7 @@ def build_services(settings: Settings) -> AppServices:
 
       1. observability first (logging/metrics/tracer) so everything after can log;
       2. the registry DISCOVERS capability modules (reports/easm/...) from disk;
-      3. the config-gated backends (llm, rag, kg, store) — each is the
+      3. the config-gated backends (llm, rag, store) — each is the
          deterministic default or the real backend purely per config.py;
       4. bundle those into ``CoreDeps`` (the bag injected into every tool call);
       5. build the boundaries/agent — the MCP tool boundary (RBAC + action gate),
@@ -166,7 +165,6 @@ def build_services(settings: Settings) -> AppServices:
     #    hosted default unless config.py points it at a real backend.
     llm = build_llm(settings)
     rag = build_rag(settings)
-    kg = build_kg(settings)
     conversations = build_conversation_store(settings)
     summarizer = RollingSummarizer(llm)               # compresses old turns into a running summary
     action_gate = build_action_gate(settings)         # holds side-effecting actions for human approval
@@ -176,7 +174,7 @@ def build_services(settings: Settings) -> AppServices:
     #    without importing anything global — the dependency-injection seam.
     deps = CoreDeps(
         settings=settings, llm=llm, rag=rag, registry=registry, conversations=conversations,
-        kg=kg, action_gate=action_gate, tracer=tracer, logger=logger,
+        action_gate=action_gate, tracer=tracer, logger=logger,
     )
     # 5. The MCP client is the SINGLE chokepoint every tool call passes through; it
     #    enforces RBAC and routes side-effecting tools to the action gate. The
@@ -194,7 +192,7 @@ def build_services(settings: Settings) -> AppServices:
         settings=settings, registry=registry, deps=deps, mcp=mcp,
         input_guard=build_input_guardrails(settings), output_guard=build_output_guardrails(settings),
         supervisor=supervisor, conversations=conversations, summarizer=summarizer,
-        kg=kg, checkpointer=checkpointer,
+        checkpointer=checkpointer,
     )
 
     # One structured "ready" line naming exactly which modules went live — the
@@ -208,7 +206,7 @@ def build_services(settings: Settings) -> AppServices:
     return AppServices(
         settings=settings, registry=registry, deps=deps, mcp=mcp, orchestrator=orchestrator,
         supervisor=supervisor, conversations=conversations, summarizer=summarizer, llm=llm,
-        rag=rag, kg=kg, action_gate=action_gate,
+        rag=rag, action_gate=action_gate,
         input_guard=orchestrator.input_guard, output_guard=orchestrator.output_guard,
         tracer=tracer, metrics=metrics, logger=logger,
         audit=build_audit_logger(settings, logger),

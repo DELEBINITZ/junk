@@ -23,7 +23,7 @@ adds routing targets without touching core or this file.
 
 from __future__ import annotations
 
-from app.capabilities.reports.tools import TOOLS
+from app.capabilities.reports.tools import TOOLS, REPORTS_VISIBILITY
 from app.core.contracts import Autonomy, CapabilityManifest
 from app.core.rag.pipeline import CollectionRetriever
 
@@ -44,8 +44,12 @@ REPORTS_COLLECTION = "reports_kb"
 # (specialist.py) calls ``retrieve`` on this during ``_retrieve`` to gather corpus
 # evidence; tenant scoping is applied from the trusted ToolContext, never the query.
 # This is a pure READ against Qdrant — the documents were written by the external cron.
+# ``visibility="shared"``: this corpus is cross-tenant shared intel — a report is
+# visible when it is public (no ``customer_tags``) OR allow-listed for the caller's
+# org. NOT the default hard org_id isolation (which still guards private corpora).
 _retriever = CollectionRetriever(
-    id="reports_kb_retriever", collection=REPORTS_COLLECTION, source="reports"
+    id="reports_kb_retriever", collection=REPORTS_COLLECTION, source="reports",
+    visibility=REPORTS_VISIBILITY,
 )
 
 # The cartridge itself. Each field below maps to a core subsystem that the

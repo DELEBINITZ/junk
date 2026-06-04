@@ -26,6 +26,13 @@ from pydantic import BaseModel, Field
 from app.core.contracts import ToolContext, ToolError, ToolResult, tool
 from app.core.rag.vector_store import SearchFilters
 
+# This corpus is SHARED INTEL: one report is visible to many orgs via an allow-list
+# (``customer_tags``), with empty/absent tags meaning public to all. So every read
+# path here uses ``visibility="shared"`` instead of the default hard org_id isolation.
+# Defined ONCE so the three tools below and the bound retriever (manifest.py) can't
+# drift apart — if they disagree, some queries silently return nothing.
+REPORTS_VISIBILITY = "shared"
+
 
 # Each tool declares its arguments as a pydantic model. The platform gets free
 # validation AND a JSON schema from it: the schema is what is advertised to the
@@ -61,6 +68,7 @@ async def get_report_metadata(args: MetadataArgs, ctx: ToolContext):
     chunks = await ctx.deps.rag.retrieve(
         args.doc_id, collection="reports_kb", ctx=ctx, top_k=25,
         filters=SearchFilters(doc_ids=[args.doc_id]), apply_time_filters=False,
+        visibility=REPORTS_VISIBILITY,
     )
     # FAILURE as a value, not an exception: unknown/forbidden doc -> a ToolError the
     # agent receives like any other result and reasons about, instead of crashing.
@@ -91,6 +99,7 @@ async def find_expiring_items(args: ExpiringArgs, ctx: ToolContext):
     # over the corpus for time-sensitive language; we keep the top few hits.
     chunks = await ctx.deps.rag.retrieve(
         args.query, collection="reports_kb", ctx=ctx, top_k=6, apply_time_filters=False,
+        visibility=REPORTS_VISIBILITY,
     )
     items = [{"doc_id": c.doc_id, "title": c.title, "snippet": c.text[:200],
               "published_at": c.published_at} for c in chunks]
@@ -128,7 +137,8 @@ async def search_reports(args: SearchArgs, ctx: ToolContext):
     # Same org-scoped pipeline the bound retriever uses (org_id from ctx, never args),
     # just reachable as a callable tool. Returns a hit count + doc ids as structured
     # data plus the passages as citations the answer can ground on.
-    chunks = await ctx.deps.rag.retrieve(args.query, collection="reports_kb", ctx=ctx, top_k=args.top_k)
+    chunks = await ctx.deps.rag.retrieve(args.query, collection="reports_kb", ctx=ctx,
+                                         top_k=args.top_k, visibility=REPORTS_VISIBILITY)
     if not chunks:
         return ToolResult(data={"hits": 0}, citations=[])
     return ToolResult(
