@@ -85,17 +85,20 @@ class FastMCPRemote:
         token_for_ctx=None,
         token_for_sc=None,
         timeout: float = 30.0,
+        api_key: str = "",
     ) -> None:
         self._target = target              # a server URL, or a FastMCP server object (tests)
         self._token_for_ctx = token_for_ctx
         self._token_for_sc = token_for_sc
         self._timeout = timeout
+        self._api_key = api_key            # transport API key (X-API-Key header); "" => none
 
     def _client(self, token: str):
         """Build a FastMCP Client for one call. ``fastmcp`` is imported here (lazy)
         so it's only required when a remote module is actually configured. For a
-        URL target we attach the org-scoped Bearer token; for an in-memory server
-        object (tests) we connect directly."""
+        URL target we attach the org-scoped Bearer token (identity) and, when set,
+        the ``X-API-Key`` transport header; for an in-memory server object (tests)
+        we connect directly."""
         from fastmcp import Client
 
         if isinstance(self._target, str):
@@ -107,6 +110,14 @@ class FastMCPRemote:
                     auth = BearerAuth(token)
                 except Exception:  # noqa: BLE001 - older fastmcp: fall back to no auth helper
                     auth = None
+            # Pass the API key as a custom header when supported; degrade gracefully on
+            # older fastmcp builds whose Client doesn't accept ``headers``.
+            if self._api_key:
+                try:
+                    return Client(self._target, auth=auth, timeout=self._timeout,
+                                  headers={"X-API-Key": self._api_key})
+                except TypeError:  # older Client signature without headers=
+                    pass
             return Client(self._target, auth=auth, timeout=self._timeout)
         # In-memory transport: hand the Client the server object directly (no network).
         return Client(self._target)

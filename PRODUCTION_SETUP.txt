@@ -45,12 +45,21 @@
  Role: stores sessions + messages. Tenant isolation is enforced at the DB via RLS
  (org_id), on top of the app-layer checks (defense in depth).
 
- 2.1 Provision Postgres 15+ (managed RDS/Cloud SQL or self-hosted). Create the DB:
+ 2.1 Provision Postgres 15+ (managed RDS/Cloud SQL or self-hosted). Create the DB
+     and a DEDICATED APP ROLE that is **NOSUPERUSER NOBYPASSRLS** — this is
+     load-bearing: FORCE ROW LEVEL SECURITY does NOT apply to a superuser or a
+     BYPASSRLS role, and the store SELECTs rely entirely on RLS (no WHERE org_id).
+     Connect the app as this role, NEVER as `postgres`/an admin:
      CREATE DATABASE asi;
-     CREATE ROLE asi_app LOGIN PASSWORD '<strong>';
-     GRANT ALL PRIVILEGES ON DATABASE asi TO asi_app;
+     CREATE ROLE asi_app LOGIN PASSWORD '<strong>' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+     GRANT CONNECT ON DATABASE asi TO asi_app;
+     -- after migrations run (they create the tables), grant table privileges:
+     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO asi_app;
+     GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO asi_app;
+     -- run the migrations as a role that CAN create tables/policies (admin/owner),
+     -- then run the app as asi_app. Do not migrate AND serve as the same superuser.
 
- 2.2 Connection string -> DATABASE_URL:
+ 2.2 Connection string -> DATABASE_URL (the app role, not an admin):
      DATABASE_URL=postgresql://asi_app:<pw>@<host>:5432/asi
 
  2.3 Run migrations (creates tables + RLS policies). The app ships a migrator
@@ -62,6 +71,11 @@
      enforces "an org sees only its own rows". The session variable name is
      RLS_SETTING_NAME (default: app.organization_id). The migrator wires the
      policies; do not disable RLS in prod.
+     BOOT SELF-TEST: at startup the app PROVES isolation holds — it rejects a
+     SUPERUSER/BYPASSRLS connection role, checks RLS is ENABLED+FORCED on every
+     tenant table, and runs a live (rolled-back) cross-org probe. In prod a failure
+     REFUSES TO BOOT; in dev it logs a warning. If boot fails here, fix the DB role
+     (§2.1) — do not work around it.
 
  2.5 Connection pool: DB_POOL_MIN / DB_POOL_MAX (defaults 1/10). Size to
      (workers x per-worker concurrency). Put PgBouncer in front for many workers.
@@ -82,15 +96,30 @@
 
  3.2 Collection contract (the cron creates this; the app expects it to exist):
      - name: reports_kb  (matches REPORTS_COLLECTION)
-     - vector size: EMBEDDING_DIM (default 1024) — MUST match the embedder (§5)
+     - vector size: EMBEDDING_DIM (default 2560) — MUST match the embedder (§5)
      - distance: Cosine
-     - payload MUST include: org_id (string), text, source, doc_id, title,
-       published_at (ISO-8601), section, metadata
-     - create a payload index on org_id (keyword) for fast tenant-filtered search.
+     - payload MUST include: text, source, doc_id, title, published_at (ISO-8601),
+       section, metadata
+     - SHARED-corpus visibility (reports_kb is cross-tenant) — payload carries:
+         * customer_tags (keyword array): orgs explicitly allow-listed for this doc.
+           ABSENT/[] => PUBLIC to every org (the public-KB model, default policy).
+         * public (bool): explicit "visible to EVERY org" marker (set from TLP:CLEAR/
+           WHITE) — makes a doc public even under the strict policy below.
+       payload indexes: customer_tags (keyword), public (bool), doc_id, source,
+       published_at — the cron (§4) creates these.
+     - For a PRIVATE, single-owner corpus instead, payload carries org_id (keyword,
+       indexed) and the app searches it with visibility="tenant" (hard org_id match).
 
- 3.3 Tenant isolation: every search the app issues is hard-filtered by org_id
-     (mandatory `must` match), taken from the verified token — never the query.
-     Therefore every point the cron writes MUST carry the correct org_id.
+ 3.3 Shared-corpus visibility (from the verified token's org, NEVER the query):
+     a doc is returned if customer_tags contains the caller's org_id, OR it is
+     explicitly public, OR — under the DEFAULT policy SHARED_UNTAGGED_PUBLIC=true —
+     it has no customer_tags (untagged == public to everyone; the public-knowledge-
+     base model for genuinely shareable threat intel).
+     >>> SECURITY TRADE-OFF: with the default, a customer-scoped report that the
+     feed FORGOT to tag becomes visible to ALL tenants. If reports_kb can ever hold
+     customer-private data, set SHARED_UNTAGGED_PUBLIC=false — then an untagged doc
+     is visible to NO tenant (fail-closed) and only customer_tags / public grant
+     access. Private corpora are always hard-scoped by org_id regardless.
 
 ------------------------------------------------------------------------------
  4. THE REPORTS INGESTION CRON  (EXTERNAL — you operate it; NOT this app)
@@ -277,12 +306,34 @@
 ------------------------------------------------------------------------------
  Promote a capability module to its own MCP server with ZERO code edits:
       MCP_URLS={"easm":"http://easm-mcp:8000/mcp","aci":"http://aci-mcp:8000/mcp"}
- The app mints a short-lived, org-scoped, audience-bound service token per call.
+ Enable the module's flag (e.g. CAP_EASM_ENABLED=true) alongside its URL.
+
+ AUTH — two layers (both REQUIRED in prod when a remote server is wired):
+   1. TRANSPORT (API key) — the standard "is this my trusted core calling?" gate.
+      The client sends ``X-API-Key``; the server checks it (constant-time). Set it:
+        MCP_API_KEY=<strong shared key>            # one key for all servers, OR
+        MCP_API_KEYS={"easm":"<k1>","aci":"<k2>"}  # per-server keys (preferred)
+      and configure the SAME key on each server. The prod boot guard refuses to
+      start if a remote module has no API key.
+   2. IDENTITY (signed service token) — the app mints a short-lived, org-scoped,
+      audience-bound token per call (Bearer). The server re-derives org/roles from
+      it (never from args), so tenant isolation holds across the wire.
+      OPTIONAL HARDENING (recommended): make the service token ASYMMETRIC so a
+      compromised server can't mint tokens — the CORE signs with a private key, each
+      server holds only the public key:
+        JWT_SERVICE_PRIVATE_KEY=<PEM>   # core only
+        JWT_SERVICE_PUBLIC_KEY=<PEM>    # the MCP server(s) only
+        JWT_SERVICE_ALGORITHM=RS256
+      Leave the keypair unset to fall back to the shared HS256 secret (fine when the
+      API key + network boundary are your trust anchors).
+
  Your MCP server MUST:
-   - verify that Bearer token (audience = "<module>-mcp"; org from claims),
+   - require the X-API-Key (layer 1) and verify the Bearer SERVICE token
+     (type="service", audience = "<module>-mcp", org from claims),
    - return tool results in {data, citations} shape (so the agent gets citations),
    - declare side-effecting tools so the human action gate applies.
- Enable the module's flag (e.g. CAP_EASM_ENABLED=true) alongside its URL.
+ (If you build the server with this repo's make_mcp_app, pass
+  ``audience="<module>-mcp", api_key="<the key>"`` and both layers are enforced.)
 
 ------------------------------------------------------------------------------
  16. ENV VARS YOU ACTUALLY SET (prod) — quick reference

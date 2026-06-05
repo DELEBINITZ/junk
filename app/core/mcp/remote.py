@@ -56,11 +56,13 @@ class RemoteMCPClient:
         token_for_sc: SCTokenProvider,
         *,
         timeout: float = 30.0,
+        api_key: str = "",
     ) -> None:
         self._base_url = base_url.rstrip("/")   # the remote MCP server's address
         self._token_for_ctx = token_for_ctx     # mint a service token for tool CALLS
         self._token_for_sc = token_for_sc       # mint a service token for tool LISTING
         self._timeout = timeout
+        self._api_key = api_key                 # transport API key (X-API-Key); "" => none
         self._client = None                     # lazy httpx.AsyncClient (see _http)
 
     def _http(self):
@@ -78,10 +80,10 @@ class RemoteMCPClient:
         the org-scoped service token as a bearer credential, and parses the reply
         back into a typed JSONRPCResponse."""
         payload = {"jsonrpc": "2.0", "id": uuid.uuid4().hex, "method": method, "params": params}
-        r = await self._http().post(
-            f"{self._base_url}/mcp", json=payload,
-            headers={"Authorization": f"Bearer {token}"},   # identity travels here, not in params
-        )
+        headers = {"Authorization": f"Bearer {token}"}      # identity travels here, not in params
+        if self._api_key:
+            headers["X-API-Key"] = self._api_key            # transport gate (server checks it)
+        r = await self._http().post(f"{self._base_url}/mcp", json=payload, headers=headers)
         r.raise_for_status()
         return JSONRPCResponse(**r.json())
 

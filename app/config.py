@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     jwt_secret: str = _DEV_JWT_SECRET  # CHANGE in prod — the prod guard enforces this
     jwt_algorithm: str = "HS256"
     access_token_ttl_seconds: int = 3600
+    # SERVICE tokens (remote MCP). When a keypair is set, service tokens are signed
+    # with the PRIVATE key (CORE process only) and verified with the PUBLIC key (a
+    # promoted MCP server holds ONLY this) — so a remote server CANNOT mint tokens for
+    # any org. Leave empty to fall back to the shared HS256 secret (in-process/dev
+    # only); the prod guard REQUIRES the keypair once a remote MCP server is wired.
+    jwt_service_private_key: str = ""   # PEM (or its contents); CORE process only
+    jwt_service_public_key: str = ""    # PEM; the MCP server process holds ONLY this
+    jwt_service_algorithm: str = "RS256"
 
     # ---- Stores ------------------------------------------------------------
     # Where conversations/sessions persist. ``memory`` is in-process (zero infra);
@@ -166,6 +174,12 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     retrieval_top_k: int = 20
+    # SHARED-corpus visibility policy. True (default) = a shared-corpus document with
+    # NO customer_tags is PUBLIC to every org (the public-knowledge-base model — e.g.
+    # CERT/ACI threat-intel advisories). Set False ONLY for a corpus that mixes
+    # customer-scoped data, to make untagged docs visible to NO tenant (fail-closed),
+    # so a missing tag upstream cannot leak one org's data to another.
+    shared_untagged_public: bool = True
     rerank_enabled: bool = False
     rerank_provider: Literal["none", "tei"] = "none"
     tei_rerank_url: str = "http://localhost:8081"
@@ -273,6 +287,13 @@ class Settings(BaseSettings):
     easm_mcp_url: str = ""
     brand_mcp_url: str = ""
     aci_mcp_url: str = ""
+    # REMOTE MCP TRANSPORT AUTH (API key). The standard "is this my trusted core
+    # calling?" gate: the client sends ``X-API-Key`` and the server checks it. This
+    # is SEPARATE from the identity (the org/user still ride in the signed service
+    # token). ``mcp_api_keys`` maps module_id -> key; ``mcp_api_key`` is the shared
+    # fallback for all servers. Required in prod once a remote MCP server is wired.
+    mcp_api_key: str = ""
+    mcp_api_keys: dict[str, str] = Field(default_factory=dict)
     # Utility module backed by the external `mcp-test-kits` MCP server. Empty =>
     # the testkit module runs its LOCAL stub tools; set to e.g.
     # http://localhost:3000/mcp to route execution to the real server.
@@ -410,6 +431,27 @@ class Settings(BaseSettings):
         ):
             if enabled and not url:
                 bad.append(f"{var} not set while its module is enabled — would serve mock data")
+        # When a REMOTE MCP server is wired, calls cross a process boundary, so the
+        # TRANSPORT must be authenticated: the client proves it's the trusted core via
+        # an API key (X-API-Key) the server checks. Require it in prod for EVERY remote
+        # module — without it, anyone who can reach the server could drive its tools.
+        # (The org/user identity additionally rides in the signed service token; an
+        # asymmetric service keypair — JWT_SERVICE_PRIVATE/PUBLIC_KEY — is recommended
+        # extra hardening so a compromised server also can't mint tokens, but the API
+        # key is the mandatory floor.)
+        remote_modules = [
+            (mid, _url) for mid, _url in (
+                ("easm", self.easm_mcp_url), ("brand", self.brand_mcp_url),
+                ("aci", self.aci_mcp_url), ("testkit", getattr(self, "testkit_mcp_url", "")),
+                *self.mcp_urls.items(),
+            ) if _url
+        ]
+        for mid, _url in remote_modules:
+            if not self.mcp_api_key_for(mid):
+                bad.append(
+                    f"remote MCP server for '{mid}' is configured but no API key is set — "
+                    f"set MCP_API_KEY (shared) or MCP_API_KEYS['{mid}'] so the server can "
+                    f"authenticate the caller (and pass the same key to the server)")
         if bad:
             raise ValueError(
                 "ENVIRONMENT=prod but insecure/incomplete configuration detected. Fix:\n  - "
@@ -420,6 +462,12 @@ class Settings(BaseSettings):
     @property
     def is_prod(self) -> bool:
         return self.environment == "prod"
+
+    def mcp_api_key_for(self, module_id: str) -> str:
+        """The transport API key to use for a module's remote MCP server: the
+        per-module entry if set, else the shared ``mcp_api_key`` fallback, else ""
+        (no key configured => the server won't require one)."""
+        return (self.mcp_api_keys.get(module_id) or self.mcp_api_key or "").strip()
 
 
 @lru_cache(maxsize=1)

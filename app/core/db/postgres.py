@@ -85,6 +85,93 @@ class PostgresDatabase:
                 )                                       # arm RLS for this transaction
                 yield conn
 
+    async def verify_rls_isolation(self) -> None:
+        """Boot-time PROOF that tenant isolation actually holds at the database.
+
+        ``FORCE ROW LEVEL SECURITY`` does NOT apply to a Postgres SUPERUSER or a role
+        with the BYPASSRLS attribute — and the store SELECTs deliberately omit
+        ``WHERE org_id`` (they rely entirely on RLS). So pointing ``DATABASE_URL`` at
+        such a role silently returns EVERY tenant's rows with no error and no log.
+        This self-test turns that misconfiguration into a loud failure. Three checks:
+
+          1. the connecting role is neither SUPERUSER nor BYPASSRLS;
+          2. RLS is ENABLED and FORCED on each tenant table (migrations actually ran);
+          3. a LIVE probe: a row written under org 'A' is INVISIBLE under org 'B' —
+             run inside a transaction that is ALWAYS rolled back, so the probe row
+             never persists.
+
+        Raises ``ConfigError`` on any failure. The caller decides whether that is
+        fatal (prod: refuse to boot) or a warning (dev)."""
+        import uuid
+
+        from app.core.errors import ConfigError
+
+        if self._pool is None:
+            await self.open()
+        tenant_tables = ("chat_sessions", "chat_messages", "audit_log")
+
+        async with self._pool.connection() as conn:
+            # 1. The connecting role must not bypass RLS.
+            cur = await conn.execute(
+                "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user"
+            )
+            role = await cur.fetchone()
+            if role and (role[0] or role[1]):
+                raise ConfigError(
+                    "DATABASE_URL connects as a SUPERUSER or BYPASSRLS role — Row-Level "
+                    "Security (tenant isolation) does NOT apply to such roles, so every "
+                    "tenant's rows would be returned. Create a dedicated app role with "
+                    "NOSUPERUSER NOBYPASSRLS and connect as that (see PRODUCTION_SETUP.txt §2.1)."
+                )
+            # 2. RLS enabled + forced on every tenant table.
+            cur = await conn.execute(
+                "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
+                "WHERE relname = ANY(%s)", (list(tenant_tables),)
+            )
+            state = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+            for t in tenant_tables:
+                enabled, forced = state.get(t, (False, False))
+                if not (enabled and forced):
+                    raise ConfigError(
+                        f"Row-Level Security is not ENABLED+FORCED on '{t}'. Run the "
+                        f"migrations (asi-migrate) before serving — tenant isolation "
+                        f"depends on it."
+                    )
+
+        # 3. Live cross-org probe, always rolled back so nothing persists.
+        probe_id = f"__rls_probe_{uuid.uuid4().hex}"
+        org_a, org_b = "__rls_probe_org_a", "__rls_probe_org_b"
+        leaked = False
+
+        class _Rollback(Exception):
+            pass
+
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.transaction():
+                    await conn.execute("SELECT set_config(%s, %s, true)", (self.rls_setting, org_a))
+                    await conn.execute(
+                        "INSERT INTO chat_sessions (id, org_id, user_id) VALUES (%s, %s, %s)",
+                        (probe_id, org_a, "__rls_probe_user"),
+                    )
+                    # Switch tenant WITHIN the same transaction; org B must not see A's row.
+                    await conn.execute("SELECT set_config(%s, %s, true)", (self.rls_setting, org_b))
+                    cur = await conn.execute(
+                        "SELECT count(*) FROM chat_sessions WHERE id=%s", (probe_id,)
+                    )
+                    (visible,) = await cur.fetchone()
+                    leaked = bool(visible)
+                    raise _Rollback()      # discard the probe row no matter what
+            except _Rollback:
+                pass
+        if leaked:
+            raise ConfigError(
+                "RLS self-test FAILED: a row written under one org was visible under "
+                "another — tenant isolation is NOT effective. Refusing to trust it. Check "
+                "the DB role (no SUPERUSER/BYPASSRLS) and that the org_isolation policies "
+                "from the migrations are present."
+            )
+
     @asynccontextmanager
     async def privileged_transaction(self) -> AsyncIterator:
         """Cross-tenant transaction for admin/audit reads. Use sparingly; the

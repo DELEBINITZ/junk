@@ -44,10 +44,16 @@ def _point_id(rid: str) -> str:
 class QdrantVectorStore:
     backend = "qdrant"
 
-    def __init__(self, url: str, api_key: str = "", timeout: float = 30.0) -> None:
+    def __init__(self, url: str, api_key: str = "", timeout: float = 30.0,
+                 *, shared_untagged_public: bool = True) -> None:
         from qdrant_client import AsyncQdrantClient  # lazy import: only when this backend is used
 
         self._client = AsyncQdrantClient(url=url, api_key=api_key or None, timeout=timeout)
+        # SHARED-corpus policy: when True (default), a shared-corpus doc with NO
+        # customer_tags is PUBLIC to every org (the public-knowledge-base model).
+        # Set False for a corpus that MIXES customer-scoped data, to make untagged
+        # docs visible to NO ONE (fail-closed) instead — so a missing tag can't leak.
+        self._shared_untagged_public = shared_untagged_public
 
     async def ensure_collection(self, collection: str, dim: int) -> None:
         from qdrant_client import models as qm
@@ -110,22 +116,29 @@ class QdrantVectorStore:
           so every search is HARD-scoped to one tenant. This is the isolation boundary
           for PRIVATE, single-owner corpora; nothing below can widen it.
         * ``visibility="shared"`` — a SHARED-intel corpus (e.g. CERT/ACI reports) where
-          one document is visible to many orgs. Visible when the report is PUBLIC
-          (``customer_tags`` empty/absent) OR explicitly allow-listed for this org
-          (``customer_tags`` array contains ``org_id``). NOTE: this is FAIL-OPEN — a
-          report with no tags is visible to EVERY tenant — so only bind it to corpora
-          that are genuinely cross-tenant shareable.
+          one document may be visible to many orgs. A document is visible to this org if
+          it is allow-listed for the org (``customer_tags`` array contains ``org_id``),
+          OR explicitly marked public (``public`` == true), OR — when the store's
+          ``shared_untagged_public`` policy is on (the DEFAULT) — it has NO
+          ``customer_tags`` at all (the public-knowledge-base model: untagged == public
+          to everyone). Set ``shared_untagged_public=False`` for a corpus that mixes
+          customer-scoped data, so an untagged doc is visible to NO tenant (fail-closed)
+          and a missing tag cannot leak.
 
         The optional SearchFilters are added on top in either mode (narrow only)."""
         from qdrant_client import models as qm
 
         if visibility == "shared":
-            # (public OR tagged-for-this-org). Wrapped in its own Filter so it ANDs
-            # cleanly with any source/date/doc musts appended below.
-            must = [qm.Filter(should=[
+            # Visible if tagged-for-this-org OR explicitly public OR (policy) untagged.
+            # Wrapped in its own Filter so it ANDs cleanly with any musts appended below.
+            should = [
                 qm.FieldCondition(key="customer_tags", match=qm.MatchValue(value=org_id)),   # array contains org_id
-                qm.IsEmptyCondition(is_empty=qm.PayloadField(key="customer_tags")),          # missing / null / []
-            ])]
+                qm.FieldCondition(key="public", match=qm.MatchValue(value=True)),            # explicitly public
+            ]
+            if self._shared_untagged_public:
+                # Public-KB model: a report with no customer_tags is visible to everyone.
+                should.append(qm.IsEmptyCondition(is_empty=qm.PayloadField(key="customer_tags")))
+            must = [qm.Filter(should=should)]
         else:
             # MANDATORY: org_id must match. The tenant-isolation boundary for private
             # corpora, enforced by Qdrant itself rather than post-filtering in Python.

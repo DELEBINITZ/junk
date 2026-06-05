@@ -131,7 +131,9 @@ def _build_remote_executors(settings: Settings, registry: CapabilityRegistry) ->
         if not url:
             continue
         for_ctx, for_sc = _service_token_minters(settings, f"{module.id}-mcp")
-        executors[module.id] = FastMCPRemote(url, token_for_ctx=for_ctx, token_for_sc=for_sc)
+        executors[module.id] = FastMCPRemote(
+            url, token_for_ctx=for_ctx, token_for_sc=for_sc,
+            api_key=settings.mcp_api_key_for(module.id))   # transport auth (X-API-Key)
     return executors
 
 
