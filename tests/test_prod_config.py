@@ -17,7 +17,7 @@ _REAL = dict(
     _env_file=None, environment="prod", debug=False, seed_demo_data=False,
     database_url="postgresql://u:p@h:5432/db",
     jwt_secret="x" * 40, api_keys=["prod-gateway-key-001"],
-    # Guardrail model endpoints are required in prod (Prompt Guard 2 + Llama Guard 3).
+    # Guardrail model endpoints are required in prod (injection + content-safety models).
     prompt_guard_url="http://prompt-guard:8085", llama_guard_url="http://llama-guard:8086/v1",
     cap_reports_enabled=True, cap_easm_enabled=False,
     cap_brand_enabled=False, cap_aci_enabled=False,

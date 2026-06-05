@@ -18,8 +18,8 @@
     app ──> TEI embedder          (Qwen3-Embedding; query + doc vectors)
     app ──> TEI reranker          (optional; cross-encoder precision)
     app ──> SGLang LLM            (Qwen 7B/72B + DeepSeek; 3 lanes)
-    app ──> Prompt Guard 2        (prompt-injection classifier)        [guardrail]
-    app ──> Llama Guard 3         (content-safety classifier)          [guardrail]
+    app ──> injection classifier  (ProtectAI DeBERTa-v3 inj. v2)       [guardrail]
+    app ──> content-safety model  (Qwen3Guard-Gen-8B)                  [guardrail]
     app ──> Presidio (in-process) (PII redaction)                      [guardrail]
     app ──> Redis                 (optional cache / rate-limit)
     app ──> Langfuse              (optional tracing)
@@ -176,15 +176,16 @@
      prod data.
 
 ------------------------------------------------------------------------------
- 8. PROMPT INJECTION GUARDRAIL — LLAMA PROMPT GUARD 2  — REQUIRED in prod
+ 8. PROMPT INJECTION GUARDRAIL — INJECTION CLASSIFIER  — REQUIRED in prod
 ------------------------------------------------------------------------------
  Role: classifies the USER's question for prompt-injection / jailbreak; the app
  BLOCKS the turn on a positive. (The old hand-rolled regex screen was removed —
  this model IS the detector.)
 
- 8.1 Serve meta-llama/Llama-Prompt-Guard-2-86M (or -22M) behind a small HTTP
-     service exposing POST /classify that returns HF text-classification output,
-     e.g. [{"label":"INJECTION"|"BENIGN","score":0.0-1.0}]. A minimal wrapper:
+ 8.1 Serve protectai/deberta-v3-base-prompt-injection-v2 (Apache-2.0, UNGATED —
+     no HF token; gated meta-llama/Llama-Prompt-Guard-2-86M also works) behind a
+     small HTTP service exposing POST /classify that returns HF text-classification
+     output, e.g. [{"label":"INJECTION"|"SAFE","score":0.0-1.0}]. A minimal wrapper:
        - load the model with transformers `pipeline("text-classification", ...)`
        - POST /classify {"inputs": "<text>"} -> the pipeline output as JSON.
      PROMPT_GUARD_URL=http://prompt-guard:8085
@@ -195,20 +196,23 @@
      threshold => BLOCK.
 
 ------------------------------------------------------------------------------
- 9. CONTENT-SAFETY GUARDRAIL — LLAMA GUARD 3  — REQUIRED in prod
+ 9. CONTENT-SAFETY GUARDRAIL — QWEN3GUARD  — REQUIRED in prod
 ------------------------------------------------------------------------------
  Role: classifies the question for genuinely harmful content; BLOCKS on "unsafe".
- Tuned categories so legitimate offensive-security discussion is allowed.
+ Tuned so legitimate offensive-security discussion is allowed (Qwen3Guard's
+ middle tier "Controversial" deliberately passes).
 
- 9.1 Serve meta-llama/Llama-Guard-3-8B as an OpenAI-compatible CHAT endpoint
-     (SGLang/vLLM both work):
-     python -m sglang.launch_server --model-path meta-llama/Llama-Guard-3-8B \
+ 9.1 Serve Qwen/Qwen3Guard-Gen-8B (Apache-2.0, UNGATED — no HF token; smaller
+     -4B/-0.6B variants and gated meta-llama/Llama-Guard-3-8B also work) as an
+     OpenAI-compatible CHAT endpoint (SGLang/vLLM both work):
+     python -m sglang.launch_server --model-path Qwen/Qwen3Guard-Gen-8B \
        --host 0.0.0.0 --port 8086
      LLAMA_GUARD_URL=http://llama-guard:8086/v1
-     LLAMA_GUARD_MODEL=meta-llama/Llama-Guard-3-8B
+     LLAMA_GUARD_MODEL=Qwen/Qwen3Guard-Gen-8B
 
  9.2 The app sends the text as a user turn to /chat/completions and BLOCKS when the
-     reply starts with "unsafe".
+     reply's first line contains "unsafe" ("unsafe\nS2" Llama Guard style, or
+     "Safety: Unsafe" Qwen3Guard style; "Safety: Controversial" passes).
 
 ------------------------------------------------------------------------------
  10. PII GUARDRAIL — MICROSOFT PRESIDIO  (in-process)  — REQUIRED when PII on

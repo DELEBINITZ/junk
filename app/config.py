@@ -176,8 +176,10 @@ class Settings(BaseSettings):
     # The safety spine, applied to BOTH the incoming question and the outgoing answer.
     # The heavy lifting is done by LIBRARIES/MODELS, not hand-rolled rules:
     #   PII             -> Microsoft Presidio (the ``pii`` extra; fails fast if absent)
-    #   prompt injection-> Llama Prompt Guard 2 (PROMPT_GUARD_URL classifier endpoint)
-    #   content safety  -> Llama Guard 3        (LLAMA_GUARD_URL chat endpoint)
+    #   prompt injection-> ProtectAI DeBERTa-v3 injection v2 (PROMPT_GUARD_URL classifier)
+    #   content safety  -> Qwen3Guard-Gen (LLAMA_GUARD_URL chat endpoint)
+    # Both defaults are Apache-2.0 and UNGATED on Hugging Face (no token/approval);
+    # the gated Meta equivalents (Prompt Guard 2 / Llama Guard 3) still work if served.
     # The only hand-coded pieces are the ones no library covers inline: secret
     # redaction, indirect-injection neutralization of retrieved content, output
     # exfiltration defang, and groundedness verification (see guardrails/detectors.py).
@@ -196,10 +198,10 @@ class Settings(BaseSettings):
     # in the generated answer (custom — LLM-output-specific).
     output_exfiltration_guard: bool = True
     # ---- Guardrail model endpoints (self-hosted classifiers) ----
-    prompt_guard_url: str = ""   # Llama Prompt Guard 2 classify endpoint (REQUIRED in prod)
+    prompt_guard_url: str = ""   # injection-classifier /classify endpoint (REQUIRED in prod)
     prompt_guard_threshold: float = 0.8   # min malicious/jailbreak label score to block
-    llama_guard_url: str = ""    # Llama Guard 3 OpenAI-compatible chat endpoint (REQUIRED in prod)
-    llama_guard_model: str = "meta-llama/Llama-Guard-3-8B"
+    llama_guard_url: str = ""    # content-safety OpenAI-compatible chat endpoint (REQUIRED in prod)
+    llama_guard_model: str = "Qwen/Qwen3Guard-Gen-8B"   # ungated; Llama-Guard-3-8B also works
     # ---- PII (Microsoft Presidio) ----
     # Security-tuned entity set: IP_ADDRESS/URL/DOMAIN are intentionally OMITTED —
     # they are the product's subject matter, not PII.
@@ -406,11 +408,11 @@ class Settings(BaseSettings):
         # removed, so injection/content-safety depend entirely on the classifiers.
         if self.guardrails_enabled:
             if self.injection_detection and not self.prompt_guard_url:
-                bad.append("PROMPT_GUARD_URL not set — Llama Prompt Guard 2 is required for "
-                           "injection detection (or set INJECTION_DETECTION=false)")
+                bad.append("PROMPT_GUARD_URL not set — the prompt-injection classifier is "
+                           "required for injection detection (or set INJECTION_DETECTION=false)")
             if self.topic_safety and not self.llama_guard_url:
-                bad.append("LLAMA_GUARD_URL not set — Llama Guard 3 is required for content "
-                           "safety (or set TOPIC_SAFETY=false)")
+                bad.append("LLAMA_GUARD_URL not set — the content-safety model is required "
+                           "for content safety (or set TOPIC_SAFETY=false)")
         # Tool-backed modules MUST point at a real MCP server in prod, else they
         # would serve their built-in mock data. (Corpus modules like reports are
         # covered by RETRIEVAL_BACKEND=qdrant above.)

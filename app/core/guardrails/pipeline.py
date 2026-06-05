@@ -135,20 +135,21 @@ class OutputGuardrailPipeline:
 def build_input_guardrails(settings) -> InputGuardrailPipeline:
     """Assemble the input pipeline FROM CONFIG. ``SecretRedactor`` is the always-on
     floor whenever guardrails are enabled (the one piece no library covers inline);
-    prompt-injection and content-safety are LIBRARY/MODEL backed — Llama Prompt
-    Guard 2 and Llama Guard 3 respectively — wired when their model URL is set (the
+    prompt-injection and content-safety are LIBRARY/MODEL backed — an injection
+    classifier (default ProtectAI DeBERTa v2) and a safety chat model (default
+    Qwen3Guard-Gen) respectively — wired when their model URL is set (the
     prod guard requires the URLs in production). Guardrails fully off => an empty
     pipeline that passes everything through unchanged."""
     if not settings.guardrails_enabled:
         return InputGuardrailPipeline([])
     detectors: list[Detector] = [SecretRedactor()]   # always first: scrub secrets before anything
     if settings.injection_detection:
-        # Llama Prompt Guard 2 (no-op in dev if no URL; required in prod).
+        # Injection classifier (no-op in dev if no URL; required in prod).
         detectors.append(PromptInjectionDetector(
             settings.prompt_guard_url, threshold=settings.prompt_guard_threshold,
             fail_closed=settings.guardrails_fail_closed))
     if settings.topic_safety and settings.llama_guard_url:
-        # Llama Guard 3 is THE content-safety classifier (the harm-regex floor was removed).
+        # The safety chat model is THE content-safety classifier (the harm-regex floor was removed).
         detectors.append(LlamaGuardDetector(
             settings.llama_guard_url, settings.llama_guard_model,
             fail_closed=settings.guardrails_fail_closed))

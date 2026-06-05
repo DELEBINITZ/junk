@@ -1,8 +1,8 @@
 """Library-based guardrails wire correctly from config.
 
-PII -> Microsoft Presidio · prompt injection -> Llama Prompt Guard 2 · content
-safety -> Llama Guard 3. The hand-rolled regex floors were removed; the only custom
-detectors are the ones no library covers (secret redaction, output exfiltration).
+PII -> Microsoft Presidio · prompt injection -> ProtectAI DeBERTa v2 classifier ·
+content safety -> Qwen3Guard-Gen. The hand-rolled regex floors were removed; the only
+custom detectors are the ones no library covers (secret redaction, output exfiltration).
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ def test_input_pipeline_wires_prompt_guard_and_llama_guard():
     s = Settings(_env_file=None, prompt_guard_url="http://pg:8085", llama_guard_url="http://lg:8086/v1")
     names = [d.name for d in build_input_guardrails(s).detectors]
     assert "secret_redactor" in names      # always-on floor (custom — no library covers it inline)
-    assert "prompt_injection" in names     # Llama Prompt Guard 2
-    assert "llama_guard" in names          # Llama Guard 3
+    assert "prompt_injection" in names     # injection classifier
+    assert "llama_guard" in names          # content-safety chat model
 
 
 def test_input_pipeline_no_llama_guard_without_url():

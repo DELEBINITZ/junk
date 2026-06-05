@@ -85,7 +85,7 @@ prompt cannot make the agent cross orgs.
 | LLM lanes | `app/core/llm/` | SGLang · OpenAI-compat; fast/standard/deep |
 | Retrieval | `app/core/rag/` | embeddings (TEI/OpenAI), **org-filtered** Qdrant store, reranker, time filters, citations |
 | Memory | `app/core/memory/` | sessions+messages (Postgres-RLS), rolling summary |
-| Guardrails | `app/core/guardrails/` | input/output spine; model seams (Prompt/Llama Guard) |
+| Guardrails | `app/core/guardrails/` | input/output spine; model seams (injection + content-safety classifiers) |
 | MCP boundary | `app/core/mcp/` | in-process now; remote client + standalone server seams |
 | Action gate | `app/core/action_gate/` | human-approval inbox for side-effecting tools |
 | Security | `app/core/security/` | API key + verified JWT, RBAC, org context, MCP service tokens |

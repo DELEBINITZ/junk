@@ -3,14 +3,14 @@
 #  start-support-models.sh  —  boots the 4 SUPPORT models for the platform:
 #     1. Embedder     Qwen3-Embedding-4B   (TEI,  :8080, dim 2560)
 #     2. Reranker     bge-reranker-v2-m3   (TEI,  :8081)
-#     3. Prompt Guard Llama-Prompt-Guard-2-86M (custom /classify, :8085, CPU)
-#     4. Llama Guard  Llama-Guard-3-8B     (vLLM, :8086, 4-bit in-flight quant)
+#     3. Prompt Guard protectai/deberta-v3-base-prompt-injection-v2 (custom /classify, :8085, CPU)
+#     4. Safety Guard Qwen3Guard-Gen-8B   (vLLM, :8086, 4-bit in-flight quant)
 #
 #  Quant profile: fits ONE 24GB GPU. The 72B answer-LLM runs on a SEPARATE box and
 #  is NOT started here.
 #
 #  Drop this file on the support-model server and run it:
-#     export HF_TOKEN=hf_xxxxx            # gated: Llama-Guard + Prompt-Guard
+#     export HF_TOKEN=hf_xxxxx            # OPTIONAL — all default models are ungated
 #     export TEI_IMAGE=...:89-1.6         # <-- pick YOUR GPU arch tag (see below)
 #     ./start-support-models.sh           # up   (default)
 #     ./start-support-models.sh down      # stop + remove all four
@@ -26,20 +26,21 @@ HF_TOKEN="${HF_TOKEN:-}"
 GPU_DEVICE="${GPU_DEVICE:-0}"                       # physical GPU index the GPU models share
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"    # model cache (persists downloads)
 
-# TEI image is GPU-ARCH SPECIFIC — set TEI_IMAGE to YOUR card's tag:
+# TEI image: universal CUDA tag by default (works across recent arches; matches
+# staging). Older per-arch tags still work via TEI_IMAGE override:
 #   H100 hopper-1.6 | A100 1.6 | A10/A6000/3090 86-1.6 | L4/L40S/4090 89-1.6 | T4 turing-1.6
-TEI_IMAGE="${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:1.6}"
+TEI_IMAGE="${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cuda-1.9}"
 VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:latest}"
 
 EMBED_MODEL="${EMBED_MODEL:-Qwen/Qwen3-Embedding-4B}"   # dim 2560 — MUST match app EMBEDDING_DIM
 EMBED_PORT="${EMBED_PORT:-8080}"
 RERANK_MODEL="${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}"
 RERANK_PORT="${RERANK_PORT:-8081}"
-PG_MODEL="${PG_MODEL:-meta-llama/Llama-Prompt-Guard-2-86M}"
+PG_MODEL="${PG_MODEL:-protectai/deberta-v3-base-prompt-injection-v2}"   # Apache-2.0, ungated
 PG_PORT="${PG_PORT:-8085}"
-PG_DEVICE="${PG_DEVICE:--1}"                            # -1 = CPU (86M, plenty fast); GPU index to use GPU
-LG_MODEL="${LG_MODEL:-meta-llama/Llama-Guard-3-8B}"     # official fp16 repo; quantized in-flight below
-LG_SERVED="${LG_SERVED:-meta-llama/Llama-Guard-3-8B}"   # MUST equal app LLAMA_GUARD_MODEL
+PG_DEVICE="${PG_DEVICE:--1}"                            # -1 = CPU (184M DeBERTa, plenty fast); GPU index to use GPU
+LG_MODEL="${LG_MODEL:-Qwen/Qwen3Guard-Gen-8B}"          # Apache-2.0, ungated; quantized in-flight below
+LG_SERVED="${LG_SERVED:-Qwen/Qwen3Guard-Gen-8B}"        # MUST equal app LLAMA_GUARD_MODEL
 LG_PORT="${LG_PORT:-8086}"
 LG_QUANT="${LG_QUANT:-bitsandbytes}"                   # in-flight 4-bit — no special AWQ repo needed
 LG_MEM_UTIL="${LG_MEM_UTIL:-0.40}"                     # cap so vLLM shares the card with TEI
@@ -60,7 +61,8 @@ fi
 # Preflight.
 # ---------------------------------------------------------------------------
 command -v docker >/dev/null || { echo "FATAL: docker not found"; exit 1; }
-[[ -n "$HF_TOKEN" ]] || { echo "FATAL: export HF_TOKEN (Llama-Guard + Prompt-Guard are gated)"; exit 1; }
+# All default models are UNGATED — HF_TOKEN only needed if you override with gated repos.
+[[ -n "$HF_TOKEN" ]] || echo "NOTE: HF_TOKEN not set (fine for the ungated defaults)"
 mkdir -p "$HF_CACHE"
 recreate() { docker rm -f "$1" >/dev/null 2>&1 || true; }
 
@@ -100,12 +102,15 @@ from pydantic import BaseModel
 from transformers import pipeline
 
 # top_k=None -> return ALL label scores; the app keys on the malicious label's score.
+# truncation: DeBERTa classifiers have a 512-token window — clip instead of erroring.
 _clf = pipeline(
     "text-classification",
-    model=os.getenv("PG_MODEL", "meta-llama/Llama-Prompt-Guard-2-86M"),
+    model=os.getenv("PG_MODEL", "protectai/deberta-v3-base-prompt-injection-v2"),
     top_k=None,
     device=int(os.getenv("PG_DEVICE", "-1")),
-    token=os.getenv("HF_TOKEN"),
+    token=os.getenv("HF_TOKEN") or None,
+    truncation=True,
+    max_length=512,
 )
 app = FastAPI()
 
@@ -142,8 +147,10 @@ docker run -d --name prompt-guard --restart unless-stopped \
   asi-prompt-guard:local
 
 # ---------------------------------------------------------------------------
-# 4. Llama Guard 3 — vLLM, OpenAI chat, 4-bit in-flight quant (~6GB).
+# 4. Content safety — Qwen3Guard-Gen-8B, vLLM, OpenAI chat, 4-bit in-flight quant (~6GB).
 #    --served-model-name stays the fp16 name so the app's LLAMA_GUARD_MODEL is unchanged.
+#    (Container keeps the historical name "llama-guard"; Llama-Guard-3-8B still works
+#     via LG_MODEL/LG_SERVED overrides — it is gated, needs HF_TOKEN.)
 # ---------------------------------------------------------------------------
 echo "[4/4] llama-guard ($LG_MODEL, quant=$LG_QUANT) :$LG_PORT"
 # Build vLLM args: bitsandbytes needs BOTH --quantization and --load-format; AWQ/GPTQ
