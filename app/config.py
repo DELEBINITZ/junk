@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     jwt_secret: str = _DEV_JWT_SECRET  # CHANGE in prod — the prod guard enforces this
     jwt_algorithm: str = "HS256"
     access_token_ttl_seconds: int = 3600
+    # SERVICE tokens (remote MCP). When a keypair is set, service tokens are signed
+    # with the PRIVATE key (CORE process only) and verified with the PUBLIC key (a
+    # promoted MCP server holds ONLY this) — so a remote server CANNOT mint tokens for
+    # any org. Leave empty to fall back to the shared HS256 secret (in-process/dev
+    # only); the prod guard REQUIRES the keypair once a remote MCP server is wired.
+    jwt_service_private_key: str = ""   # PEM (or its contents); CORE process only
+    jwt_service_public_key: str = ""    # PEM; the MCP server process holds ONLY this
+    jwt_service_algorithm: str = "RS256"
 
     # ---- Stores ------------------------------------------------------------
     # Where conversations/sessions persist. ``memory`` is in-process (zero infra);
@@ -166,6 +174,12 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     retrieval_top_k: int = 20
+    # SHARED-corpus visibility policy. True (default) = a shared-corpus document with
+    # NO customer_tags is PUBLIC to every org (the public-knowledge-base model — e.g.
+    # CERT/ACI threat-intel advisories). Set False ONLY for a corpus that mixes
+    # customer-scoped data, to make untagged docs visible to NO tenant (fail-closed),
+    # so a missing tag upstream cannot leak one org's data to another.
+    shared_untagged_public: bool = True
     rerank_enabled: bool = False
     rerank_provider: Literal["none", "tei"] = "none"
     tei_rerank_url: str = "http://localhost:8081"
@@ -174,16 +188,14 @@ class Settings(BaseSettings):
 
     # ---- Guardrails --------------------------------------------------------
     # The safety spine, applied to BOTH the incoming question and the outgoing answer.
-    # The heavy lifting is done by LIBRARIES/MODELS, not hand-rolled rules:
-    #   PII             -> Microsoft Presidio (the ``pii`` extra; fails fast if absent)
-    #   prompt injection-> ProtectAI DeBERTa-v3 injection v2 (PROMPT_GUARD_URL classifier)
-    #   content safety  -> Qwen3Guard-Gen (LLAMA_GUARD_URL chat endpoint)
-    # Both defaults are Apache-2.0 and UNGATED on Hugging Face (no token/approval);
-    # the gated Meta equivalents (Prompt Guard 2 / Llama Guard 3) still work if served.
+    # NO dedicated guard-model deployments: injection + content safety run on the
+    # MAIN deployed LLM (LLMJudgeGuard — the single 72B in prod / 32B in staging
+    # doubles as a hardened security judge; one extra small completion per turn).
+    # PII is Microsoft Presidio (the ``pii`` extra; fails fast if absent).
     # The only hand-coded pieces are the ones no library covers inline: secret
     # redaction, indirect-injection neutralization of retrieved content, output
     # exfiltration defang, and groundedness verification (see guardrails/detectors.py).
-    # In PROD the model URLs are REQUIRED (the prod guard refuses to boot without them).
+    # Nothing extra to require in PROD — the LLM is already mandatory.
     guardrails_enabled: bool = True
     pii_redaction: bool = True
     injection_detection: bool = True
@@ -197,14 +209,10 @@ class Settings(BaseSettings):
     # Defang data-exfiltration vectors (auto-loading markdown images, script links)
     # in the generated answer (custom — LLM-output-specific).
     output_exfiltration_guard: bool = True
-    # ---- Guardrail model endpoints (self-hosted classifiers) ----
-    prompt_guard_url: str = ""   # injection-classifier /classify endpoint (REQUIRED in prod)
-    prompt_guard_threshold: float = 0.8   # min malicious/jailbreak label score to block
-    llama_guard_url: str = ""    # content-safety OpenAI-compatible chat endpoint (REQUIRED in prod)
-    llama_guard_model: str = "Qwen/Qwen3Guard-Gen-8B"   # ungated; Llama-Guard-3-8B also works
     # ---- PII (Microsoft Presidio) ----
-    # Security-tuned entity set: IP_ADDRESS/URL/DOMAIN are intentionally OMITTED —
-    # they are the product's subject matter, not PII.
+    # NER + context + checksums — catches free-text PERSON names, which no regex
+    # can. Security-tuned entity set: IP_ADDRESS/URL/DOMAIN are intentionally
+    # OMITTED — they are the product's subject matter, not PII.
     pii_score_threshold: float = 0.5
     pii_entities: Annotated[list[str], NoDecode] = Field(default_factory=lambda: [
         "PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "US_SSN", "CREDIT_CARD",
@@ -279,6 +287,13 @@ class Settings(BaseSettings):
     easm_mcp_url: str = ""
     brand_mcp_url: str = ""
     aci_mcp_url: str = ""
+    # REMOTE MCP TRANSPORT AUTH (API key). The standard "is this my trusted core
+    # calling?" gate: the client sends ``X-API-Key`` and the server checks it. This
+    # is SEPARATE from the identity (the org/user still ride in the signed service
+    # token). ``mcp_api_keys`` maps module_id -> key; ``mcp_api_key`` is the shared
+    # fallback for all servers. Required in prod once a remote MCP server is wired.
+    mcp_api_key: str = ""
+    mcp_api_keys: dict[str, str] = Field(default_factory=dict)
     # Utility module backed by the external `mcp-test-kits` MCP server. Empty =>
     # the testkit module runs its LOCAL stub tools; set to e.g.
     # http://localhost:3000/mcp to route execution to the real server.
@@ -404,15 +419,8 @@ class Settings(BaseSettings):
         # API keys gate the gateway — the dev default must not ship to prod.
         if not self.api_keys or "dev-api-key-change-me" in set(self.api_keys):
             bad.append("API_KEYS is empty or still the dev default — set real gateway key(s)")
-        # Guardrail MODELS are required in prod: the hand-rolled regex floors were
-        # removed, so injection/content-safety depend entirely on the classifiers.
-        if self.guardrails_enabled:
-            if self.injection_detection and not self.prompt_guard_url:
-                bad.append("PROMPT_GUARD_URL not set — the prompt-injection classifier is "
-                           "required for injection detection (or set INJECTION_DETECTION=false)")
-            if self.topic_safety and not self.llama_guard_url:
-                bad.append("LLAMA_GUARD_URL not set — the content-safety model is required "
-                           "for content safety (or set TOPIC_SAFETY=false)")
+        # Guard models need nothing here: injection/content-safety run on the main
+        # LLM (LLMJudgeGuard), and a real LLM endpoint is already mandatory.
         # Tool-backed modules MUST point at a real MCP server in prod, else they
         # would serve their built-in mock data. (Corpus modules like reports are
         # covered by RETRIEVAL_BACKEND=qdrant above.)
@@ -423,6 +431,27 @@ class Settings(BaseSettings):
         ):
             if enabled and not url:
                 bad.append(f"{var} not set while its module is enabled — would serve mock data")
+        # When a REMOTE MCP server is wired, calls cross a process boundary, so the
+        # TRANSPORT must be authenticated: the client proves it's the trusted core via
+        # an API key (X-API-Key) the server checks. Require it in prod for EVERY remote
+        # module — without it, anyone who can reach the server could drive its tools.
+        # (The org/user identity additionally rides in the signed service token; an
+        # asymmetric service keypair — JWT_SERVICE_PRIVATE/PUBLIC_KEY — is recommended
+        # extra hardening so a compromised server also can't mint tokens, but the API
+        # key is the mandatory floor.)
+        remote_modules = [
+            (mid, _url) for mid, _url in (
+                ("easm", self.easm_mcp_url), ("brand", self.brand_mcp_url),
+                ("aci", self.aci_mcp_url), ("testkit", getattr(self, "testkit_mcp_url", "")),
+                *self.mcp_urls.items(),
+            ) if _url
+        ]
+        for mid, _url in remote_modules:
+            if not self.mcp_api_key_for(mid):
+                bad.append(
+                    f"remote MCP server for '{mid}' is configured but no API key is set — "
+                    f"set MCP_API_KEY (shared) or MCP_API_KEYS['{mid}'] so the server can "
+                    f"authenticate the caller (and pass the same key to the server)")
         if bad:
             raise ValueError(
                 "ENVIRONMENT=prod but insecure/incomplete configuration detected. Fix:\n  - "
@@ -433,6 +462,12 @@ class Settings(BaseSettings):
     @property
     def is_prod(self) -> bool:
         return self.environment == "prod"
+
+    def mcp_api_key_for(self, module_id: str) -> str:
+        """The transport API key to use for a module's remote MCP server: the
+        per-module entry if set, else the shared ``mcp_api_key`` fallback, else ""
+        (no key configured => the server won't require one)."""
+        return (self.mcp_api_keys.get(module_id) or self.mcp_api_key or "").strip()
 
 
 @lru_cache(maxsize=1)

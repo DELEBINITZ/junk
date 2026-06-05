@@ -174,7 +174,8 @@ def build_vector_store(settings: Settings) -> VectorStore:
     # Qdrant is the only vector backend (org_id-scoped). No in-memory fallback.
     from app.core.rag.qdrant_backend import QdrantVectorStore
 
-    return QdrantVectorStore(settings.qdrant_url, settings.qdrant_api_key)
+    return QdrantVectorStore(settings.qdrant_url, settings.qdrant_api_key,
+                             shared_untagged_public=settings.shared_untagged_public)
 
 
 def build_rag(settings: Settings) -> RetrievalPipeline:

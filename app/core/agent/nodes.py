@@ -50,7 +50,7 @@ from app.core.agent.state import (
 )
 from app.core.contracts import Chunk
 from app.core.guardrails.detectors import neutralize_injection
-from app.core.llm.base import CONTEXT_MARKER, ChatMessage, Lane
+from app.core.llm.base import CONTEXT_MARKER, NO_CONTEXT_REFUSAL, ChatMessage, Lane
 
 # After merging every specialist's findings we keep at most this many chunks for
 # the final prompt. A hard cap is what keeps the LLM context bounded no matter
@@ -411,9 +411,17 @@ async def answer_node(state: ChatState, ctx: AgentContext) -> dict:
 
     The single LLM "generation" step. Builds the message list (see
     build_answer_messages), runs it on the STANDARD lane (the mid-tier model),
-    and — if the turn is streaming — emits each token as a ``token`` event so the
-    user sees it appear live. Afterwards it parses the [n] markers the model
-    wrote and maps each back to the source chunk to produce real citations.
+    then parses the [n] markers the model wrote and maps each back to the source
+    chunk to produce real citations.
+
+    SECURITY — we BUFFER, we do NOT stream tokens to the client here. The output
+    guardrail (PII redaction, groundedness, injection defang) runs in the NEXT node;
+    emitting raw tokens now would leak unverified/unsafe content before the guard can
+    act, and a guard cannot un-send what already streamed. So the GUARDED text is
+    emitted later by output_guardrail_node. We still call ``stream()`` when the turn
+    is streaming so a client disconnect cancels the in-flight generation (vLLM abort);
+    we just hold the tokens. Trade-off: time-to-first-token rises to full-generation
+    time — the price of never showing unguarded output in a security product.
     """
     await ctx.fire("status", stage="answering")
     messages = build_answer_messages(state, ctx)
@@ -426,17 +434,20 @@ async def answer_node(state: ChatState, ctx: AgentContext) -> dict:
     routed = state.get("route_modules") or []
     hard = len(plan_steps) > 1 or len(routed) > 1 or state.get("replan_count", 0) > 0
     lane = Lane.DEEP if hard else Lane.STANDARD
-    if ctx.stream_tokens and ctx.emit is not None:
-        # Streaming path: accumulate tokens while also emitting each one live.
+    if ctx.stream_tokens:
+        # Buffer the stream (cancellable on disconnect) — but DON'T emit live.
         buf: list[str] = []
         async for tok in llm.stream(messages, lane=lane):
             buf.append(tok)
-            await ctx.fire("token", text=tok)
         text = "".join(buf)
     else:
         # Non-streaming path (plain POST /chat): one shot, take the whole text.
         resp = await llm.complete(messages, lane=lane)
         text = resp.text
+    if not text.strip():
+        # Empty generation (model returned nothing / only whitespace) -> a safe,
+        # honest refusal rather than shipping a blank answer to the user.
+        text = NO_CONTEXT_REFUSAL
 
     chunks: list[Chunk] = state.get("context_chunks") or []
     from app.core.rag.citations import extract_citation_indices
@@ -453,18 +464,39 @@ async def answer_node(state: ChatState, ctx: AgentContext) -> dict:
     return {"answer": text, "citations": citations, "lane": lane.value}
 
 
+async def _emit_answer_stream(ctx: AgentContext, text: str) -> None:
+    """Emit an already-GUARDED answer to a streaming client as ``token`` events
+    (no-op when the turn isn't streaming). Chunks on whitespace so the UI keeps its
+    progressive 'typing' feel; the content is final/guarded so chunk size is purely
+    cosmetic. Trailing whitespace is preserved per chunk, so client-side
+    concatenation reproduces the text. We cannot stream during generation
+    (see answer_node) — the output guard must run first."""
+    if not (ctx.stream_tokens and ctx.emit is not None) or not text:
+        return
+    for tok in re.findall(r"\S+\s*|\s+", text):   # words-with-trailing-space, or pure-space runs
+        await ctx.fire("token", text=tok)
+
+
 async def output_guardrail_node(state: ChatState, ctx: AgentContext) -> dict:
-    """NODE 5 — final safety check on the generated answer BEFORE it leaves.
+    """NODE 5 — final safety check on the generated answer BEFORE it leaves, and
+    the ONLY place a generated answer is streamed to the client.
 
     Verifies the answer is actually grounded in the retrieved chunks (catches
     hallucination), that its citations are valid, and redacts any leaked PII. If
     it blocks, we drop the citations so nothing unverified is shown as a source.
+    answer_node buffered the generation WITHOUT streaming it; only here — after the
+    guard has approved/redacted, or replaced a blocked answer with a safe canned
+    reply — do we stream the GUARDED text out. That ordering is what makes
+    "no unverified token reaches the user" actually true.
     """
     await ctx.fire("status", stage="output_guardrail")
     res = await ctx.output_guard.run(state.get("answer", ""), state.get("context_chunks") or [], ctx.sc)
     updates: dict[str, Any] = {"answer": res.text, "output_flags": res.flags}
     if res.blocked:
         updates["citations"] = []
+    # Stream the GUARDED answer now (no-op when not streaming) — deliberately AFTER
+    # the guard, so redaction/blocking has already been applied to res.text.
+    await _emit_answer_stream(ctx, res.text)
     return updates
 
 

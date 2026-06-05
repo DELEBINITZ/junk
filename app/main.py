@@ -55,8 +55,21 @@ async def lifespan(app: FastAPI):
     # isn't even required on the zero-infra path.
     if settings.store_backend == "postgres":
         from app.core.db.postgres import get_database
+        from app.core.errors import ConfigError
 
-        await get_database(settings).open()
+        db = get_database(settings)
+        await db.open()
+        # PROVE tenant isolation holds before taking traffic: a SUPERUSER/BYPASSRLS
+        # DATABASE_URL silently defeats RLS (the store SELECTs have no WHERE org_id).
+        # Prod = fail-closed (refuse to boot); dev = warn but continue so the local
+        # superuser quickstart still works.
+        try:
+            await db.verify_rls_isolation()
+        except ConfigError as exc:
+            if settings.is_prod:
+                raise
+            log.warning("rls.selftest_failed",
+                        extra={"event": "rls_selftest", "detail": str(exc)})
 
     # Stash long-lived objects on ``app.state`` so request dependencies (auth,
     # handlers) can reach them without rebuilding anything per request.

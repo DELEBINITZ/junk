@@ -131,7 +131,9 @@ def _build_remote_executors(settings: Settings, registry: CapabilityRegistry) ->
         if not url:
             continue
         for_ctx, for_sc = _service_token_minters(settings, f"{module.id}-mcp")
-        executors[module.id] = FastMCPRemote(url, token_for_ctx=for_ctx, token_for_sc=for_sc)
+        executors[module.id] = FastMCPRemote(
+            url, token_for_ctx=for_ctx, token_for_sc=for_sc,
+            api_key=settings.mcp_api_key_for(module.id))   # transport auth (X-API-Key)
     return executors
 
 
@@ -190,7 +192,9 @@ def build_services(settings: Settings) -> AppServices:
     # is the object a request actually calls to run one chat turn.
     orchestrator = Orchestrator(
         settings=settings, registry=registry, deps=deps, mcp=mcp,
-        input_guard=build_input_guardrails(settings), output_guard=build_output_guardrails(settings),
+        # ``llm`` is handed to the input guard: the main model doubles as the
+        # security judge (LLMJudgeGuard — no dedicated guard-model deployments).
+        input_guard=build_input_guardrails(settings, llm=llm), output_guard=build_output_guardrails(settings),
         supervisor=supervisor, conversations=conversations, summarizer=summarizer,
         checkpointer=checkpointer,
     )

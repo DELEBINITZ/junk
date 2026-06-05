@@ -52,6 +52,25 @@ def _encode(settings: Settings, claims: dict[str, Any]) -> str:
     return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
+def _service_keys(settings: Settings) -> tuple[str, str, str]:
+    """Resolve ``(sign_key, verify_key, algorithm)`` for SERVICE tokens.
+
+    ASYMMETRIC when a keypair is configured: the CORE signs with the private key,
+    and a remote MCP server verifies with the PUBLIC key only — so a promoted MCP
+    server holds no signing key and CANNOT mint tokens for any org. This closes the
+    "any promoted server can forge admin tokens" hole a shared symmetric secret
+    leaves open.
+
+    Falls back to the shared HS256 secret when NO service keypair is set — acceptable
+    for the in-process/dev path (no token crosses a process boundary), but the prod
+    guard REQUIRES the keypair once a remote MCP server is configured."""
+    priv = getattr(settings, "jwt_service_private_key", "") or ""
+    pub = getattr(settings, "jwt_service_public_key", "") or ""
+    if priv or pub:
+        return priv, pub, getattr(settings, "jwt_service_algorithm", "RS256")
+    return settings.jwt_secret, settings.jwt_secret, settings.jwt_algorithm
+
+
 def create_access_token(
     settings: Settings, *, sub: str, org_id: str, roles: tuple[str, ...], email: str = ""
 ) -> IssuedToken:
@@ -84,16 +103,22 @@ def create_service_token(
     local identity and send it in the Authorization header; the remote server
     re-derives org/roles from it (same rule, across the wire). ``audience`` names
     the intended server (e.g. "easm-mcp") so a token can't be replayed elsewhere;
-    the TTL is tiny because it's used immediately for one hop. ``type="access"``
-    so the remote server's ``decode_token(expected_type="access")`` accepts it.
-    """
+    the TTL is tiny because it's used immediately for one hop.
+
+    SECURITY: this is a DISTINCT token ``type="service"`` (not "access"), signed with
+    the SERVICE key (asymmetric private key when configured — see ``_service_keys``).
+    Two consequences: (1) the main API verifies ``expected_type="access"`` so a
+    service token is rejected there — it can't be replayed as a user token; (2) when
+    a keypair is configured, an MCP server holding only the public key cannot mint
+    tokens. Verified by ``decode_service_token`` on the server."""
+    sign_key, _verify, alg = _service_keys(settings)
     exp = _now() + ttl_seconds
     claims = {
         "sub": sub, "org_id": org_id, "roles": list(roles), "email": "",
-        "type": "access", "aud": audience, "jti": uuid.uuid4().hex,
+        "type": "service", "aud": audience, "jti": uuid.uuid4().hex,
         "iat": _now(), "exp": exp,
     }
-    return _encode(settings, claims)
+    return jwt.encode(claims, sign_key, algorithm=alg)
 
 
 def decode_token(
@@ -139,4 +164,34 @@ def decode_token(
     return claims
 
 
-__all__ = ["IssuedToken", "create_access_token", "create_service_token", "decode_token"]
+def decode_service_token(
+    settings: Settings, token: str, *, expected_audience: str | None = None
+) -> dict[str, Any]:
+    """VERIFY a SERVICE token on the remote MCP server side, or raise AuthError.
+
+    Verifies with the SERVICE verify key (the PUBLIC key when an asymmetric keypair
+    is configured — so this process cannot MINT tokens, only check them) and the
+    service algorithm. Requires ``type="service"`` (a user/access token is rejected
+    here) and, when given, the exact ``aud`` (so a token minted for another module's
+    server can't be replayed). This is the cross-process counterpart to
+    ``create_service_token`` and is what ``mcp/server.py`` calls."""
+    _sign, verify_key, alg = _service_keys(settings)
+    try:
+        claims = jwt.decode(token, verify_key, algorithms=[alg], options={"verify_aud": False})
+    except jwt.ExpiredSignatureError as exc:
+        raise AuthError("token expired") from exc
+    except jwt.PyJWTError as exc:
+        raise AuthError("invalid token") from exc
+    if claims.get("type") != "service":
+        # A user/access token (or anything not minted as a service token) must not
+        # authenticate a tool call on an MCP server.
+        raise AuthError("expected service token")
+    if expected_audience is not None and claims.get("aud") != expected_audience:
+        raise AuthError("token audience mismatch")
+    if not claims.get("org_id") or not claims.get("sub"):
+        raise AuthError("token missing org_id/sub")
+    return claims
+
+
+__all__ = ["IssuedToken", "create_access_token", "create_service_token",
+           "decode_token", "decode_service_token"]

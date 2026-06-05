@@ -119,6 +119,7 @@ def ensure_collection() -> None:
         ("doc_id", models.PayloadSchemaType.KEYWORD),
         ("published_at", models.PayloadSchemaType.DATETIME),  # recency range filtering
         ("customer_tags", models.PayloadSchemaType.KEYWORD),  # shared-visibility allow-list (array)
+        ("public", models.PayloadSchemaType.BOOL),            # explicit "visible to every org" flag
     ]
     for field, schema in indexes:
         try:
@@ -165,6 +166,17 @@ def _light_metadata(report: dict, idx: int, total: int) -> dict:
     }
 
 
+def _is_public(report: dict) -> bool:
+    """A shared-corpus document is PUBLIC (visible to every tenant) only when the
+    feed says so EXPLICITLY: a truthy ``public`` flag, or a TLP:CLEAR/WHITE marking
+    (the Traffic Light Protocol value for 'freely shareable'). Everything else is
+    restricted — visible only to the orgs named in ``customer_tags``. This is the
+    fail-CLOSED rule: absence of a signal means PRIVATE, never public."""
+    if bool(report.get("public")):
+        return True
+    return str(report.get("tlp") or "").strip().upper() in {"CLEAR", "WHITE", "TLP:CLEAR", "TLP:WHITE"}
+
+
 def build_points(report: dict) -> list[models.PointStruct]:
     doc_id = str(report["_id"])
     full_text = (report.get("insight") or {}).get("content_text", "")
@@ -172,9 +184,15 @@ def build_points(report: dict) -> list[models.PointStruct]:
     if not chunks:
         return []
 
-    vectors = embed_documents(chunks)
-    # SHARED-corpus visibility: [] (or absent in source) => PUBLIC to every org.
+    # SHARED-corpus visibility. ``customer_tags`` allow-lists specific orgs; absent/[]
+    # means PUBLIC to every org under the app's default policy (SHARED_UNTAGGED_PUBLIC).
+    # ``public`` is an EXPLICIT "visible to everyone" marker (set from the feed's
+    # TLP:CLEAR/WHITE or a public flag) — it makes a doc public even when the app runs
+    # in the strict SHARED_UNTAGGED_PUBLIC=false mode, and documents intent regardless.
     customer_tags = report.get("customer_tags", []) or []
+    public = _is_public(report)
+
+    vectors = embed_documents(chunks)
     title, published_at = _title(report), _published_at(report)
 
     points = []
@@ -192,8 +210,9 @@ def build_points(report: dict) -> list[models.PointStruct]:
                 "title": title,
                 "section": f"chunk {idx}",
                 "published_at": published_at,
-                # ---- shared-visibility allow-list (top-level; matched by _filter) ----
-                "customer_tags": customer_tags,
+                # ---- shared-visibility (top-level; matched by _filter, DEFAULT-DENY) ----
+                "customer_tags": customer_tags,   # orgs explicitly allow-listed for this doc
+                "public": public,                 # True => visible to EVERY org (explicit only)
                 # ---- arbitrary extras, filterable as metadata.<key> ----
                 "metadata": _light_metadata(report, idx, len(chunks)),
                 # NOTE: no org_id — shared corpus has no single owner; the shared

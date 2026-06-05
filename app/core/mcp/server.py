@@ -21,6 +21,14 @@ never trusted from arguments, so tenant isolation holds across the boundary.
 
 from __future__ import annotations
 
+# FastAPI at MODULE scope (not inside make_mcp_app): with ``from __future__ import
+# annotations`` the route handler's ``request: Request`` annotation is a STRING, and
+# FastAPI resolves it against this module's globals — so ``Request`` MUST be importable
+# here or FastAPI mis-reads ``request`` as a query parameter and the endpoint breaks.
+# FastAPI is a base dependency anyway (the app is built on it), so this costs nothing.
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
 from app.config import Settings
 from app.core.contracts import CoreDeps, ToolContext
 from app.core.mcp.inprocess import InProcessMCPClient
@@ -32,7 +40,7 @@ from app.core.mcp.protocol import (
 )
 from app.core.registry import CapabilityRegistry
 from app.core.security.context import SecurityContext
-from app.core.security.jwt import decode_token
+from app.core.security.jwt import decode_service_token
 
 
 def make_mcp_app(
@@ -42,6 +50,7 @@ def make_mcp_app(
     *,
     title: str = "MCP server",
     audience: str | None = None,
+    api_key: str = "",
 ):
     """Build a FastAPI app exposing the registry's tools over JSON-RPC at /mcp.
 
@@ -50,13 +59,16 @@ def make_mcp_app(
     ordinary InProcessMCPClient — meaning every tool call this server handles
     still passes through the SAME RBAC + action-gate enforcement.
 
-    ``audience`` is THIS server's identity (e.g. "easm-mcp"). When set, the bearer
-    service token must carry a matching ``aud`` claim or it is rejected — so a token
-    minted for another module's server can't be replayed here. The caller mints
-    tokens with ``create_service_token(audience="<module>-mcp")``, so pass the same
-    string (e.g. ``make_mcp_app(reg, settings, deps, audience="easm-mcp")``)."""
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse
+    TWO auth layers (both enforced before any tool runs):
+      * ``api_key`` — the TRANSPORT gate. When set, the request must carry a matching
+        ``X-API-Key`` header (constant-time compared) or it's refused. This is the
+        "is this my trusted core calling?" check, like a normal production API. Pass
+        the same key the caller is configured with (MCP_API_KEY / MCP_API_KEYS).
+      * ``audience`` — THIS server's identity (e.g. "easm-mcp"). The bearer SERVICE
+        token must carry a matching ``aud`` claim (and be type="service"), or it's
+        rejected — so a token minted for another server can't be replayed here. The
+        org/user identity is re-derived from that verified token, never from args."""
+    import hmac
 
     app = FastAPI(title=title)
     # Reuse the standard in-process runner: the network layer is just a thin
@@ -72,7 +84,10 @@ def make_mcp_app(
         caller cannot assert a different org than its token grants."""
         auth = request.headers.get("authorization", "")
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        claims = decode_token(settings, token, expected_type="access", expected_audience=audience)
+        # SERVICE token only: verified with the service key (the PUBLIC key when an
+        # asymmetric keypair is configured, so this server can't mint), must be
+        # type="service", and bound to THIS server's audience.
+        claims = decode_service_token(settings, token, expected_audience=audience)
         return SecurityContext(
             org_id=str(claims["org_id"]), user_id=str(claims["sub"]),
             roles=tuple(claims.get("roles", []) or ("viewer",)),
@@ -86,13 +101,19 @@ def make_mcp_app(
         with a JSON-RPC envelope (using standard-ish negative error codes)."""
         body = await request.json()
         rid = body.get("id")                      # echo the caller's id back for correlation
-        # AUTH FIRST: if the token is missing/invalid, refuse before touching any
-        # tool. The identity built here (sc) is the ONLY source of org/roles below.
+        # LAYER 1 — TRANSPORT: verify the per-server API key (constant-time) before
+        # touching the body's identity or any tool. Generic error: never reveal which
+        # check failed.
+        if api_key and not hmac.compare_digest(request.headers.get("x-api-key", ""), api_key):
+            return JSONResponse(JSONRPCResponse(
+                id=rid, error={"code": -32001, "message": "auth failed"}).model_dump())
+        # LAYER 2 — IDENTITY: verify the service token and rebuild sc. The identity
+        # built here is the ONLY source of org/roles below.
         try:
             sc = _sc(request)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return JSONResponse(JSONRPCResponse(
-                id=rid, error={"code": -32001, "message": f"auth failed: {exc}"}).model_dump())
+                id=rid, error={"code": -32001, "message": "auth failed"}).model_dump())
 
         method = body.get("method")
         params = body.get("params", {}) or {}
