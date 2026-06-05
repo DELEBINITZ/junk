@@ -3,9 +3,10 @@
 ================================ DESIGN: LIBRARIES + GAPS =================
 The heavy lifting is done by established LIBRARIES/MODELS, not hand-rolled rules:
   * PII detection/redaction  -> Microsoft **Presidio** (NER + context + checksums).
-  * prompt injection / jailbreak (user input) -> **Llama Prompt Guard 2** (a hosted
-    classifier).
-  * content / topic safety   -> **Llama Guard 3** (a hosted chat classifier).
+  * prompt injection / jailbreak (user input) -> a hosted injection classifier
+    (default **protectai/deberta-v3-base-prompt-injection-v2** — Apache-2.0, ungated).
+  * content / topic safety   -> a hosted safety chat model (default
+    **Qwen/Qwen3Guard-Gen-8B** — Apache-2.0, ungated; Llama Guard 3 also works).
 
 This file only hand-codes the security pieces those libraries do NOT provide:
   * ``SecretRedactor`` — strip credentials (API keys, AWS keys, PEM private keys,
@@ -26,7 +27,7 @@ This is a SECURITY product, so the policy is deliberately tuned, not generic:
     never redacted. (``pii_entities`` in config deliberately omits IP_ADDRESS/URL/
     DOMAIN so Presidio doesn't gut the product.)
   * Talking about exploits/malware/attacks is a defender's daily job, so content
-    safety is delegated to Llama Guard (tuned), not a strict generic filter.
+    safety is delegated to the safety model (tuned), not a strict generic filter.
 ===========================================================================
 """
 
@@ -102,8 +103,9 @@ def neutralize_injection(text: str) -> tuple[str, list[str]]:
     return cleaned, hits
 
 
-# Labels Prompt Guard 2 (HF text-classification) uses for a malicious prompt. We
-# normalize across naming conventions.
+# Malicious-prompt labels across HF text-classification injection models, normalized:
+# ProtectAI deberta-v3 v2 emits SAFE/INJECTION; Prompt-Guard-style models emit
+# LABEL_0/LABEL_1; others say jailbreak/malicious/unsafe.
 _INJECTION_LABELS = {"injection", "jailbreak", "malicious", "unsafe", "label_1"}
 
 
@@ -156,9 +158,11 @@ class SecretRedactor:
 
 
 class PromptInjectionDetector:
-    """INPUT detector backed by **Llama Prompt Guard 2** (a self-hosted text
-    classifier). BLOCKS likely prompt-injection / jailbreak attempts — the turn never
-    reaches routing/retrieval/answer.
+    """INPUT detector backed by a self-hosted prompt-injection text classifier
+    (default **protectai/deberta-v3-base-prompt-injection-v2**; any HF
+    text-classification injection model fits — labels are normalized). BLOCKS likely
+    prompt-injection / jailbreak attempts — the turn never reaches
+    routing/retrieval/answer.
 
     Library-based: there is no hand-rolled regex screen here (that was removed). With
     no ``model_url`` the detector is a NO-OP (a dev convenience); production REQUIRES
@@ -211,12 +215,14 @@ class OutputExfiltrationGuard:
 
 
 class LlamaGuardDetector:
-    """INPUT detector backed by **Llama Guard 3** (self-hosted on your GPU) — the
-    content/topic-safety classifier. Llama Guard is a CHAT model: we send the text as
-    a user turn to an OpenAI-compatible endpoint and it replies "safe" or
-    "unsafe\\nS<category>", and we BLOCK on "unsafe". This REPLACES the old hand-rolled
-    harm-regex floor; in this security product its categories are tuned so legitimate
-    offensive-security discussion is allowed. Fail policy is configurable."""
+    """INPUT detector backed by a self-hosted content/topic-safety CHAT model —
+    default **Qwen3Guard-Gen** (Apache-2.0, ungated); Llama Guard also works. We send
+    the text as a user turn to an OpenAI-compatible endpoint; the reply's FIRST line
+    carries the verdict — "unsafe\\nS<category>" (Llama Guard) or
+    "Safety: Safe|Controversial|Unsafe" (Qwen3Guard) — and we BLOCK only on unsafe.
+    Qwen3Guard's middle tier "Controversial" is deliberately ALLOWED: this is a
+    security product and offensive-security discussion is a defender's daily job.
+    This REPLACES the old hand-rolled harm-regex floor. Fail policy is configurable."""
 
     name = "llama_guard"
 
@@ -238,7 +244,11 @@ class LlamaGuardDetector:
                 )
                 r.raise_for_status()
                 content = str(r.json()["choices"][0]["message"]["content"]).strip().lower()
-            unsafe = content.startswith("unsafe")
+            # Verdict is on the FIRST line: "unsafe\nS2" (Llama Guard) or
+            # "safety: unsafe" / "safety: controversial" (Qwen3Guard). Only an
+            # explicit unsafe blocks; "controversial" passes (see class docstring).
+            first_line = content.splitlines()[0] if content else ""
+            unsafe = "unsafe" in first_line
         except Exception:
             unsafe = self.fail_closed              # block on error only if fail-closed
         if unsafe:
