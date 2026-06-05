@@ -17,8 +17,8 @@ _REAL = dict(
     _env_file=None, environment="prod", debug=False, seed_demo_data=False,
     database_url="postgresql://u:p@h:5432/db",
     jwt_secret="x" * 40, api_keys=["prod-gateway-key-001"],
-    # Guardrail model endpoints are required in prod (injection + content-safety models).
-    prompt_guard_url="http://prompt-guard:8085", llama_guard_url="http://llama-guard:8086/v1",
+    # No guard-model endpoints: injection/content-safety run on the main LLM
+    # (LLMJudgeGuard), and a real LLM endpoint is already mandatory.
     cap_reports_enabled=True, cap_easm_enabled=False,
     cap_brand_enabled=False, cap_aci_enabled=False,
 )
@@ -53,11 +53,12 @@ def test_prod_accepts_full_real_config():
     assert Settings(**_REAL).is_prod
 
 
-def test_prod_rejects_missing_guard_models():
-    # guardrails on (default) but no Prompt Guard / Llama Guard URL -> reject
-    cfg = {**_REAL, "prompt_guard_url": "", "llama_guard_url": ""}
-    with pytest.raises(ValidationError):
-        Settings(**cfg)
+def test_prod_needs_no_guard_model_endpoints():
+    # injection/content-safety run on the main LLM (LLMJudgeGuard) — prod boots
+    # with guardrails fully on and NO dedicated guard-model URLs in the config.
+    s = Settings(**_REAL)
+    assert s.is_prod and s.guardrails_enabled
+    assert s.injection_detection and s.topic_safety
 
 
 def test_prod_requires_mcp_url_for_enabled_tool_module():

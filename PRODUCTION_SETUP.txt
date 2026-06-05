@@ -17,17 +17,17 @@
     app ──> Qdrant                (RAG vector store; READ-only — see §4)
     app ──> TEI embedder          (Qwen3-Embedding; query + doc vectors)
     app ──> TEI reranker          (optional; cross-encoder precision)
-    app ──> SGLang LLM            (Qwen 7B/72B + DeepSeek; 3 lanes)
-    app ──> injection classifier  (ProtectAI DeBERTa-v3 inj. v2)       [guardrail]
-    app ──> content-safety model  (Qwen3Guard-Gen-8B)                  [guardrail]
+    app ──> vLLM LLM              (ONE model: Qwen 72B prod / 32B staging; all
+                                   lanes collapse to it; it ALSO serves the
+                                   security judge — LLMJudgeGuard)   [+ guardrail]
     app ──> Presidio (in-process) (PII redaction)                      [guardrail]
     app ──> Redis                 (optional cache / rate-limit)
     app ──> Langfuse              (optional tracing)
     EXTERNAL CRON ──> Qdrant      (writes report documents; NOT this app — see §4)
     app ──> EASM/Brand/ACI MCP servers (optional; via MCP_URLS — see §12)
 
- GPUs: the LLM (SGLang) and the embedder/reranker (TEI) and the two guard models
- need GPUs. Sizing depends on the models you pick (see each section).
+ GPUs: the LLM (vLLM) and the embedder/reranker (TEI) need GPUs. No guard-model
+ GPUs — injection/content-safety run on the main LLM (see §8).
 
 ------------------------------------------------------------------------------
  1. PREREQUISITES
@@ -176,50 +176,41 @@
      prod data.
 
 ------------------------------------------------------------------------------
- 8. PROMPT INJECTION GUARDRAIL — INJECTION CLASSIFIER  — REQUIRED in prod
+ 8. INJECTION + CONTENT-SAFETY GUARDRAILS — the LLM judge (no servers)
 ------------------------------------------------------------------------------
- Role: classifies the USER's question for prompt-injection / jailbreak; the app
- BLOCKS the turn on a positive. (The old hand-rolled regex screen was removed —
- this model IS the detector.)
+ Role: classify the USER's question for prompt-injection / jailbreak AND for
+ genuinely harmful content; the app BLOCKS the turn on a positive. (The old
+ hand-rolled regex screens were removed — a model IS the detector.)
 
- 8.1 Serve protectai/deberta-v3-base-prompt-injection-v2 (Apache-2.0, UNGATED —
-     no HF token; gated meta-llama/Llama-Prompt-Guard-2-86M also works) behind a
-     small HTTP service exposing POST /classify that returns HF text-classification
-     output, e.g. [{"label":"INJECTION"|"SAFE","score":0.0-1.0}]. A minimal wrapper:
-       - load the model with transformers `pipeline("text-classification", ...)`
-       - POST /classify {"inputs": "<text>"} -> the pipeline output as JSON.
-     PROMPT_GUARD_URL=http://prompt-guard:8085
-     PROMPT_GUARD_THRESHOLD=0.8     # min malicious/jailbreak score to block
+ The MAIN deployed LLM (the single 72B in prod / 32B in staging) doubles as a
+ hardened security judge (LLMJudgeGuard): one extra small completion per turn
+ classifies both concerns in one strict-JSON verdict. NOTHING extra to serve,
+ no extra VRAM, no guard endpoints to configure.
 
- 8.2 The app calls:  POST {PROMPT_GUARD_URL}/classify  {"inputs": "<question>"}.
-     A label in {injection, jailbreak, malicious, unsafe, label_1} at/above the
-     threshold => BLOCK.
+ Hardening (the judge itself is a target):
+   - input NFKC-normalized + zero-width-stripped (de-obfuscation), clipped,
+     fenced as <untrusted_input> DATA with an explicit never-obey rule, and
+     fence-escape attempts are defanged before embedding;
+   - the verdict must be one strict JSON line with real booleans; anything
+     else is a judge FAILURE -> GUARDRAILS_FAIL_CLOSED applies (block);
+   - temperature 0, max_tokens 96;
+   - "unsafe" policy is NARROW (CSAM, mass-casualty weapons, credible threats,
+     self-harm) — exploits/pentest/CVE discussion is the product's legitimate
+     domain and passes.
+
+ Config: nothing to add. INJECTION_DETECTION / TOPIC_SAFETY toggles gate each
+ half of the verdict; GUARDRAILS_FAIL_CLOSED=true is the prod stance. A missing
+ LLM client at build time is a LOUD ConfigError, never a silent no-op.
 
 ------------------------------------------------------------------------------
- 9. CONTENT-SAFETY GUARDRAIL — QWEN3GUARD  — REQUIRED in prod
-------------------------------------------------------------------------------
- Role: classifies the question for genuinely harmful content; BLOCKS on "unsafe".
- Tuned so legitimate offensive-security discussion is allowed (Qwen3Guard's
- middle tier "Controversial" deliberately passes).
-
- 9.1 Serve Qwen/Qwen3Guard-Gen-8B (Apache-2.0, UNGATED — no HF token; smaller
-     -4B/-0.6B variants and gated meta-llama/Llama-Guard-3-8B also work) as an
-     OpenAI-compatible CHAT endpoint (SGLang/vLLM both work):
-     python -m sglang.launch_server --model-path Qwen/Qwen3Guard-Gen-8B \
-       --host 0.0.0.0 --port 8086
-     LLAMA_GUARD_URL=http://llama-guard:8086/v1
-     LLAMA_GUARD_MODEL=Qwen/Qwen3Guard-Gen-8B
-
- 9.2 The app sends the text as a user turn to /chat/completions and BLOCKS when the
-     reply's first line contains "unsafe" ("unsafe\nS2" Llama Guard style, or
-     "Safety: Unsafe" Qwen3Guard style; "Safety: Controversial" passes).
+ 9. (removed — content safety is covered by the LLM judge in §8)
 
 ------------------------------------------------------------------------------
  10. PII GUARDRAIL — MICROSOFT PRESIDIO  (in-process)  — REQUIRED when PII on
 ------------------------------------------------------------------------------
- Role: redacts PII from the OUTGOING answer (NER + context + checksums). Runs
- in-process in the app — no separate service. The app FAILS FAST at boot if it's
- enabled but not installed.
+ Role: redacts PII from the OUTGOING answer (NER + context + checksums — catches
+ free-text PERSON names no regex can). Runs in-process in the app — no separate
+ service. The app FAILS FAST at boot if it's enabled but not installed.
 
  10.1 Install with the app (the `pii` extra) + a spaCy model:
       pip install -e ".[prod]"            # prod includes presidio
@@ -304,7 +295,7 @@
    QDRANT_URL=...    QDRANT_API_KEY=...    EMBEDDING_DIM=1024
    LLM_PROVIDER=sglang   SGLANG_BASE_URL=...  SGLANG_API_KEY=...
    EMBEDDING_PROVIDER=tei  TEI_EMBED_URL=...
-   PROMPT_GUARD_URL=...  LLAMA_GUARD_URL=...
+   (guardrails: nothing to set — the main LLM judges injection/content safety)
    TRACING_PROVIDER=langfuse  LANGFUSE_PUBLIC_KEY=...  LANGFUSE_SECRET_KEY=...   (recommended)
    MCP_URLS={...}  (if using remote modules)   CAP_*_ENABLED=...
  Sensible defaults you usually DON'T set: DEBUG=false, SEED_DEMO_DATA=false,
@@ -322,8 +313,8 @@
      private network, never publicly reachable
  [ ] Postgres RLS enabled (asi-migrate ran); least-privilege DB role; PITR backups
  [ ] Qdrant API key set; org_id payload index present; every point carries org_id
- [ ] Guardrails: PROMPT_GUARD_URL + LLAMA_GUARD_URL set; GUARDRAILS_FAIL_CLOSED=true;
-     Presidio installed (+ spaCy model)
+ [ ] Guardrails: judge runs on the main LLM (nothing to deploy);
+     GUARDRAILS_FAIL_CLOSED=true; Presidio installed (+ spaCy model)
  [ ] CORS_ORIGINS restricted to your front-end origins (not *)
  [ ] CAP_TESTKIT_ENABLED=false (unless deliberately used)
  [ ] Rate limiting / quotas at the gateway; PER_ORG_CONCURRENCY tuned
@@ -339,8 +330,8 @@
    - DATABASE_URL is empty
    - JWT_SECRET is the dev default or < 32 bytes
    - API_KEYS is empty or still the dev default
-   - GUARDRAILS_ENABLED=true but PROMPT_GUARD_URL / LLAMA_GUARD_URL are unset
-     (when injection/topic checks are on)
+   - (guard models need no URLs — the judge runs on the mandatory LLM; a missing
+      LLM client at guardrail build time fails loudly at boot)
    - DEBUG=true or SEED_DEMO_DATA=true
    - an enabled tool module (easm/brand/aci) has no MCP URL
  Fix everything it prints, then it boots. This is the "no insecure prod" guarantee.

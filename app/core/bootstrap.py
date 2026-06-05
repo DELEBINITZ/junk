@@ -190,7 +190,9 @@ def build_services(settings: Settings) -> AppServices:
     # is the object a request actually calls to run one chat turn.
     orchestrator = Orchestrator(
         settings=settings, registry=registry, deps=deps, mcp=mcp,
-        input_guard=build_input_guardrails(settings), output_guard=build_output_guardrails(settings),
+        # ``llm`` is handed to the input guard: the main model doubles as the
+        # security judge (LLMJudgeGuard — no dedicated guard-model deployments).
+        input_guard=build_input_guardrails(settings, llm=llm), output_guard=build_output_guardrails(settings),
         supervisor=supervisor, conversations=conversations, summarizer=summarizer,
         checkpointer=checkpointer,
     )

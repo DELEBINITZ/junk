@@ -29,10 +29,9 @@ from typing import Any
 from app.core.contracts import Chunk
 from app.core.guardrails.base import Action, Detector, GuardrailResult, GuardrailVerdict
 from app.core.guardrails.detectors import (
-    LlamaGuardDetector,
+    LLMJudgeGuard,
     OutputExfiltrationGuard,
     PresidioPIIRedactor,
-    PromptInjectionDetector,
     SecretRedactor,
 )
 from app.core.llm.base import NO_CONTEXT_REFUSAL
@@ -132,35 +131,43 @@ class OutputGuardrailPipeline:
         return GuardrailResult(blocked=False, text=cur, reasons=reasons, verdicts=verdicts, flags=flags)
 
 
-def build_input_guardrails(settings) -> InputGuardrailPipeline:
+def build_input_guardrails(settings, llm: Any = None) -> InputGuardrailPipeline:
     """Assemble the input pipeline FROM CONFIG. ``SecretRedactor`` is the always-on
-    floor whenever guardrails are enabled (the one piece no library covers inline);
-    prompt-injection and content-safety are LIBRARY/MODEL backed — an injection
-    classifier (default ProtectAI DeBERTa v2) and a safety chat model (default
-    Qwen3Guard-Gen) respectively — wired when their model URL is set (the
-    prod guard requires the URLs in production). Guardrails fully off => an empty
-    pipeline that passes everything through unchanged."""
+    floor whenever guardrails are enabled (the one piece no library covers inline).
+    Injection + content safety are ONE ``LLMJudgeGuard``: the app's main LLM
+    (bootstrap injects the LaneRouter via ``llm``) doubles as a hardened security
+    judge — no dedicated guard-model deployments. The INJECTION_DETECTION /
+    TOPIC_SAFETY toggles gate each half of the judge's verdict.
+
+    A missing ``llm`` while either check is enabled is a LOUD ConfigError, not a
+    silent no-op — a security control that quietly doesn't run is worse than a
+    boot failure. Guardrails fully off => an empty pass-through pipeline."""
     if not settings.guardrails_enabled:
         return InputGuardrailPipeline([])
     detectors: list[Detector] = [SecretRedactor()]   # always first: scrub secrets before anything
-    if settings.injection_detection:
-        # Injection classifier (no-op in dev if no URL; required in prod).
-        detectors.append(PromptInjectionDetector(
-            settings.prompt_guard_url, threshold=settings.prompt_guard_threshold,
-            fail_closed=settings.guardrails_fail_closed))
-    if settings.topic_safety and settings.llama_guard_url:
-        # The safety chat model is THE content-safety classifier (the harm-regex floor was removed).
-        detectors.append(LlamaGuardDetector(
-            settings.llama_guard_url, settings.llama_guard_model,
-            fail_closed=settings.guardrails_fail_closed))
+    if settings.injection_detection or settings.topic_safety:
+        if llm is None:
+            from app.core.errors import ConfigError
+
+            raise ConfigError(
+                "input guardrails need the LLM client: injection/content-safety checks "
+                "run on the main model (LLMJudgeGuard). Pass llm=... (bootstrap does), "
+                "or set INJECTION_DETECTION=false and TOPIC_SAFETY=false to disable."
+            )
+        # The main LLM judges both concerns in one call; each toggle gates its
+        # half of the verdict so INJECTION_DETECTION/TOPIC_SAFETY still apply.
+        detectors.append(LLMJudgeGuard(
+            llm, fail_closed=settings.guardrails_fail_closed,
+            check_injection=settings.injection_detection,
+            check_unsafe=settings.topic_safety))
     return InputGuardrailPipeline(detectors)
 
 
 def _build_pii_detector(settings) -> Detector:
-    """The PII redactor is Microsoft **Presidio** (NER-based). Fails FAST if the
-    ``pii`` extra isn't installed, rather than silently degrading — PII redaction is
-    a security control, so a missing dependency must be a loud boot error, not a
-    quiet no-op."""
+    """The PII redactor is Microsoft **Presidio** (NER-based — catches free-text
+    PERSON names no regex can). Fails FAST if the ``pii`` extra isn't installed,
+    rather than silently degrading — PII redaction is a security control, so a
+    missing dependency must be a loud boot error, not a quiet no-op."""
     try:
         import presidio_analyzer  # noqa: F401
         import presidio_anonymizer  # noqa: F401
