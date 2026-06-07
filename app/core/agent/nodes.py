@@ -73,10 +73,28 @@ def _context_cap(state: ChatState) -> int:
 # anti-hallucination contract, enforced again at output). The rest raise answer
 # quality: prioritize by risk, reconcile conflicting sources, and be explicit about
 # confidence/gaps rather than papering over them.
+#
+# The prompt also gives the agent CONVERSATIONAL awareness: it can handle greetings,
+# small talk, identity questions, and capability inquiries naturally — no hardcoded
+# regex triage needed. For security/data questions it stays grounded in context;
+# for conversational messages it replies as a helpful, friendly assistant.
 BASE_SYSTEM = (
-    "You are a security-intelligence analyst assistant. Answer the user's question "
-    "USING ONLY the retrieved context below, and cite every claim with its source "
-    "marker like [1] (cite multiple when a claim rests on several, e.g. [1][3]).\n"
+    "You are a security-intelligence analyst assistant. You serve as an agentic "
+    "chat interface for your organization's security data and tools.\n\n"
+    "CONVERSATIONAL MESSAGES (greetings, small talk, 'who are you', 'what can you "
+    "do', thanks, etc.):\n"
+    "- Respond naturally and warmly as a helpful security assistant.\n"
+    "- When asked about your identity or capabilities, explain that you are a "
+    "security-intelligence assistant that can help with security reports, attack "
+    "surface analysis, threat intelligence, vulnerability management, and other "
+    "security topics — grounded in the organization's own data.\n"
+    "- For greetings and casual chat, be friendly and steer the conversation toward "
+    "how you can help with security questions.\n"
+    "- You do NOT need retrieved context to handle these — respond directly.\n\n"
+    "SECURITY / DATA QUESTIONS:\n"
+    "- Answer USING ONLY the retrieved context below, and cite every claim with its "
+    "source marker like [1] (cite multiple when a claim rests on several, e.g. "
+    "[1][3]).\n"
     "- If the context does not contain the answer, say you don't have enough grounded "
     "information and name what's missing — never guess or use outside knowledge.\n"
     "- Lead with what matters most: rank findings by severity/exploitability and "
@@ -250,87 +268,22 @@ async def input_guardrail_node(state: ChatState, ctx: AgentContext) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# triage (small-talk / scope) — answer greetings and "what can you do" directly,
-# with NO routing, retrieval, or tool calls. Keeps the chat natural and steers the
-# user toward what the assistant is actually for.
+# triage — ALL messages flow through the full agent pipeline. The LLM's system
+# prompt (BASE_SYSTEM) gives it enough context to handle greetings, small talk,
+# identity questions, and capability inquiries naturally alongside security
+# queries. No hardcoded regex classification — the agent is agentic end-to-end.
 # --------------------------------------------------------------------------- #
-_GREETING_RE = re.compile(
-    r"^\s*(hi+|hello+|hey+|yo|hiya|howdy|greetings|good (morning|afternoon|evening|day)|"
-    r"how('?s| is| are)?\s*(it going|you|things|u)|what'?s up|sup|thanks?|thank you|thx|"
-    r"cheers|bye+|goodbye|see you|ok(ay)?|cool|nice|great|got it)\b",
-    re.IGNORECASE,
-)
-_HELP_RE = re.compile(
-    r"\b(what can you do|what do you do|how (can|do) you help|what (can|do) you (help|cover|offer)|"
-    r"your capabilities|what are you capable|how do you work|help me|what should i ask|"
-    r"give me examples?)\b",
-    re.IGNORECASE,
-)
-_IDENTITY_RE = re.compile(
-    r"\b(who are you|what are you|your name|are you (a |an )?(bot|ai|human|robot|chatgpt|gpt|llm|model))\b",
-    re.IGNORECASE,
-)
-
-
-def _triage_category(text: str) -> str:
-    """Classify a message: greeting / help / identity / task. High precision —
-    'help'/'identity' are specific phrases; a 'greeting' must ALSO be short, so a
-    real question that merely starts with 'hi...' isn't misread as chitchat."""
-    t = text.strip()
-    if not t:
-        return "greeting"
-    if _HELP_RE.search(t):
-        return "help"
-    if _IDENTITY_RE.search(t):
-        return "identity"
-    if _GREETING_RE.match(t) and len(t.split()) <= 8:
-        return "greeting"
-    return "task"
-
-
-def _capabilities_blurb(ctx: AgentContext) -> str:
-    """List what THIS caller's org can actually use, from the registry — so the
-    steer reflects the live, entitled capability set, never a hardcoded list."""
-    view = ctx.registry.capability_view(ctx.sc)
-    lines = []
-    for mid in dict.fromkeys(view.module_ids):
-        m = ctx.registry.module(mid)
-        if m:
-            lines.append(f"• {m.manifest.display_name} — {m.manifest.description}")
-    return "\n".join(lines) or "• (no capabilities are enabled for your org yet)"
-
-
-def _direct_reply(category: str, ctx: AgentContext) -> str:
-    caps = _capabilities_blurb(ctx)
-    if category == "identity":
-        return ("I'm a security-intelligence assistant — an AI that answers questions grounded "
-                "in your organization's security data. I can help with:\n\n" + caps +
-                "\n\nAsk me a security question and I'll dig into your data.")
-    if category == "help":
-        return ("Here's what I can help with:\n\n" + caps +
-                "\n\nTry: \"what are our top risks this quarter?\", \"what's exposed on our attack "
-                "surface?\", or \"which threat actors are targeting us?\"")
-    # greeting / chitchat
-    return ("Hi! I'm your security-intelligence assistant. I answer questions grounded in your "
-            "security data — I can help with:\n\n" + caps +
-            "\n\nWhat would you like to know? For example: \"summarize our latest report\".")
-
-
 async def triage_node(state: ChatState, ctx: AgentContext) -> dict:
-    """Small-talk / scope gate. For a greeting, a 'what can you do', or an identity
-    question, reply DIRECTLY (with a capability steer) and skip routing, retrieval,
-    and every tool call. A real task proceeds to the agent. Disabled via config =>
-    everything is treated as a task."""
-    if not getattr(ctx.settings, "smalltalk_handling", True):
-        return {"triage": "task"}
-    category = _triage_category(state.get("safe_question") or state.get("question") or "")
-    if category == "task":
-        return {"triage": "task"}
-    text = _direct_reply(category, ctx)
-    await ctx.fire("status", stage="smalltalk", category=category)
-    if ctx.stream_tokens and ctx.emit is not None:
-        await ctx.fire("token", text=text)        # surface the reply on the stream too
-    return {"triage": category, "answer": text, "citations": [], "route_modules": []}
+    """Triage node — passes ALL messages through to the full agent pipeline.
+
+    Previously this node used hardcoded regex patterns to detect greetings,
+    identity questions, and capability inquiries, short-circuiting them with
+    canned replies. Now the LLM handles everything: the system prompt gives it
+    conversational awareness so it responds naturally to small talk while staying
+    grounded in retrieved context for security questions. This is the agentic
+    approach — let the agent be the agent."""
+    await ctx.fire("status", stage="triage")
+    return {"triage": "task"}
 
 
 async def route_node(state: ChatState, ctx: AgentContext) -> dict:
@@ -527,12 +480,8 @@ def build_report_graph(ctx: AgentContext):
         lambda s: "blocked" if s.get("blocked") else "ok",
         {"blocked": END, "ok": N_TRIAGE},
     )
-    # triage: a greeting/help/identity reply ends the turn directly; a task routes.
-    g.add_conditional_edges(
-        N_TRIAGE,
-        lambda s: "task" if s.get("triage", "task") == "task" else "direct",
-        {"task": N_ROUTE, "direct": END},
-    )
+    # triage always passes through to routing — the LLM handles all messages.
+    g.add_edge(N_TRIAGE, N_ROUTE)
     g.add_edge(N_ROUTE, N_GATHER)
     g.add_edge(N_GATHER, N_ANSWER)
     g.add_edge(N_ANSWER, N_OUTPUT_GUARD)
@@ -814,12 +763,8 @@ def build_planner_graph(ctx: AgentContext):
         lambda s: "blocked" if s.get("blocked") else "ok",
         {"blocked": END, "ok": N_TRIAGE},
     )
-    # small-talk short-circuits before planning; a task goes to the planner.
-    g.add_conditional_edges(
-        N_TRIAGE,
-        lambda s: "task" if s.get("triage", "task") == "task" else "direct",
-        {"task": N_PLAN, "direct": END},
-    )
+    # triage always passes through to planning — the LLM handles all messages.
+    g.add_edge(N_TRIAGE, N_PLAN)
     g.add_edge(N_PLAN, N_PLAN_DISPATCH)
     g.add_edge(N_PLAN_DISPATCH, N_ANSWER)
     g.add_edge(N_ANSWER, N_REPLAN_GATE)

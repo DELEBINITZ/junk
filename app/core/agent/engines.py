@@ -104,13 +104,8 @@ class LangGraphEngine:
             {"blocked": END, "ok": N_TRIAGE},
         )
         if planner_mode:
-            # triage: small-talk ends directly; a task goes to the planner. Then
-            # plan -> dispatch -> answer -> reflect (loop to plan or finish).
-            sg.add_conditional_edges(
-                N_TRIAGE,
-                lambda s: "task" if s.get("triage", "task") == "task" else "direct",
-                {"task": N_PLAN, "direct": END},
-            )
+            # triage always passes through to planner — LLM handles all messages.
+            sg.add_edge(N_TRIAGE, N_PLAN)
             sg.add_edge(N_PLAN, N_PLAN_DISPATCH)
             sg.add_edge(N_PLAN_DISPATCH, N_ANSWER)
             sg.add_edge(N_ANSWER, N_REPLAN_GATE)
@@ -120,11 +115,8 @@ class LangGraphEngine:
                 {"replan": N_PLAN, "finish": N_OUTPUT_GUARD},
             )
         else:
-            sg.add_conditional_edges(
-                N_TRIAGE,
-                lambda s: "task" if s.get("triage", "task") == "task" else "direct",
-                {"task": N_ROUTE, "direct": END},
-            )
+            # triage always passes through to routing — LLM handles all messages.
+            sg.add_edge(N_TRIAGE, N_ROUTE)
             sg.add_edge(N_ROUTE, N_GATHER)
             sg.add_edge(N_GATHER, N_ANSWER)
             sg.add_edge(N_ANSWER, N_OUTPUT_GUARD)
