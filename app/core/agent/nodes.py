@@ -531,11 +531,18 @@ async def plan_node(state: ChatState, ctx: AgentContext) -> dict:
 
     planner = Planner(ctx.registry, ctx.deps.llm, ctx.settings,
                       embedder=getattr(ctx.deps.rag, "embedder", None))
-    plan = await planner.plan(
-        state.get("safe_question", ""), ctx.sc,
-        replan_notes=state.get("replan_notes", ""),
-        history=state.get("history"), summary=state.get("summary", ""),
-    )
+    try:
+        plan = await planner.plan(
+            state.get("safe_question", ""), ctx.sc,
+            replan_notes=state.get("replan_notes", ""),
+            history=state.get("history"), summary=state.get("summary", ""),
+        )
+    except Exception:
+        plan = None
+    if plan is None or plan.steps is None:
+        from app.core.agent.planner import Plan
+        plan = Plan(steps=[], synthesis="Answer the user's question from the gathered findings; cite every claim.", mode="fallback:none")
+
     domains = list(dict.fromkeys(s.domain for s in plan.steps))
     await ctx.fire(
         "plan",
