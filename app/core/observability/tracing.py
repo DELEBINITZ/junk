@@ -50,35 +50,34 @@ class LangfuseTracer:
     provider = "langfuse"
 
     def __init__(self, host: str, public_key: str, secret_key: str) -> None:
-        from langfuse import Langfuse  # lazy: only import the SDK when actually tracing
+        from langfuse import Langfuse
 
         self._lf = Langfuse(host=host or None, public_key=public_key, secret_key=secret_key)
 
     @contextmanager
     def span(self, name: str, **attrs: Any) -> Iterator[Any]:
-        # Open a span, yield it for the ``with`` body, and ALWAYS end it in finally
-        # (so a span is closed even if the wrapped work raises). ``attrs`` ride
-        # along as span metadata.
         span = None
         try:
-            span = self._lf.span(name=name, metadata=attrs)
+            trace = self._lf.trace(name=name, metadata=attrs)
+            span = trace.span(name=name, metadata=attrs)
             yield span
+        except Exception:
+            yield NoOpSpan()
         finally:
             try:
-                if span:
+                if span and hasattr(span, "end"):
                     span.end()
             except Exception:
                 pass
 
     def event(self, name: str, **attrs: Any) -> None:
-        # A point-in-time marker (no duration), e.g. "guardrail blocked".
         try:
-            self._lf.event(name=name, metadata=attrs)
+            trace = self._lf.trace(name=name)
+            trace.event(name=name, metadata=attrs)
         except Exception:
             pass
 
     async def aclose(self) -> None:
-        # Flush buffered spans on shutdown so nothing is lost (Langfuse batches).
         try:
             self._lf.flush()
         except Exception:

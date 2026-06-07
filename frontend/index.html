@@ -530,6 +530,11 @@ function sendMessage() {
     addCaret(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+  es.addEventListener("rollback", (e) => {
+    acc = JSON.parse(e.data).text;
+    bubble.innerHTML = md(acc);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
   es.addEventListener("done", (e) => {
     const d = JSON.parse(e.data);
     acc = d.answer || acc;
@@ -553,13 +558,13 @@ function sendMessage() {
     finish(es);
   });
 
-  // Timeout: if no events in 3s, fallback to POST
+  // Timeout: if no events in 15s, fallback to POST (LLM planning takes time)
   const timeout = setTimeout(() => {
     if (!streamOpened && !acc) {
       es.close();
       fallbackPost(text, turn, bubble, statusEl);
     }
-  }, 3000);
+  }, 15000);
 
   const origFinish = finish;
   function finish(src) { clearTimeout(timeout); src.close(); streaming = false; $("#send").disabled = false; input.focus(); }

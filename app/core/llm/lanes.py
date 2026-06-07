@@ -73,7 +73,10 @@ class LaneRouter:
 
     def _span(self, name: str, **attrs):
         if self._tracer:
-            return self._tracer.span(name, **attrs)
+            try:
+                return self._tracer.span(name, **attrs)
+            except Exception:  # noqa: BLE001
+                pass
         from contextlib import nullcontext
         return nullcontext()
 
