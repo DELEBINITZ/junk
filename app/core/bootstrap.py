@@ -104,14 +104,8 @@ def _service_token_minters(settings: Settings, audience: str):
 
 
 def _mcp_url_for(settings: Settings, module_id: str) -> str:
-    """Resolve the MCP server URL for one module, or "" if it runs in-process.
-
-    Two sources, generic map first: the ``mcp_urls`` {id: url} map (the zero-code
-    integration path — add an entry, done) wins; otherwise a legacy per-module
-    ``<id>_mcp_url`` Settings field (easm/brand/aci/testkit, kept for back-compat).
-    Convention over configuration: there is no hardcoded list of module ids here, so
-    a brand-new MCP-backed module is wired purely from config."""
-    return (settings.mcp_urls.get(module_id) or getattr(settings, f"{module_id}_mcp_url", "") or "").strip()
+    """Resolve the MCP server URL for a module from the mcp_urls map."""
+    return (settings.mcp_urls.get(module_id) or "").strip()
 
 
 def _build_remote_executors(settings: Settings, registry: CapabilityRegistry) -> dict[str, Any]:
@@ -165,7 +159,7 @@ def build_services(settings: Settings) -> AppServices:
     registry = CapabilityRegistry().discover(settings)
     # 3. Config-gated core backends. Every factory returns the deterministic/self-
     #    hosted default unless config.py points it at a real backend.
-    llm = build_llm(settings)
+    llm = build_llm(settings, tracer=tracer)
     rag = build_rag(settings)
     conversations = build_conversation_store(settings)
     summarizer = RollingSummarizer(llm)               # compresses old turns into a running summary
@@ -198,6 +192,11 @@ def build_services(settings: Settings) -> AppServices:
         supervisor=supervisor, conversations=conversations, summarizer=summarizer,
         checkpointer=checkpointer,
     )
+
+    # MCP wiring transparency at boot.
+    remote_ids = list(mcp.remote_executors.keys())
+    local_ids = [m.id for m in registry.modules() if m.enabled and m.id not in remote_ids]
+    logger.info("mcp.wiring", extra={"event": "mcp_wiring", "remote": remote_ids, "local": local_ids})
 
     # One structured "ready" line naming exactly which modules went live — the
     # fastest way to confirm a deployment's capability bundle at a glance.

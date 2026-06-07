@@ -19,128 +19,76 @@ from __future__ import annotations
 from typing import Protocol
 
 from app.core.observability import build_langfuse_handler
-from app.core.agent.nodes import (
-    NODE_SPECS,
-    PLANNER_NODE_SPECS,
-    build_planner_graph,
-    build_report_graph,
-)
+from app.core.agent.fast_rag import PARALLEL_PLANNER_NODE_SPECS, build_parallel_planner_graph
 from app.core.agent.state import (
     N_ANSWER,
-    N_GATHER,
-    N_INPUT_GUARD,
-    N_OUTPUT_GUARD,
-    N_PLAN,
+    N_PARALLEL_RETRIEVE,
     N_PLAN_DISPATCH,
     N_REPLAN_GATE,
-    N_ROUTE,
-    N_TRIAGE,
     AgentContext,
     ChatState,
 )
 
 
 class AgentEngine(Protocol):
-    """Both engines satisfy this tiny interface, so the orchestrator doesn't care
-    which one it's holding: give me a ``state`` and a ``thread_id``, run the
-    graph, hand back the final state."""
+    """Both engines satisfy this tiny interface: give me a ``state`` and a
+    ``thread_id``, run the graph, hand back the final state."""
     name: str
 
     async def run(self, state: dict, *, thread_id: str) -> dict: ...
 
 
 class InternalEngine:
-    """The default, zero-dependency engine — just wraps our built-in graph
-    (graph.py). Picks the heuristic graph or the planner graph from
-    ``orchestrator_mode``. ``thread_id`` is accepted for interface parity but
-    unused: the built-in engine keeps no cross-run state."""
+    """The default engine — parallel planner graph (guardrail + plan concurrent,
+    wave-based dispatch, reflect loop). Zero external dependencies."""
     name = "internal"
 
     def __init__(self, ctx: AgentContext) -> None:
-        if getattr(ctx.settings, "orchestrator_mode", "heuristic") == "planner":
-            self._compiled = build_planner_graph(ctx)
-        else:
-            self._compiled = build_report_graph(ctx)
+        self._compiled = build_parallel_planner_graph(ctx)
 
     async def run(self, state: dict, *, thread_id: str) -> dict:
         return await self._compiled.run(state)
 
 
 class LangGraphEngine:
-    """The same five nodes mounted onto real ``langgraph.StateGraph``, plus a
-    checkpointer. Compare this wiring to nodes.build_report_graph — it is the
-    SAME shape (entry -> conditional after input guard -> linear to END), just
-    expressed in LangGraph's API (START/END come from the library here)."""
+    """Same parallel planner graph mounted on real LangGraph for durable
+    checkpointing (resumable runs, human-approval gate)."""
 
     name = "langgraph"
 
     def __init__(self, ctx: AgentContext, checkpointer=None) -> None:
-        # Imported lazily so the langgraph package is only needed when this engine
-        # is actually selected (keeps the default install dependency-free).
         from langgraph.graph import END, START, StateGraph
 
-        # LangGraph wants the state SCHEMA (our ChatState TypedDict) up front.
         sg = StateGraph(ChatState)
 
-        # Our node functions take ``(state, ctx)``; LangGraph calls nodes with just
-        # ``(state)``. This wrapper closes over ``ctx`` to bridge the two — exactly
-        # the same closure trick the built-in engine uses.
         def _wrap(fn):
             async def _node(state):
                 return await fn(state, ctx)
             return _node
 
-        planner_mode = getattr(ctx.settings, "orchestrator_mode", "heuristic") == "planner"
-        # Register the IDENTICAL node set the built-in engine uses (single source of
-        # truth), choosing the heuristic or planner node list by mode.
-        specs = PLANNER_NODE_SPECS if planner_mode else NODE_SPECS
-        for name, fn in specs:
+        for name, fn in PARALLEL_PLANNER_NODE_SPECS:
             sg.add_node(name, _wrap(fn))
-        sg.add_edge(START, N_INPUT_GUARD)
-        # blocked -> END; else triage for small-talk (both modes).
+
+        sg.add_edge(START, N_PARALLEL_RETRIEVE)
         sg.add_conditional_edges(
-            N_INPUT_GUARD,
+            N_PARALLEL_RETRIEVE,
             lambda s: "blocked" if s.get("blocked") else "ok",
-            {"blocked": END, "ok": N_TRIAGE},
+            {"blocked": END, "ok": N_PLAN_DISPATCH},
         )
-        if planner_mode:
-            # triage always passes through to planner — LLM handles all messages.
-            sg.add_edge(N_TRIAGE, N_PLAN)
-            sg.add_edge(N_PLAN, N_PLAN_DISPATCH)
-            sg.add_edge(N_PLAN_DISPATCH, N_ANSWER)
-            sg.add_edge(N_ANSWER, N_REPLAN_GATE)
-            sg.add_conditional_edges(
-                N_REPLAN_GATE,
-                lambda s: "replan" if s.get("needs_replan") else "finish",
-                {"replan": N_PLAN, "finish": N_OUTPUT_GUARD},
-            )
-        else:
-            # triage always passes through to routing — LLM handles all messages.
-            sg.add_edge(N_TRIAGE, N_ROUTE)
-            sg.add_edge(N_ROUTE, N_GATHER)
-            sg.add_edge(N_GATHER, N_ANSWER)
-            sg.add_edge(N_ANSWER, N_OUTPUT_GUARD)
-        sg.add_edge(N_OUTPUT_GUARD, END)
-        # ``compile(checkpointer=...)`` is what enables resumable, persisted runs.
+        sg.add_edge(N_PLAN_DISPATCH, N_ANSWER)
+        sg.add_edge(N_ANSWER, N_REPLAN_GATE)
+        sg.add_conditional_edges(
+            N_REPLAN_GATE,
+            lambda s: "replan" if s.get("needs_replan") else "finish",
+            {"replan": N_PARALLEL_RETRIEVE, "finish": END},
+        )
         self._compiled = sg.compile(checkpointer=checkpointer)
 
-        # Auto-trace seam: a Langfuse callback handler (or None when tracing is
-        # off) that LangGraph invokes for every node/LLM step, building the full
-        # per-node trace tree in the dashboard — the LangSmith-style view, self-
-        # hosted. Built ONCE here because the keys are static; the per-run session
-        # /user metadata is attached in run(). ``sc`` is the acting identity, used
-        # to group traces by chat session, user, and tenant.
         self._lf_handler = build_langfuse_handler(ctx.settings)
         self._sc = ctx.sc
 
     async def run(self, state: dict, *, thread_id: str) -> dict:
-        # ``thread_id`` keys the checkpoint — reuse the same id (we use the chat
-        # session id) and LangGraph can associate/resume the run.
         cfg = {"configurable": {"thread_id": thread_id}}
-        # When Langfuse is configured, attach the auto-tracing handler and tag the
-        # run so the dashboard groups this chat session's turns together
-        # (langfuse_session_id) under the acting user/tenant. The langfuse_* keys
-        # are read by the handler; they are inert when no handler is attached.
         if self._lf_handler is not None:
             cfg["callbacks"] = [self._lf_handler]
             cfg["metadata"] = {

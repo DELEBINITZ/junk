@@ -61,29 +61,21 @@ def test_prod_needs_no_guard_model_endpoints():
     assert s.injection_detection and s.topic_safety
 
 
-def test_prod_requires_mcp_url_for_enabled_tool_module():
-    # easm enabled in prod with NO server URL would serve mock data -> reject
-    cfg = {**_REAL, "cap_easm_enabled": True, "easm_mcp_url": ""}
-    with pytest.raises(ValidationError):
-        Settings(**cfg)
-
-
 def test_prod_remote_mcp_requires_api_key():
-    # A remote MCP server wired in prod with NO transport API key -> reject (anyone
-    # who can reach the server could otherwise drive its tools).
-    cfg = {**_REAL, "cap_easm_enabled": True, "easm_mcp_url": "https://easm/mcp"}
+    # A remote MCP server wired in prod with NO transport API key -> reject
+    cfg = {**_REAL, "mcp_urls": {"easm": "https://easm/mcp"}}
     with pytest.raises(ValidationError):
         Settings(**cfg)
 
 
 def test_prod_remote_mcp_with_api_key_ok():
-    cfg = {**_REAL, "cap_easm_enabled": True, "easm_mcp_url": "https://easm/mcp",
+    cfg = {**_REAL, "mcp_urls": {"easm": "https://easm/mcp"},
            "mcp_api_key": "a-strong-mcp-key"}
     assert Settings(**cfg).is_prod
 
 
 def test_prod_remote_mcp_per_module_api_key_ok():
-    cfg = {**_REAL, "cap_easm_enabled": True, "easm_mcp_url": "https://easm/mcp",
+    cfg = {**_REAL, "mcp_urls": {"easm": "https://easm/mcp"},
            "mcp_api_keys": {"easm": "per-module-key"}}
     s = Settings(**cfg)
     assert s.mcp_api_key_for("easm") == "per-module-key"

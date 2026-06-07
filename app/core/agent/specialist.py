@@ -409,16 +409,28 @@ class GenericSpecialist:
 
     async def investigate(self, question: str, ctx: ToolContext) -> SpecialistResult:
         """The Specialist protocol method. Orchestrates one module's evidence
-        gathering: retrieve from the corpus, then run the chosen tool planner,
-        then rank + cap the findings. Returns a SpecialistResult the dispatch
-        node merges with the other specialists'."""
+        gathering: retrieve from the corpus, then ONLY run tools if the retriever
+        didn't find enough evidence. This prevents redundant LLM tool-call loops
+        on corpus modules where the retriever already has the answer.
+
+        For tool-only modules (no retriever), always runs the tool planner.
+        For corpus modules with sufficient retrieval results, skips tools entirely.
+        """
         chunks: list[Chunk] = []
         events: list[dict] = []
         await self._retrieve(question, ctx, chunks, events)
-        if self._use_llm_planner():
-            await self._llm_tools(question, ctx, chunks, events)
-        else:
-            await self._heuristic_tools(question, ctx, chunks, events)
+
+        # Skip tool-calling when retrieval already found enough evidence.
+        # This prevents 10+ redundant tool calls on corpus modules.
+        has_retriever = bool(self.module.retrievers)
+        retrieval_sufficient = has_retriever and len(chunks) >= 2
+
+        if not retrieval_sufficient:
+            if self._use_llm_planner():
+                await self._llm_tools(question, ctx, chunks, events)
+            else:
+                await self._heuristic_tools(question, ctx, chunks, events)
+
         ranked = relevance_rank(chunks, question, PER_SPECIALIST_MAX)
         return SpecialistResult(module_id=self.id, chunks=ranked, events=events)
 

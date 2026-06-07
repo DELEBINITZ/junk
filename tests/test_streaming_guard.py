@@ -81,14 +81,15 @@ def _collector():
 
 
 @pytest.mark.asyncio
-async def test_answer_node_buffers_and_emits_no_tokens():
-    # Even with streaming on, answer_node must NOT emit token events — the guard
-    # has not run yet. It only buffers the generation into state["answer"].
+async def test_answer_node_streams_tokens_live():
+    # answer_node NOW streams tokens live for instant TTFT. The output guard
+    # sends a "rollback" event if redaction/blocking is needed post-generation.
     events, emit = _collector()
     ctx = _ctx(llm=_FakeLLM("Reach me at secret@evil.com please"), emit=emit, stream=True)
     out = await answer_node({"question": "hi", "context_chunks": []}, ctx)
     assert out["answer"] == "Reach me at secret@evil.com please"
-    assert not [e for e in events if e.type == "token"]   # nothing streamed pre-guard
+    tokens = [e for e in events if e.type == "token"]
+    assert tokens  # tokens ARE streamed live now
 
 
 @pytest.mark.asyncio
@@ -99,9 +100,9 @@ async def test_answer_node_empty_generation_falls_back():
 
 
 @pytest.mark.asyncio
-async def test_output_guard_streams_only_redacted_text():
-    # THE guarantee: tokens emitted by the guard node carry the REDACTED answer,
-    # and the raw PII never appears in any token event.
+async def test_output_guard_sends_rollback_on_redaction():
+    # When PII is redacted, the output guard sends a "rollback" event so the client
+    # replaces the already-streamed raw text with the redacted version.
     events, emit = _collector()
     guard = OutputGuardrailPipeline([_EmailRedactor()], groundedness=False)
     ctx = _ctx(output_guard=guard, emit=emit, stream=True)
@@ -109,10 +110,10 @@ async def test_output_guard_streams_only_redacted_text():
 
     out = await output_guardrail_node(state, ctx)
 
-    streamed = "".join(e.data["text"] for e in events if e.type == "token")
     assert out["answer"] == "mail me at [REDACTED_EMAIL] now"
-    assert streamed == out["answer"]                  # client reconstructs the guarded text exactly
-    assert "secret@evil.com" not in streamed          # raw PII never streamed
+    rollbacks = [e for e in events if e.type == "rollback"]
+    assert rollbacks
+    assert rollbacks[0].data["text"] == "mail me at [REDACTED_EMAIL] now"
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ EV_ROUTE = "route"
 EV_TOOL = "tool"
 EV_THINKING = "thinking"   # human-readable reasoning steps (plan decomposition, reflect verdicts)
 EV_TOKEN = "token"
+EV_ROLLBACK = "rollback"   # replace all streamed tokens with corrected text (guard redaction/block)
 EV_CITATION = "citation"
 EV_DONE = "done"
 EV_ERROR = "error"

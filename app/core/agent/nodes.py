@@ -360,96 +360,85 @@ async def dispatch_node(state: ChatState, ctx: AgentContext) -> dict:
 
 
 async def answer_node(state: ChatState, ctx: AgentContext) -> dict:
-    """NODE 4 — SYNTHESIZE the final answer from the gathered context.
+    """SYNTHESIZE the final answer from gathered context.
 
-    The single LLM "generation" step. Builds the message list (see
-    build_answer_messages), runs it on the STANDARD lane (the mid-tier model),
-    then parses the [n] markers the model wrote and maps each back to the source
-    chunk to produce real citations.
-
-    SECURITY — we BUFFER, we do NOT stream tokens to the client here. The output
-    guardrail (PII redaction, groundedness, injection defang) runs in the NEXT node;
-    emitting raw tokens now would leak unverified/unsafe content before the guard can
-    act, and a guard cannot un-send what already streamed. So the GUARDED text is
-    emitted later by output_guardrail_node. We still call ``stream()`` when the turn
-    is streaming so a client disconnect cancels the in-flight generation (vLLM abort);
-    we just hold the tokens. Trade-off: time-to-first-token rises to full-generation
-    time — the price of never showing unguarded output in a security product.
+    Tokens stream LIVE to the client during generation for instant TTFT.
+    After generation, a deterministic groundedness check (~1ms, no LLM) verifies
+    citations are valid. If the model hallucinated a citation (referenced a source
+    that doesn't exist), the answer is replaced with a safe refusal.
     """
     await ctx.fire("status", stage="answering")
     messages = build_answer_messages(state, ctx)
     llm = ctx.deps.llm
-    # ADAPTIVE LANE: a hard synthesis — a multi-step plan, several routed modules, or
-    # a turn that went through a reflection round — earns the DEEP model (the strongest
-    # tier). A simple single-module question stays on STANDARD to keep cost/latency low.
-    # (Under the openai provider all lanes map to one model, so this is a no-op there.)
     plan_steps = state.get("plan") or []
     routed = state.get("route_modules") or []
     hard = len(plan_steps) > 1 or len(routed) > 1 or state.get("replan_count", 0) > 0
     lane = Lane.DEEP if hard else Lane.STANDARD
+
     if ctx.stream_tokens:
-        # Buffer the stream (cancellable on disconnect) — but DON'T emit live.
         buf: list[str] = []
         async for tok in llm.stream(messages, lane=lane):
             buf.append(tok)
+            await ctx.fire("token", text=tok)
         text = "".join(buf)
     else:
-        # Non-streaming path (plain POST /chat): one shot, take the whole text.
         resp = await llm.complete(messages, lane=lane)
         text = resp.text
+
     if not text.strip():
-        # Empty generation (model returned nothing / only whitespace) -> a safe,
-        # honest refusal rather than shipping a blank answer to the user.
         text = NO_CONTEXT_REFUSAL
 
     chunks: list[Chunk] = state.get("context_chunks") or []
-    from app.core.rag.citations import extract_citation_indices
+    from app.core.rag.citations import extract_citation_indices, verify_groundedness
 
-    # Turn the [1], [2] markers the model emitted into structured citations,
-    # mapping each index back to the chunk that occupied that slot. Out-of-range
-    # markers (model hallucinated a [9] when only 8 chunks existed) are ignored.
     cited = extract_citation_indices(text)
     citations = []
     for i in cited:
         if 1 <= i <= len(chunks):
             cit = chunks[i - 1].to_citation()
             citations.append({"n": i, **cit.model_dump()})
-    return {"answer": text, "citations": citations, "lane": lane.value}
 
+    # Groundedness check: deterministic, ~1ms. Catches fabricated citations.
+    report = verify_groundedness(text, chunks, refusal_markers=[NO_CONTEXT_REFUSAL[:30]])
+    flags: dict[str, Any] = {"groundedness": report.grounded, "coverage": report.coverage}
+    if report.invalid_indices:
+        text = NO_CONTEXT_REFUSAL
+        citations = []
+        if ctx.stream_tokens:
+            await ctx.fire("rollback", text=text)
 
-async def _emit_answer_stream(ctx: AgentContext, text: str) -> None:
-    """Emit an already-GUARDED answer to a streaming client as ``token`` events
-    (no-op when the turn isn't streaming). Chunks on whitespace so the UI keeps its
-    progressive 'typing' feel; the content is final/guarded so chunk size is purely
-    cosmetic. Trailing whitespace is preserved per chunk, so client-side
-    concatenation reproduces the text. We cannot stream during generation
-    (see answer_node) — the output guard must run first."""
-    if not (ctx.stream_tokens and ctx.emit is not None) or not text:
-        return
-    for tok in re.findall(r"\S+\s*|\s+", text):   # words-with-trailing-space, or pure-space runs
-        await ctx.fire("token", text=tok)
+    return {"answer": text, "citations": citations, "lane": lane.value, "output_flags": flags}
 
 
 async def output_guardrail_node(state: ChatState, ctx: AgentContext) -> dict:
-    """NODE 5 — final safety check on the generated answer BEFORE it leaves, and
-    the ONLY place a generated answer is streamed to the client.
+    """NODE 5 — post-generation safety check.
 
-    Verifies the answer is actually grounded in the retrieved chunks (catches
-    hallucination), that its citations are valid, and redacts any leaked PII. If
-    it blocks, we drop the citations so nothing unverified is shown as a source.
-    answer_node buffered the generation WITHOUT streaming it; only here — after the
-    guard has approved/redacted, or replaced a blocked answer with a safe canned
-    reply — do we stream the GUARDED text out. That ordering is what makes
-    "no unverified token reaches the user" actually true.
+    Runs deterministic guards (PII redaction, groundedness verification) on the
+    COMPLETE answer. Since answer_node already streamed tokens live, this node
+    handles two cases:
+
+      * PASS (or redaction-only): answer stays as-is (or with PII masked). No
+        client-visible event needed — tokens already streamed.
+      * BLOCK (hallucinated citation): send a "rollback" event that tells the
+        client to REPLACE all streamed tokens with the safe fallback text. The
+        client treats this as an atomic replacement.
+
+    The output guard is deterministic (~5ms, zero LLM calls: Presidio PII +
+    citation-index verification), so the window between streaming and guard is
+    negligible.
     """
     await ctx.fire("status", stage="output_guardrail")
     res = await ctx.output_guard.run(state.get("answer", ""), state.get("context_chunks") or [], ctx.sc)
     updates: dict[str, Any] = {"answer": res.text, "output_flags": res.flags}
+
     if res.blocked:
         updates["citations"] = []
-    # Stream the GUARDED answer now (no-op when not streaming) — deliberately AFTER
-    # the guard, so redaction/blocking has already been applied to res.text.
-    await _emit_answer_stream(ctx, res.text)
+        if ctx.stream_tokens:
+            await ctx.fire("rollback", text=res.text)
+    elif res.text != state.get("answer", ""):
+        if ctx.stream_tokens:
+            await ctx.fire("rollback", text=res.text)
+
     return updates
 
 
@@ -457,7 +446,7 @@ async def output_guardrail_node(state: ChatState, ctx: AgentContext) -> dict:
 # graph assembly (internal engine)
 # --------------------------------------------------------------------------- #
 def build_report_graph(ctx: AgentContext):
-    """Wire the five nodes above into a runnable graph using our built-in engine.
+    """Wire the nodes into a runnable graph using our built-in engine.
 
     Notice how each node is added with ``lambda s: the_node(s, ctx)`` — that
     closure is how the per-request services/identity (``ctx``) get INTO a node
@@ -467,21 +456,17 @@ def build_report_graph(ctx: AgentContext):
     """
     g = StateGraph()
     g.add_node(N_INPUT_GUARD, lambda s: input_guardrail_node(s, ctx))
-    g.add_node(N_TRIAGE, lambda s: triage_node(s, ctx))
     g.add_node(N_ROUTE, lambda s: route_node(s, ctx))
     g.add_node(N_GATHER, lambda s: dispatch_node(s, ctx))
     g.add_node(N_ANSWER, lambda s: answer_node(s, ctx))
     g.add_node(N_OUTPUT_GUARD, lambda s: output_guardrail_node(s, ctx))
 
     g.set_entry(N_INPUT_GUARD)
-    # blocked -> END; otherwise triage for small-talk before doing real work.
     g.add_conditional_edges(
         N_INPUT_GUARD,
         lambda s: "blocked" if s.get("blocked") else "ok",
-        {"blocked": END, "ok": N_TRIAGE},
+        {"blocked": END, "ok": N_ROUTE},
     )
-    # triage always passes through to routing — the LLM handles all messages.
-    g.add_edge(N_TRIAGE, N_ROUTE)
     g.add_edge(N_ROUTE, N_GATHER)
     g.add_edge(N_GATHER, N_ANSWER)
     g.add_edge(N_ANSWER, N_OUTPUT_GUARD)
@@ -494,7 +479,6 @@ def build_report_graph(ctx: AgentContext):
 # truth, so the two engines can never drift apart.
 NODE_SPECS = [
     (N_INPUT_GUARD, input_guardrail_node),
-    (N_TRIAGE, triage_node),
     (N_ROUTE, route_node),
     (N_GATHER, dispatch_node),
     (N_ANSWER, answer_node),
@@ -677,42 +661,56 @@ def _parse_critic(text: str) -> dict:
     return {"complete": True, "missing": []}
 
 
-async def reflect_gate_node(state: ChatState, ctx: AgentContext) -> dict:
-    """REFLECT GATE — runs AFTER the answer. This is what makes the loop agentic
-    rather than a one-shot pipeline: a critic LLM judges whether the ANSWER
-    actually addresses the question and every sub-question. If it finds a real gap
-    (or a step returned no evidence) and budget remains, it loops back to PLAN with
-    a note on what's missing; the next round re-plans for the gap and ACCUMULATES
-    evidence (plan_dispatch seeds from the prior context).
+def _evidence_is_strong(state: ChatState) -> bool:
+    """Fast heuristic: skip the LLM critic when evidence is clearly sufficient.
 
-    Conservative + BOUNDED: reflection runs only when the LLM router is on
-    (``router_mode=llm``) and only up to ``max_replans`` times, so a turn can never
-    loop indefinitely. The decision is read by the conditional edge (replan -> plan,
-    finish -> output_guard)."""
+    True when ALL plan steps succeeded with evidence AND the answer has enough
+    citations relative to context. This avoids a full FAST-lane LLM call (~1-2s)
+    on well-answered queries — the critic only fires when something looks weak.
+    """
+    results = state.get("plan_results") or []
+    if not results:
+        return False
+    for r in results:
+        if not r.get("ok") or r.get("found", 0) == 0:
+            return False
+    answer = state.get("answer", "")
+    chunks = state.get("context_chunks") or []
+    if not chunks:
+        return False
+    from app.core.rag.citations import extract_citation_indices
+    cited = extract_citation_indices(answer)
+    # Strong = at least 2 distinct citations and covers >30% of available chunks
+    return len(cited) >= 2 and len(cited) / len(chunks) > 0.3
+
+
+async def reflect_gate_node(state: ChatState, ctx: AgentContext) -> dict:
+    """REFLECT GATE — decides whether the answer needs another round.
+
+    THREE-TIER decision (cheapest first, avoids wasted LLM calls):
+      1. Budget exhausted (count >= max_replans) → finish immediately
+      2. Evidence is strong (all steps OK, good citation density) → finish (no LLM)
+      3. Otherwise → run the LLM critic to check completeness + groundedness
+
+    Only tier 3 costs an LLM call. On well-answered queries (~80% of turns), tier 2
+    exits early and saves 1-2s of model inference.
+    """
     count = state.get("replan_count", 0)
     max_replans = getattr(ctx.settings, "max_replans", 1)
-    # ``router_mode=llm`` gates reflection. (The provider-name check is a belt-and-
-    # suspenders guard against a non-reasoning stub; real providers always pass it.)
     is_llm = ctx.settings.router_mode == "llm" and getattr(ctx.deps.llm, "provider", "") != "deterministic"
     if not is_llm or count >= max_replans:
         return {"needs_replan": False}
 
+    # EARLY EXIT: strong evidence = no need for the LLM critic
+    if _evidence_is_strong(state):
+        return {"needs_replan": False}
+
     results = state.get("plan_results") or []
-    # A "hard gap" = a step that errored or returned ZERO evidence — a concrete hole.
-    # Kept as a signal: even if the critic likes the prose, an empty/failed step means
-    # the loop should try again (within budget).
     hard_gaps = [r for r in results if not r.get("ok") or r.get("found", 0) == 0]
     question = state.get("safe_question", "")
     answer = state.get("answer", "")
     subqs = "; ".join(r.get("subq", "") for r in results) or question
 
-    # STRUCTURED completeness+groundedness critic (deep-reasoning gate). It returns a
-    # PARSED verdict, not prose we keyword-sniff: {"complete": bool, "missing": [...]}.
-    # It judges whether the ANSWER fully covers the QUESTION + every SUB-QUESTION AND is
-    # grounded in evidence (not vague/asserted), and names the most valuable follow-up
-    # queries to close any gap. We no longer short-circuit on a raw citation count — the
-    # critic decides on RELEVANCE, not mere presence of >=2 cites. Reflection must never
-    # break a turn, so any failure finishes with what we have.
     critic = [
         ChatMessage(role="system", content=(
             "You are a strict completeness and groundedness critic for a security-"
@@ -734,17 +732,13 @@ async def reflect_gate_node(state: ChatState, ctx: AgentContext) -> dict:
 
     complete = bool(verdict.get("complete", True))
     missing = [m.strip() for m in (verdict.get("missing") or []) if isinstance(m, str) and m.strip()][:3]
-    # Finish when the critic is satisfied AND no step came back empty/errored.
     if complete and not hard_gaps:
         return {"needs_replan": False}
 
-    # Next round's targeted notes: the critic's missing items, else the failed sub-questions.
     note = "; ".join(missing) if missing else (
         "Unresolved: " + "; ".join(f"{r['domain']} ({r['subq']})" for r in hard_gaps))
     if not note:
         return {"needs_replan": False}
-    # VISIBLE REASONING: surface the critic's verdict as a "thinking" step AND a short
-    # status line — the user sees the answer being checked and what it's going back for.
     await ctx.fire("thinking", stage="reflecting",
                    text=f"Reviewing the answer (round {count + 1}) — still need: {note}")
     await ctx.fire("status", stage="reflecting", round=count + 1, reason=note[:160])
@@ -757,7 +751,6 @@ def build_planner_graph(ctx: AgentContext):
     back to plan, which the engine's max-steps fuse keeps bounded."""
     g = StateGraph()
     g.add_node(N_INPUT_GUARD, lambda s: input_guardrail_node(s, ctx))
-    g.add_node(N_TRIAGE, lambda s: triage_node(s, ctx))
     g.add_node(N_PLAN, lambda s: plan_node(s, ctx))
     g.add_node(N_PLAN_DISPATCH, lambda s: plan_dispatch_node(s, ctx))
     g.add_node(N_ANSWER, lambda s: answer_node(s, ctx))
@@ -768,10 +761,8 @@ def build_planner_graph(ctx: AgentContext):
     g.add_conditional_edges(
         N_INPUT_GUARD,
         lambda s: "blocked" if s.get("blocked") else "ok",
-        {"blocked": END, "ok": N_TRIAGE},
+        {"blocked": END, "ok": N_PLAN},
     )
-    # triage always passes through to planning — the LLM handles all messages.
-    g.add_edge(N_TRIAGE, N_PLAN)
     g.add_edge(N_PLAN, N_PLAN_DISPATCH)
     g.add_edge(N_PLAN_DISPATCH, N_ANSWER)
     g.add_edge(N_ANSWER, N_REPLAN_GATE)
@@ -790,7 +781,6 @@ def build_planner_graph(ctx: AgentContext):
 # the reflect gate sits AFTER answer.
 PLANNER_NODE_SPECS = [
     (N_INPUT_GUARD, input_guardrail_node),
-    (N_TRIAGE, triage_node),
     (N_PLAN, plan_node),
     (N_PLAN_DISPATCH, plan_dispatch_node),
     (N_ANSWER, answer_node),

@@ -101,35 +101,29 @@ class RetrievalPipeline:
         apply_time_filters: bool = True,
         visibility: str = "tenant",
     ) -> list[Chunk]:
-        """The READ path — the full retrieve sequence for one query. This is the
-        method specialists/retrievers ultimately call to get evidence chunks."""
+        """The READ path — the full retrieve sequence for one query."""
+        tracer = getattr(ctx.deps, "tracer", None)
         sf = filters or SearchFilters()
-        # If the caller didn't pin a date window, auto-derive one from the question
-        # ("last quarter" -> a concrete range). Explicit filters always win.
         if apply_time_filters and not (sf.date_from or sf.date_to):
             df, dt = extract_time_filters(query)
             if df or dt:
                 sf = sf.model_copy(update={"date_from": df, "date_to": dt})
 
-        # Embed the question into the same vector space as the indexed chunks.
         qv = await self.embedder.embed_query(query)
-        # OVER-FETCH: pull more candidates than we'll ultimately return, so the
-        # reranker has a rich pool to pick the truly-best top_k from (the first
-        # half of over-fetch-then-rerank). org_id=ctx.org_id is the mandatory
-        # tenant scope, taken from the trusted context — never from the query.
         over_fetch = max(self.settings.retrieval_top_k, top_k or 0)
         chunks = await self.store.search(
             collection, qv, org_id=ctx.org_id, top_k=over_fetch, filters=sf, visibility=visibility
         )
-        # Apply soft time-decay before the final cut.
         chunks = self._apply_recency(chunks)
         final_k = top_k or self.settings.rerank_top_k
-        # RERANK the over-fetched candidates and keep top_k (the second half of the
-        # pattern). If reranking is off, just truncate to top_k.
         if self.settings.rerank_enabled and chunks:
             chunks = await self.reranker.rerank(query, chunks, final_k)
         else:
             chunks = chunks[:final_k]
+
+        if tracer:
+            tracer.event("rag.retrieve", collection=collection, org_id=ctx.org_id,
+                         query_len=len(query), results=len(chunks), top_k=final_k)
         return chunks
 
     async def aclose(self) -> None:

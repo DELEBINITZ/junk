@@ -231,82 +231,31 @@ class Settings(BaseSettings):
     # trigger settings bound how much chat history is kept verbatim before it gets
     # rolled into a running summary.
     agent_engine: Literal["internal", "langgraph"] = "internal"
-    max_tool_iterations: int = 4
-    # Small-talk / scope triage: greet + steer on "hi" / "what can you do" / off-topic
-    # WITHOUT routing, retrieval, or tool calls. Off => every message runs the full agent.
-    smalltalk_handling: bool = True
-    history_window_messages: int = 12     # how many prior messages run_turn loads
-    answer_history_turns: int = 6         # how many of those the answer prompt includes verbatim
+    max_tool_iterations: int = 2
+    history_window_messages: int = 12
+    answer_history_turns: int = 6
     summary_trigger_messages: int = 20
-    # CROSS-SESSION RECALL: pull a few relevant snippets from the user's OTHER (past)
-    # conversations into context, so follow-ups that reference earlier chats have
-    # continuity ("like we discussed last week"). Org+user scoped by the store — never
-    # crosses tenant/user. Injected as background context only, NOT citable evidence.
     cross_session_recall: bool = True
-    cross_session_recall_k: int = 3       # max past-conversation snippets to inject
-    # The agentic path is ON by default: the planner brain + LLM tool-calling. Both
-    # DEGRADE GRACEFULLY to deterministic behaviour when no real LLM is wired (the
-    # provider gate inside the supervisor/planner/specialist makes them no-ops on
-    # the deterministic stub), so the zero-infra path still works. Point the LLM at
-    # your Qwen/SGLang and the full agentic loop (plan -> tools -> reflect) lights up.
-    router_mode: Literal["heuristic", "llm"] = "llm"
-    # How the supervisor picks which module(s)/app(s) handle a query when NOT using
-    # the LLM router. Routing is ALWAYS dynamic (by meaning), never by curated
-    # keywords — the brittle keyword/``routing_hints`` path has been removed because
-    # it silently mis-routed any query whose wording differed from the hand-written
-    # phrases. "semantic" (default) = EMBEDDING similarity between the query and each
-    # module's natural-language profile (display_name + description + tool
-    # names/descriptions). The default embedder is deterministic + offline, so this
-    # works with no model; a real embedder sharpens recall. "llm" defers entirely to
-    # the LLM router (router_mode=llm + a real model).
-    routing_strategy: Literal["semantic", "llm"] = "semantic"
-    # Orchestration strategy. ``heuristic`` = the v1 supervisor->specialists graph
-    # (route -> parallel dispatch -> answer). ``planner`` = the LLM-brain graph
-    # (plan -> dispatch-with-dependencies -> synthesize -> bounded replan): it
-    # decomposes a query into steps across modules and supports cross-module data
-    # dependencies (a step can consume an earlier step's findings). The planner
-    # falls back to a deterministic supervisor-style plan when no real LLM is wired,
-    # so the zero-infra path still works and tests stay green.
-    orchestrator_mode: Literal["heuristic", "planner"] = "planner"
-    max_plan_steps: int = 6      # hard cap on steps the planner may emit (bounds fan-out + cost)
-    # DEEP REASONING depth: how many times the reflect gate may revise the plan after
-    # finding a gap (LLM mode only; the deterministic path always finishes in one
-    # pass). 3 lets the agent iterate a few times — gather, notice what's missing,
-    # fetch the missing data, and re-check — before answering. Bounds cost/latency
-    # (each round is a full plan+answer+critic pass); raise for harder questions, set
-    # 0 to disable reflection. On a single 72B every round is ~several model calls.
-    max_replans: int = 3
-    planner_max_fanout: int = 2  # max modules a single (deterministic) plan spreads across
+    cross_session_recall_k: int = 3
+    # The planner decomposes queries into sub-questions, picks modules, and dispatches
+    # specialists. LLM routing lets the model pick the best module(s) by meaning.
+    router_mode: Literal["llm"] = "llm"
+    max_plan_steps: int = 6
+    # Reflection depth: how many times the reflect gate may loop back for missing
+    # evidence. Each round = re-plan + dispatch + answer + critic. 1 is enough to
+    # catch a gap; raise for harder multi-hop analysis.
+    max_replans: int = 1
+    planner_max_fanout: int = 2
 
-    # ---- Remote MCP servers + tool-context budget --------------------------
-    # Per-module MCP server URLs. Empty => that module runs IN-PROCESS (local
-    # tools). Set one (e.g. a FastMCP server for EASM) and that module's tool
-    # EXECUTION is routed there over MCP, while its manifest stays local as the
-    # contract (so RBAC, the action gate, and planner cards are unchanged). Brand
-    # and ACI follow the same pattern when their servers exist.
-    easm_mcp_url: str = ""
-    brand_mcp_url: str = ""
-    aci_mcp_url: str = ""
-    # REMOTE MCP TRANSPORT AUTH (API key). The standard "is this my trusted core
-    # calling?" gate: the client sends ``X-API-Key`` and the server checks it. This
-    # is SEPARATE from the identity (the org/user still ride in the signed service
-    # token). ``mcp_api_keys`` maps module_id -> key; ``mcp_api_key`` is the shared
-    # fallback for all servers. Required in prod once a remote MCP server is wired.
+    # ---- Remote MCP servers -------------------------------------------------
+    # ALL modules run as remote MCP servers. Wire them via a single {module_id: url}
+    # map. Set as JSON in env: MCP_URLS={"reports":"http://reports:8000/mcp","easm":"http://easm:8000/mcp"}
+    # Bootstrap builds a FastMCPRemote for each entry. RBAC + action gate enforced locally.
+    mcp_urls: dict[str, str] = Field(default_factory=dict)
+    # Transport auth: the client sends X-API-Key so the remote server can verify the
+    # caller is the trusted core. Per-module keys override the shared fallback.
     mcp_api_key: str = ""
     mcp_api_keys: dict[str, str] = Field(default_factory=dict)
-    # Utility module backed by the external `mcp-test-kits` MCP server. Empty =>
-    # the testkit module runs its LOCAL stub tools; set to e.g.
-    # http://localhost:3000/mcp to route execution to the real server.
-    testkit_mcp_url: str = ""
-    # GENERIC MCP wiring (the easy-integration path). A {module_id: url} map that
-    # promotes ANY capability module to its own MCP server with ZERO code edits — no
-    # new config field, no bootstrap change. Set it as JSON in the env, e.g.
-    #   MCP_URLS={"easm":"http://easm-mcp:8000/mcp","newmod":"http://newmod:8000/mcp"}
-    # bootstrap iterates the registered modules and wires a FastMCPRemote for any
-    # whose id appears here (this map wins) OR that has a legacy ``<id>_mcp_url`` field
-    # above (kept for back-compat). Adding a brand-new MCP-backed module = write its
-    # manifest + add one entry here. Routing/RBAC/the action gate are unchanged.
-    mcp_urls: dict[str, str] = Field(default_factory=dict)
     # TTL of the short-lived, org-scoped service token minted to authenticate a
     # remote MCP call (identity travels in this token, never in tool args).
     mcp_service_token_ttl_seconds: int = 120
@@ -419,39 +368,12 @@ class Settings(BaseSettings):
         # API keys gate the gateway — the dev default must not ship to prod.
         if not self.api_keys or "dev-api-key-change-me" in set(self.api_keys):
             bad.append("API_KEYS is empty or still the dev default — set real gateway key(s)")
-        # Guard models need nothing here: injection/content-safety run on the main
-        # LLM (LLMJudgeGuard), and a real LLM endpoint is already mandatory.
-        # Tool-backed modules MUST point at a real MCP server in prod, else they
-        # would serve their built-in mock data. (Corpus modules like reports are
-        # covered by RETRIEVAL_BACKEND=qdrant above.)
-        for enabled, url, var in (
-            (self.cap_easm_enabled, self.easm_mcp_url, "EASM_MCP_URL"),
-            (self.cap_brand_enabled, self.brand_mcp_url, "BRAND_MCP_URL"),
-            (self.cap_aci_enabled, self.aci_mcp_url, "ACI_MCP_URL"),
-        ):
-            if enabled and not url:
-                bad.append(f"{var} not set while its module is enabled — would serve mock data")
-        # When a REMOTE MCP server is wired, calls cross a process boundary, so the
-        # TRANSPORT must be authenticated: the client proves it's the trusted core via
-        # an API key (X-API-Key) the server checks. Require it in prod for EVERY remote
-        # module — without it, anyone who can reach the server could drive its tools.
-        # (The org/user identity additionally rides in the signed service token; an
-        # asymmetric service keypair — JWT_SERVICE_PRIVATE/PUBLIC_KEY — is recommended
-        # extra hardening so a compromised server also can't mint tokens, but the API
-        # key is the mandatory floor.)
-        remote_modules = [
-            (mid, _url) for mid, _url in (
-                ("easm", self.easm_mcp_url), ("brand", self.brand_mcp_url),
-                ("aci", self.aci_mcp_url), ("testkit", getattr(self, "testkit_mcp_url", "")),
-                *self.mcp_urls.items(),
-            ) if _url
-        ]
-        for mid, _url in remote_modules:
-            if not self.mcp_api_key_for(mid):
+        # Every remote MCP server MUST have transport auth in prod.
+        for mid, _url in self.mcp_urls.items():
+            if _url and not self.mcp_api_key_for(mid):
                 bad.append(
                     f"remote MCP server for '{mid}' is configured but no API key is set — "
-                    f"set MCP_API_KEY (shared) or MCP_API_KEYS['{mid}'] so the server can "
-                    f"authenticate the caller (and pass the same key to the server)")
+                    f"set MCP_API_KEY (shared) or MCP_API_KEYS['{mid}']")
         if bad:
             raise ValueError(
                 "ENVIRONMENT=prod but insecure/incomplete configuration detected. Fix:\n  - "

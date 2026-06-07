@@ -41,6 +41,7 @@ N_OUTPUT_GUARD = "output_guardrail"
 N_PLAN = "plan"
 N_PLAN_DISPATCH = "plan_dispatch"
 N_REPLAN_GATE = "replan_gate"
+N_PARALLEL_RETRIEVE = "parallel_retrieve"
 
 
 class ChatState(TypedDict, total=False):
@@ -181,4 +182,5 @@ __all__ = [
     "N_PLAN",
     "N_PLAN_DISPATCH",
     "N_REPLAN_GATE",
+    "N_PARALLEL_RETRIEVE",
 ]

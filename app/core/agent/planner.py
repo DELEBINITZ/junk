@@ -110,14 +110,15 @@ class Planner:
     async def plan(
         self, question: str, sc: SecurityContext, *,
         replan_notes: str = "", history: list | None = None, summary: str = "",
+        evidence_hint: str = "",
     ) -> Plan:
         """Produce a Plan. Try the LLM planner when enabled; on any failure (or in
         deterministic mode) fall back to the heuristic plan so a turn always gets
-        a usable plan. ``history``/``summary`` give the planner conversational
-        context so it can decompose FOLLOW-UP questions ("and which are critical?")
-        correctly instead of planning the bare words in isolation."""
+        a usable plan. ``evidence_hint`` is a short summary of what evidence is
+        already available (from a retrieval probe) so the planner can make informed
+        decomposition decisions."""
         if self._use_llm():
-            p = await self._llm_plan(question, sc, replan_notes, history or [], summary)
+            p = await self._llm_plan(question, sc, replan_notes, history or [], summary, evidence_hint)
             if p and p.steps:
                 return p
         return await self._heuristic_plan(question, sc)
@@ -136,7 +137,7 @@ class Planner:
 
     async def _llm_plan(
         self, question: str, sc: SecurityContext, replan_notes: str,
-        history: list | None = None, summary: str = "",
+        history: list | None = None, summary: str = "", evidence_hint: str = "",
     ) -> Plan | None:
         """Ask the model for a JSON plan over the capability cards. Returns None on
         any parse/validation failure so the caller falls back to the heuristic plan
@@ -172,6 +173,8 @@ class Planner:
             if role in ("user", "assistant") and content:
                 convo += f"{role}: {content[:200]}\n"
         user = question if not replan_notes else f"{question}\n\n(Revise the plan. {replan_notes})"
+        if evidence_hint:
+            user = f"{user}\n\n[{evidence_hint}]"
         if convo:
             user = f"[Conversation so far]\n{convo}\n[Current question]\n{user}"
         try:
