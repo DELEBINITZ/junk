@@ -141,18 +141,30 @@ def _parse_judge_verdict(raw: str) -> dict[str, Any] | None:
     the caller's fail policy, never an implicit allow. Booleans must be real JSON
     booleans: a judge manipulated into prose/string output fails closed. Pure, so
     it is unit-testable without a live model."""
-    m = re.search(r"\{.*?\}", raw or "", re.DOTALL)   # first {...} (schema is flat)
+    import logging
+    logger = logging.getLogger(__name__)
+    if not raw:
+        logger.warning("judge returned empty response")
+        return None
+    # Normalize Python-style bools (True/False) to JSON (true/false) — common with
+    # smaller models that conflate Python dict repr with JSON.
+    normalized = raw.replace("True", "true").replace("False", "false")
+    m = re.search(r"\{.*?\}", normalized, re.DOTALL)   # first {...} (schema is flat)
     if not m:
+        logger.warning("judge verdict has no JSON object: %s", raw[:200])
         return None
     try:
         obj = json.loads(m.group(0))
     except ValueError:
+        logger.warning("judge verdict JSON parse failed: %s", m.group(0)[:200])
         return None
     if not isinstance(obj, dict):
         return None
     inj, uns = obj.get("injection"), obj.get("unsafe")
     if not isinstance(inj, bool) or not isinstance(uns, bool):
+        logger.warning("judge verdict missing bool fields: %s", obj)
         return None
+    logger.debug("judge verdict: %s", obj)
     return {"injection": inj, "unsafe": uns, "reason": str(obj.get("reason", ""))[:80]}
 
 
@@ -184,6 +196,8 @@ class LLMJudgeGuard:
         self.max_chars = max_chars              # latency clip, not a window fit
 
     async def check(self, text: str, ctx: Any) -> GuardrailVerdict:
+        import logging
+        logger = logging.getLogger(__name__)
         from app.core.llm.base import ChatMessage, Lane
 
         # De-obfuscate BEFORE judging, defang fence escapes, clip for latency.
@@ -195,8 +209,10 @@ class LLMJudgeGuard:
                  ChatMessage(role="user", content=user)],
                 lane=Lane.FAST, temperature=0.0, max_tokens=96,
             )
+            logger.info("LLM judge raw response: %s", repr(resp.text))
             verdict = _parse_judge_verdict(resp.text)
-        except Exception:
+        except Exception as exc:
+            logger.warning("LLM judge call failed: %s", exc)
             verdict = None                      # network/server fault == judge failure
         if verdict is None:
             if self.fail_closed:
