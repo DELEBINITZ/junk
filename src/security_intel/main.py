@@ -1,0 +1,207 @@
+"""FastAPI application — production-grade LangGraph multi-agent system.
+
+Startup sequence:
+1. Settings + structured logging
+2. Database (Postgres with RLS)
+3. LLM LaneRouter (FAST/STANDARD/DEEP)
+4. Agent Registry (auto-discover from config)
+5. Build all agents (LangGraph create_react_agent)
+6. Build orchestrator (LangGraph StateGraph)
+7. Start serving
+
+Adding a new MCP agent requires ONLY:
+- Set MCP_SERVERS env: {"new_agent": {"url": "...", "transport": "sse"}}
+- Register in _register_agents() with description
+"""
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from security_intel.config import Settings
+from security_intel.llm.provider import LaneRouter
+from security_intel.db.postgres import Database
+from security_intel.db.migrations import run_migrations
+from security_intel.memory.checkpointer import get_checkpointer
+from security_intel.memory.conversations import ConversationStore
+from security_intel.memory.summarizer import RollingSummarizer
+from security_intel.agents.registry import AgentRegistry, AgentSpec
+from security_intel.agents.orchestrator import build_orchestrator
+from security_intel.tools.mcp_loader import load_mcp_tools_for_agent
+from security_intel.agents.reports.tools import get_reports_tools
+from security_intel.agents.easm.tools import get_easm_tools
+from security_intel.observability.logging import setup_logging, get_logger
+from security_intel.observability.middleware import TracingMiddleware
+from security_intel.observability.tracing import get_langfuse_handler
+from security_intel.api.routes import router
+
+
+async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
+    """Register all specialist agents with the registry.
+
+    To add a new agent:
+    1. Define its tools (local or MCP)
+    2. Register with AgentSpec here
+    3. Done — planner auto-discovers it, orchestrator auto-routes to it.
+    """
+
+    # Reports Agent
+    reports_tools = get_reports_tools(settings)
+    registry.register(AgentSpec(
+        id="reports",
+        display_name="Security Reports Agent",
+        description="Searches security reports corpus (threat intel, CVEs, scan findings, remediation). "
+                    "Use for known threats, vulnerabilities, past findings, compliance status.",
+        capabilities=[
+            "Semantic search over security reports",
+            "Filter by threat type, TLP level, report type",
+            "Get report metadata and details",
+            "Find remediation guidance",
+        ],
+        system_prompt=(
+            "You are a Security Reports specialist. Answer questions using the organization's "
+            "security reports corpus. Use search_reports for semantic search, search_reports_by_filter "
+            "for metadata queries, get_report_metadata for specific reports. "
+            "Always cite sources with report titles. Say 'no relevant reports found' if searches empty. "
+            "Be concise, factual, grounded in evidence."
+        ),
+        tools=reports_tools,
+    ))
+
+    # EASM Agent
+    easm_tools = await get_easm_tools(settings)
+    registry.register(AgentSpec(
+        id="easm",
+        display_name="EASM Agent",
+        description="Queries external attack surface (assets, exposures, changes, rescans). "
+                    "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
+        capabilities=[
+            "Query external-facing assets (domains, IPs, services)",
+            "Get current exposures and security findings",
+            "Track attack surface changes over time",
+            "Trigger asset rescans (requires approval)",
+        ],
+        system_prompt=(
+            "You are an External Attack Surface Management specialist. Answer questions about the "
+            "organization's internet-facing assets and exposures. Use query_assets to find assets, "
+            "get_exposures for vulnerabilities, get_asset_changes for recent changes. "
+            "trigger_rescan requires human approval. Be precise about severity and asset details."
+        ),
+        tools=easm_tools,
+        side_effecting_tools={"trigger_rescan"},
+    ))
+
+    # --- ADD NEW AGENTS HERE ---
+    # Example: Brand Protection Agent
+    # brand_tools = await load_mcp_tools_for_agent("brand", settings)
+    # if brand_tools:
+    #     registry.register(AgentSpec(
+    #         id="brand",
+    #         display_name="Brand Protection Agent",
+    #         description="Monitors brand abuse, phishing sites, typosquatting...",
+    #         capabilities=["Detect brand impersonation", "Track phishing domains", ...],
+    #         system_prompt="...",
+    #         tools=brand_tools,
+    #     ))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifecycle — initialize all services, cleanup on shutdown."""
+    settings = Settings()
+    app.state.settings = settings
+
+    # Structured logging
+    setup_logging(settings)
+    logger = get_logger("startup")
+    logger.info("Starting Security Intelligence Platform v2.0.0")
+
+    # Database
+    db = None
+    conversations = None
+    summarizer = None
+    try:
+        db = await Database.connect(settings)
+        await run_migrations(db)
+        conversations = ConversationStore(db)
+        app.state.db = db
+        app.state.conversations = conversations
+        logger.info("Postgres connected (RLS enabled)")
+    except Exception as e:
+        logger.error(f"Postgres unavailable: {e}. Chat persistence disabled.")
+
+    # LLM Lane Router
+    lane_router = LaneRouter(settings)
+    app.state.lane_router = lane_router
+    logger.info(f"LLM lanes: fast={settings.llm_fast_model}, standard={settings.llm_model}, deep={settings.llm_deep_model}")
+
+    # Summarizer
+    if conversations:
+        summarizer = RollingSummarizer(conversations, lane_router.fast)
+
+    # LangGraph Checkpointer
+    checkpointer = None
+    try:
+        checkpointer = await get_checkpointer(settings)
+        logger.info("LangGraph checkpointer ready (Postgres)")
+    except Exception as e:
+        logger.warning(f"Checkpointer unavailable: {e}")
+
+    # Langfuse tracing
+    langfuse_handler = get_langfuse_handler(settings)
+    app.state.langfuse_handler = langfuse_handler
+
+    # Agent Registry
+    registry = AgentRegistry()
+    await _register_agents(registry, settings)
+
+    # Build LangGraph agents
+    registry.build_agents(lane_router.standard)
+    app.state.registry = registry
+
+    # Build orchestrator (main LangGraph StateGraph)
+    orchestrator = build_orchestrator(
+        lane_router=lane_router,
+        registry=registry,
+        conversations=conversations,
+        summarizer=summarizer,
+        checkpointer=checkpointer,
+    )
+    app.state.orchestrator = orchestrator
+    logger.info(f"Orchestrator ready. Agents: {registry.agent_ids}")
+
+    yield
+
+    # Cleanup
+    if db:
+        await db.close()
+        logger.info("Postgres pool closed")
+
+
+def create_app() -> FastAPI:
+    """Application factory."""
+    settings = Settings()
+
+    app = FastAPI(
+        title="Security Intelligence Platform",
+        version="2.0.0",
+        description="Multi-agent security intelligence powered by LangGraph",
+        lifespan=lifespan,
+    )
+
+    # Middleware
+    app.add_middleware(TracingMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins.split(","),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    app.include_router(router)
+    return app
+
+
+app = create_app()
