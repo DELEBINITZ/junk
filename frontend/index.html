@@ -4,280 +4,379 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Security Intelligence — Chat</title>
-<!-- Markdown (marked) + sanitization (DOMPurify) + code highlighting (highlight.js) from CDN -->
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css" />
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
 <style>
   :root {
-    --bg:#0b0e14; --panel:#11151d; --panel2:#171c26; --panel3:#1d2430;
-    --line:#222a36; --line2:#2c3645;
-    --text:#e8eef6; --muted:#9aa4b2; --faint:#6b7480;
-    --accent:#4c8dff; --accent2:#7a6cff; --user:#2563eb;
-    --code-bg:#0a0d13; --ok:#3fb950; --warn:#e3b341;
-    --shadow:0 6px 24px rgba(0,0,0,.35); --shadow-sm:0 2px 8px rgba(0,0,0,.25);
-    --radius:14px;
+    --bg: #212121;
+    --bg-secondary: #171717;
+    --surface: #2f2f2f;
+    --surface-hover: #3a3a3a;
+    --surface-active: #424242;
+    --border: #424242;
+    --border-light: #4a4a4a;
+    --text: #ececec;
+    --text-secondary: #b4b4b4;
+    --text-muted: #8e8e8e;
+    --accent: #10a37f;
+    --accent-hover: #0d8c6d;
+    --user-bg: #2f2f2f;
+    --code-bg: #1e1e1e;
+    --shadow: 0 2px 6px rgba(0,0,0,.15);
+    --radius: 16px;
+    --max-width: 768px;
   }
-  * { box-sizing:border-box; }
-  html,body { height:100%; }
-  body { margin:0; display:flex; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-         background:radial-gradient(1200px 600px at 70% -10%, #131a26 0%, var(--bg) 60%); color:var(--text);
-         -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+    display: flex;
+  }
 
-  /* ---------- scrollbars ---------- */
-  ::-webkit-scrollbar { width:10px; height:10px; }
-  ::-webkit-scrollbar-thumb { background:var(--line2); border-radius:8px; border:2px solid transparent; background-clip:padding-box; }
-  ::-webkit-scrollbar-thumb:hover { background:#3a4658; background-clip:padding-box; }
-  ::-webkit-scrollbar-track { background:transparent; }
+  /* scrollbars */
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
 
   /* ---------- sidebar ---------- */
-  #sidebar { width:286px; background:rgba(17,21,29,.7); backdrop-filter:blur(8px);
-             border-right:1px solid var(--line); display:flex; flex-direction:column; }
-  #sidebar header { padding:16px 18px; border-bottom:1px solid var(--line); font-weight:650;
-                    display:flex; justify-content:space-between; align-items:center; letter-spacing:.2px; }
-  .brand { display:flex; align-items:center; gap:9px; font-size:14px; }
-  .brand .dot { width:22px; height:22px; border-radius:7px; background:linear-gradient(135deg,var(--accent),var(--accent2));
-                display:grid; place-items:center; font-size:12px; box-shadow:0 0 0 1px rgba(255,255,255,.06) inset; }
-  #newchat { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#fff; border:0; border-radius:8px;
-             padding:7px 12px; cursor:pointer; font-size:13px; font-weight:600; box-shadow:var(--shadow-sm);
-             transition:transform .12s ease, filter .12s ease; }
-  #newchat:hover { transform:translateY(-1px); filter:brightness(1.08); }
-  #newchat:active { transform:translateY(0); }
-  #sessions { overflow-y:auto; flex:1; padding:8px; }
-  .sess { padding:11px 13px; margin:2px 0; border-radius:9px; cursor:pointer; font-size:13px; color:var(--muted);
-          white-space:nowrap; overflow:hidden; text-overflow:ellipsis; transition:background .12s ease, color .12s ease; }
-  .sess:hover { background:var(--panel2); color:var(--text); }
-  .sess.active { background:linear-gradient(90deg, rgba(76,141,255,.16), rgba(122,108,255,.06)); color:var(--text);
-                 box-shadow:inset 3px 0 0 var(--accent); }
+  #sidebar {
+    width: 260px; background: var(--bg-secondary); display: flex; flex-direction: column;
+    border-right: 1px solid var(--border); flex-shrink: 0;
+  }
+  #sidebar header {
+    padding: 12px; display: flex; align-items: center; justify-content: space-between;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 600; color: var(--text);
+  }
+  .brand-icon {
+    width: 28px; height: 28px; border-radius: 8px; background: var(--accent);
+    display: grid; place-items: center; color: #fff; font-size: 14px; font-weight: 700;
+  }
+  #newchat {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; font-weight: 500;
+    transition: background .15s;
+  }
+  #newchat:hover { background: var(--surface); }
+  #sessions { overflow-y: auto; flex: 1; padding: 8px; }
+  .sess {
+    padding: 10px 12px; margin: 2px 0; border-radius: 8px; cursor: pointer;
+    font-size: 13px; color: var(--text-secondary); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; transition: background .12s;
+  }
+  .sess:hover { background: var(--surface); }
+  .sess.active { background: var(--surface); color: var(--text); }
 
   /* ---------- main ---------- */
-  #main { flex:1; display:flex; flex-direction:column; min-width:0; }
-  #topbar { padding:12px 22px; border-bottom:1px solid var(--line); font-size:12.5px; color:var(--muted);
-            display:flex; align-items:center; gap:8px; background:rgba(11,14,20,.5); }
-  #topbar .chip { background:var(--panel2); border:1px solid var(--line); border-radius:20px; padding:3px 10px; color:var(--muted); }
-  #messages { flex:1; overflow-y:auto; padding:28px 18px 8px; scroll-behavior:smooth; }
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
-  /* ---------- a chat turn ---------- */
-  .turn { max-width:860px; margin:0 auto 26px; display:flex; gap:14px; align-items:flex-start;
-          animation:rise .26s cubic-bezier(.2,.7,.3,1) both; }
-  @keyframes rise { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
-  .turn.user { flex-direction:row-reverse; }
-  .avatar { flex:0 0 32px; width:32px; height:32px; border-radius:9px; display:grid; place-items:center;
-            font-size:15px; margin-top:2px; box-shadow:var(--shadow-sm); user-select:none; }
-  .turn.assistant .avatar { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#fff; }
-  .turn.user .avatar { background:var(--panel3); color:var(--text); border:1px solid var(--line2); }
-  .content { min-width:0; flex:1; display:flex; flex-direction:column; }
-  .turn.user .content { align-items:flex-end; }
-  .role { font-size:11.5px; color:var(--faint); margin:0 4px 6px; font-weight:600; letter-spacing:.3px; text-transform:uppercase; }
+  /* ---------- messages ---------- */
+  #messages { flex: 1; overflow-y: auto; padding: 24px 0; }
 
-  .bubble { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:15px 18px;
-            line-height:1.62; word-wrap:break-word; max-width:100%; box-shadow:var(--shadow-sm);
-            border-top-left-radius:4px; }
-  .turn.user .bubble { background:linear-gradient(135deg,var(--user),#3b76f0); border-color:transparent; color:#fff;
-                       border-top-left-radius:var(--radius); border-top-right-radius:4px; }
+  /* ---------- welcome screen ---------- */
+  .welcome {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; padding: 40px 20px; text-align: center;
+  }
+  .welcome-icon {
+    width: 52px; height: 52px; border-radius: 50%; background: var(--accent);
+    display: grid; place-items: center; font-size: 24px; color: #fff; margin-bottom: 20px;
+  }
+  .welcome h1 { font-size: 24px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
+  .welcome p { font-size: 14px; color: var(--text-secondary); max-width: 460px; line-height: 1.6; }
+  .suggestions {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 28px; max-width: 520px; width: 100%;
+  }
+  .suggestion {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; cursor: pointer; text-align: left; transition: background .12s, border-color .12s;
+    font-size: 13px; color: var(--text-secondary); line-height: 1.4;
+  }
+  .suggestion:hover { background: var(--surface-hover); border-color: var(--border-light); }
+  .suggestion strong { display: block; color: var(--text); margin-bottom: 4px; font-size: 13px; }
 
-  /* ---------- markdown rhythm ---------- */
-  .bubble > :first-child { margin-top:0; } .bubble > :last-child { margin-bottom:0; }
-  .bubble p { margin:0 0 11px; }
-  .bubble h1,.bubble h2,.bubble h3,.bubble h4 { margin:20px 0 10px; line-height:1.3; font-weight:650; }
-  .bubble h1 { font-size:1.4em; } .bubble h2 { font-size:1.22em; border-bottom:1px solid var(--line); padding-bottom:5px; }
-  .bubble h3 { font-size:1.08em; } .bubble h4 { font-size:1em; color:var(--muted); }
-  .bubble ul,.bubble ol { margin:0 0 11px; padding-left:22px; }
-  .bubble li { margin:4px 0; } .bubble li::marker { color:var(--accent); }
-  .bubble a { color:#79b0ff; text-decoration:none; border-bottom:1px solid rgba(121,176,255,.3); transition:border-color .12s; }
-  .bubble a:hover { border-bottom-color:#79b0ff; }
-  .bubble hr { border:0; border-top:1px solid var(--line); margin:16px 0; }
-  .bubble strong { color:#fff; font-weight:650; } .turn.user .bubble strong { color:#fff; }
-  .bubble blockquote { margin:0 0 11px; padding:6px 14px; border-left:3px solid var(--accent);
-                       background:rgba(76,141,255,.07); border-radius:0 8px 8px 0; color:var(--muted); }
-  .bubble blockquote p:last-child { margin-bottom:0; }
+  /* ---------- turn layout ---------- */
+  .turn {
+    padding: 24px 0; animation: fadeIn .3s ease;
+  }
+  .turn.assistant { background: var(--bg); }
+  .turn.user { background: var(--bg); }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-  /* inline code */
-  .bubble code { background:var(--code-bg); padding:2px 6px; border-radius:5px; font-size:.88em;
-                 font-family:"SF Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; border:1px solid var(--line);
-                 color:#e9b8ff; }
-  .turn.user .bubble code { background:rgba(0,0,0,.22); border-color:rgba(255,255,255,.14); color:#fff; }
+  .turn-inner {
+    max-width: var(--max-width); margin: 0 auto; padding: 0 24px;
+    display: flex; gap: 16px; align-items: flex-start;
+  }
+  .avatar {
+    flex: 0 0 30px; width: 30px; height: 30px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 14px; margin-top: 2px;
+  }
+  .turn.assistant .avatar { background: var(--accent); color: #fff; font-weight: 700; }
+  .turn.user .avatar { background: var(--surface-active); color: var(--text); }
+  .content { min-width: 0; flex: 1; }
 
-  /* ---------- code blocks (wrapped w/ header bar) ---------- */
-  .code-wrap { margin:0 0 12px; border:1px solid var(--line); border-radius:10px; overflow:hidden; background:var(--code-bg);
-               box-shadow:var(--shadow-sm); }
-  .code-bar { display:flex; align-items:center; justify-content:space-between; padding:6px 12px;
-              background:var(--panel2); border-bottom:1px solid var(--line); }
-  .code-lang { font-size:11px; color:var(--faint); font-family:ui-monospace,monospace; letter-spacing:.5px; text-transform:lowercase; }
-  .code-copy { background:transparent; color:var(--muted); border:1px solid var(--line2); border-radius:6px;
-               padding:3px 10px; font-size:11px; cursor:pointer; transition:all .12s ease; }
-  .code-copy:hover { color:var(--text); border-color:var(--accent); background:rgba(76,141,255,.1); }
-  .code-copy.done { color:var(--ok); border-color:var(--ok); }
-  .code-wrap pre { margin:0; padding:14px; overflow-x:auto; background:transparent; }
-  .bubble pre { margin:0 0 12px; padding:14px; background:var(--code-bg); border:1px solid var(--line); border-radius:10px; overflow-x:auto; }
-  .bubble pre code { background:transparent; border:0; padding:0; font-size:.85em; color:inherit; line-height:1.55; }
+  /* ---------- bubble (markdown body) ---------- */
+  .bubble { line-height: 1.7; word-wrap: break-word; font-size: 15px; color: var(--text); }
+  .bubble > :first-child { margin-top: 0; }
+  .bubble > :last-child { margin-bottom: 0; }
+  .bubble p { margin: 0 0 12px; }
+  .bubble h1, .bubble h2, .bubble h3, .bubble h4 { margin: 20px 0 10px; line-height: 1.3; font-weight: 600; }
+  .bubble h1 { font-size: 1.4em; }
+  .bubble h2 { font-size: 1.2em; }
+  .bubble h3 { font-size: 1.05em; }
+  .bubble ul, .bubble ol { margin: 0 0 12px; padding-left: 24px; }
+  .bubble li { margin: 4px 0; }
+  .bubble a { color: var(--accent); text-decoration: none; }
+  .bubble a:hover { text-decoration: underline; }
+  .bubble hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+  .bubble strong { color: #fff; font-weight: 600; }
+  .bubble blockquote {
+    margin: 0 0 12px; padding: 8px 16px; border-left: 3px solid var(--accent);
+    background: rgba(16,163,127,.06); border-radius: 0 8px 8px 0; color: var(--text-secondary);
+  }
+  .bubble blockquote p:last-child { margin-bottom: 0; }
+  .bubble code {
+    background: var(--code-bg); padding: 2px 6px; border-radius: 4px; font-size: .87em;
+    font-family: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border: 1px solid var(--border);
+  }
+  .bubble table { border-collapse: collapse; margin: 0 0 12px; width: 100%; font-size: .9em; }
+  .bubble th, .bubble td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  .bubble thead th { background: var(--surface); font-weight: 600; }
 
-  /* ---------- tables ---------- */
-  .bubble table { border-collapse:collapse; margin:0 0 12px; width:100%; font-size:.92em; overflow:hidden; border-radius:8px; }
-  .bubble th,.bubble td { border:1px solid var(--line); padding:7px 11px; text-align:left; }
-  .bubble thead th { background:var(--panel2); color:var(--text); font-weight:600; }
-  .bubble tbody tr:nth-child(even) { background:rgba(255,255,255,.02); }
+  /* ---------- code blocks ---------- */
+  .code-wrap {
+    margin: 0 0 12px; border: 1px solid var(--border); border-radius: 10px;
+    overflow: hidden; background: var(--code-bg);
+  }
+  .code-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 14px; background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .code-lang { font-size: 12px; color: var(--text-muted); font-family: monospace; }
+  .code-copy {
+    background: transparent; color: var(--text-secondary); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; transition: all .12s;
+  }
+  .code-copy:hover { color: var(--text); border-color: var(--accent); }
+  .code-copy.done { color: var(--accent); border-color: var(--accent); }
+  .code-wrap pre { margin: 0; padding: 16px; overflow-x: auto; }
+  .bubble pre { margin: 0 0 12px; padding: 16px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; overflow-x: auto; }
+  .bubble pre code { background: transparent; border: 0; padding: 0; font-size: .85em; color: inherit; }
 
   /* ---------- citations ---------- */
-  .cites { margin-top:13px; padding-top:11px; border-top:1px dashed var(--line); display:flex; flex-wrap:wrap; gap:7px; }
-  .cite { font-size:11.5px; background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:4px 10px 4px 8px;
-          color:var(--muted); cursor:help; display:inline-flex; align-items:center; gap:6px; transition:all .12s ease; }
-  .cite:hover { border-color:var(--accent); color:var(--text); }
-  .cite .n { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#fff; font-size:10px; font-weight:700;
-             min-width:16px; height:16px; border-radius:5px; display:grid; place-items:center; padding:0 3px; }
+  .cites { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 8px; }
+  .cite {
+    font-size: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 10px; color: var(--text-secondary); cursor: help;
+    display: inline-flex; align-items: center; gap: 6px; transition: all .12s;
+  }
+  .cite:hover { border-color: var(--accent); color: var(--text); }
+  .cite .n {
+    background: var(--accent); color: #fff; font-size: 10px; font-weight: 700;
+    min-width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center;
+  }
 
-  /* ---------- meta / feedback ---------- */
-  .meta { margin-top:11px; display:flex; gap:6px; align-items:center; }
-  .mbtn { cursor:pointer; opacity:.55; background:transparent; border:1px solid transparent; border-radius:7px;
-          padding:3px 7px; font-size:14px; line-height:1; transition:all .12s ease; color:var(--muted); }
-  .mbtn:hover { opacity:1; background:var(--panel2); border-color:var(--line); }
-  .mbtn.on { opacity:1; background:rgba(76,141,255,.14); border-color:var(--accent); }
-  .mbtn.copy { font-size:12px; }
+  /* ---------- meta row (copy/feedback) ---------- */
+  .meta { margin-top: 10px; display: flex; gap: 4px; align-items: center; }
+  .mbtn {
+    cursor: pointer; opacity: .6; background: transparent; border: 1px solid transparent;
+    border-radius: 6px; padding: 4px 8px; font-size: 14px; color: var(--text-secondary);
+    transition: all .12s;
+  }
+  .mbtn:hover { opacity: 1; background: var(--surface); border-color: var(--border); }
+  .mbtn.on { opacity: 1; color: var(--accent); }
 
-  /* ---------- thinking panel (visible reasoning) ---------- */
-  .think { margin:2px 4px 10px; border-left:2px solid var(--line2); background:rgba(122,108,255,.05);
-           border-radius:0 8px 8px 0; font-size:12.5px; overflow:hidden; }
-  .think > summary { cursor:pointer; list-style:none; padding:7px 12px; color:var(--muted);
-                     display:flex; align-items:center; gap:8px; user-select:none; font-weight:600; letter-spacing:.2px; }
-  .think > summary::-webkit-details-marker { display:none; }
-  .think > summary::after { content:"▸"; color:var(--faint); font-size:10px; margin-left:auto; transition:transform .15s; }
-  .think[open] > summary::after { transform:rotate(90deg); }
-  .think-dot { width:7px; height:7px; border-radius:50%; background:var(--accent2);
-               box-shadow:0 0 8px var(--accent2); animation:pulse 1.1s ease-in-out infinite; flex:0 0 auto; }
-  .think-dot.done { animation:none; opacity:.45; box-shadow:none; }
-  .think-body { padding:0 14px 10px; color:var(--muted); line-height:1.55; }
-  .tline { padding:6px 0; border-top:1px dashed var(--line); white-space:pre-wrap; }
-  .tline:first-child { border-top:0; }
-  .tstage { display:inline-block; font-size:10px; text-transform:uppercase; letter-spacing:.5px; vertical-align:1px;
-            color:var(--accent2); background:rgba(122,108,255,.12); border-radius:5px; padding:1px 6px; margin-right:8px; }
+  /* ---------- thinking panel ---------- */
+  .think {
+    margin: 4px 0 12px; border-left: 2px solid var(--border);
+    border-radius: 0 8px 8px 0; font-size: 13px; overflow: hidden;
+  }
+  .think > summary {
+    cursor: pointer; list-style: none; padding: 8px 12px; color: var(--text-muted);
+    display: flex; align-items: center; gap: 8px; user-select: none; font-weight: 500;
+  }
+  .think > summary::-webkit-details-marker { display: none; }
+  .think > summary::after { content: "▸"; font-size: 10px; margin-left: auto; transition: transform .15s; }
+  .think[open] > summary::after { transform: rotate(90deg); }
+  .think-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .think-dot.done { animation: none; opacity: .4; }
+  .think-body { padding: 0 14px 10px; color: var(--text-muted); line-height: 1.5; }
+  .tline { padding: 4px 0; border-top: 1px dashed var(--border); white-space: pre-wrap; }
+  .tline:first-child { border-top: 0; }
+  .tstage {
+    display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--accent); background: rgba(16,163,127,.1); border-radius: 4px;
+    padding: 1px 6px; margin-right: 6px;
+  }
 
-  /* ---------- status + typing + caret ---------- */
-  .status { font-size:12px; color:var(--accent); margin:8px 4px 0; min-height:16px; display:flex; align-items:center; gap:7px; }
-  .status:not(:empty)::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--accent);
-                                box-shadow:0 0 8px var(--accent); animation:pulse 1.1s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{ opacity:.4; transform:scale(.8);} 50%{ opacity:1; transform:scale(1.2);} }
-  .typing { display:inline-flex; gap:5px; padding:3px 2px; }
-  .typing i { width:7px; height:7px; border-radius:50%; background:var(--muted); display:inline-block; animation:bounce 1.2s infinite ease-in-out; }
-  .typing i:nth-child(2){ animation-delay:.18s; } .typing i:nth-child(3){ animation-delay:.36s; }
-  @keyframes bounce { 0%,80%,100%{ transform:translateY(0); opacity:.5;} 40%{ transform:translateY(-5px); opacity:1;} }
-  .caret { display:inline-block; width:8px; height:1.05em; vertical-align:text-bottom; margin-left:2px; border-radius:2px;
-           background:var(--accent); animation:blink 1s steps(1) infinite; }
-  @keyframes blink { 50%{ opacity:0; } }
+  /* ---------- status + typing ---------- */
+  .status { font-size: 12px; color: var(--text-muted); margin: 6px 0; min-height: 16px; display: flex; align-items: center; gap: 6px; }
+  .status:not(:empty)::before {
+    content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: .4; transform: scale(.8); } 50% { opacity: 1; transform: scale(1.1); } }
+  .typing { display: inline-flex; gap: 4px; padding: 4px 0; }
+  .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); display: inline-block; animation: bounce 1.2s infinite ease-in-out; }
+  .typing i:nth-child(2) { animation-delay: .15s; }
+  .typing i:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%,80%,100% { transform: translateY(0); opacity: .5; } 40% { transform: translateY(-4px); opacity: 1; } }
+  .caret {
+    display: inline-block; width: 2px; height: 1.1em; vertical-align: text-bottom;
+    background: var(--text); animation: blink .8s steps(1) infinite; margin-left: 1px;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
 
   /* ---------- composer ---------- */
-  #composer { border-top:1px solid var(--line); padding:16px 18px 20px; background:rgba(11,14,20,.6); }
-  #composer .row { max-width:860px; margin:0 auto; display:flex; gap:10px; align-items:flex-end;
-                   background:var(--panel); border:1px solid var(--line2); border-radius:14px; padding:8px 8px 8px 14px;
-                   box-shadow:var(--shadow); transition:border-color .15s ease; }
-  #composer .row:focus-within { border-color:var(--accent); box-shadow:0 0 0 3px rgba(76,141,255,.12), var(--shadow); }
-  #input { flex:1; resize:none; background:transparent; color:var(--text); border:0; outline:none;
-           padding:8px 0; font-size:14.5px; font-family:inherit; max-height:180px; line-height:1.5; }
-  #input::placeholder { color:var(--faint); }
-  #send { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#fff; border:0; border-radius:10px;
-          padding:0 20px; height:40px; cursor:pointer; font-weight:650; font-size:14px; box-shadow:var(--shadow-sm);
-          transition:transform .12s ease, filter .12s ease; }
-  #send:hover:not(:disabled) { transform:translateY(-1px); filter:brightness(1.08); }
-  #send:disabled { opacity:.45; cursor:default; }
-  .hint { max-width:860px; margin:8px auto 0; font-size:11px; color:var(--faint); text-align:center; }
+  #composer {
+    border-top: 1px solid var(--border); padding: 16px 24px 24px;
+    background: var(--bg);
+  }
+  #composer .wrap {
+    max-width: var(--max-width); margin: 0 auto;
+  }
+  #composer .row {
+    display: flex; gap: 10px; align-items: flex-end;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+    padding: 10px 10px 10px 18px; transition: border-color .15s, box-shadow .15s;
+  }
+  #composer .row:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(16,163,127,.15); }
+  #input {
+    flex: 1; resize: none; background: transparent; color: var(--text); border: 0; outline: none;
+    padding: 6px 0; font-size: 15px; font-family: inherit; max-height: 200px; line-height: 1.5;
+  }
+  #input::placeholder { color: var(--text-muted); }
+  #send {
+    background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+    width: 36px; height: 36px; cursor: pointer; display: grid; place-items: center;
+    transition: background .12s, transform .1s;
+  }
+  #send:hover:not(:disabled) { background: var(--accent-hover); transform: scale(1.05); }
+  #send:disabled { opacity: .4; cursor: default; }
+  #send svg { width: 18px; height: 18px; }
+  .hint { max-width: var(--max-width); margin: 8px auto 0; font-size: 11px; color: var(--text-muted); text-align: center; }
 </style>
 </head>
 <body>
   <aside id="sidebar">
     <header>
-      <span class="brand"><span class="dot">✦</span><span>Conversations</span></span>
+      <span class="brand"><span class="brand-icon">S</span><span>SecureChat</span></span>
       <button id="newchat">+ New</button>
     </header>
     <div id="sessions"></div>
   </aside>
   <main id="main">
-    <div id="topbar"></div>
     <div id="messages"></div>
     <div id="composer">
-      <div class="row">
-        <textarea id="input" rows="1" placeholder="Ask about your reports, attack surface, threats…  (Enter to send)"></textarea>
-        <button id="send">Send</button>
+      <div class="wrap">
+        <div class="row">
+          <textarea id="input" rows="1" placeholder="Ask about security reports, threats, vulnerabilities…"></textarea>
+          <button id="send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button>
+        </div>
+        <div class="hint">Enter to send · Shift+Enter for newline · Powered by your security intelligence platform</div>
       </div>
-      <div class="hint">Enter to send · Shift+Enter for newline</div>
     </div>
   </main>
 
 <script>
-// ============================ CONFIG (hardcoded for testing) =================
-// Run the API with AUTH_PROVIDER=apikey, then open this page at the app's "/" URL
-// (e.g. http://localhost:8000/) so requests are same-origin (no CORS).
+// ============================ CONFIG ========================================
 const CONFIG = {
-  API_BASE: "",                        // same-origin; or "http://localhost:8000"
-  API_KEY:  "dev-api-key-change-me",   // must be in settings.api_keys
-  ORG_ID:   "org_acme",
-  USER_ID:  "u-alice",
-  ROLES:    "analyst",                 // comma-separated
+  API_BASE: "",
+  API_KEY: "57888d36c4bb8679dc293f271f58b485e8485828a3ca1911187ddcb804306683",
+  JWT_TOKEN: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoidXNlci0xIiwib3JnX2lkIjoib3JnLTEiLCJyb2xlcyI6WyJhZG1pbiJdLCJlbWFpbCI6ImFrc2hheUB0ZXN0LmNvbSIsInR5cGUiOiJhY2Nlc3MiLCJqdGkiOiIyYzg1MTA0MzJjNDY0ZTk1OWU5NWU0NDU3MTFhMTNlYiIsImlhdCI6MTc4MDgzODUzOSwiZXhwIjoxNzgwODQyMTM5fQ.4WlOxXjFrBR8wm6YCQAdhxMx4TPkRUZA4YRCbHBHFAk",
 };
 // ============================================================================
 
-marked.setOptions({ breaks:true, gfm:true });
+marked.setOptions({ breaks: true, gfm: true });
 const $ = (s) => document.querySelector(s);
-const messagesEl = $("#messages"), sessionsEl = $("#sessions"), topbar = $("#topbar"), input = $("#input");
+const messagesEl = $("#messages"), sessionsEl = $("#sessions"), input = $("#input");
 let currentSession = null, streaming = false;
 
-const authHeaders = () => ({
-  "X-API-Key": CONFIG.API_KEY, "X-Org-Id": CONFIG.ORG_ID,
-  "X-User-Id": CONFIG.USER_ID, "X-Roles": CONFIG.ROLES,
-});
-const md = (t) => DOMPurify.sanitize(marked.parse(t || ""));
 const escapeHtml = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
+const md = (t) => DOMPurify.sanitize(marked.parse(t || ""));
 const TYPING = `<span class="typing"><i></i><i></i><i></i></span>`;
 
-function setTopbar() {
-  topbar.innerHTML =
-    `<span class="chip">org · ${escapeHtml(CONFIG.ORG_ID)}</span>` +
-    `<span class="chip">user · ${escapeHtml(CONFIG.USER_ID)}</span>` +
-    `<span class="chip">${currentSession ? "session " + escapeHtml(currentSession.slice(0, 12)) : "new conversation"}</span>`;
+function showWelcome() {
+  messagesEl.innerHTML = `
+    <div class="welcome">
+      <div class="welcome-icon">S</div>
+      <h1>Security Intelligence Assistant</h1>
+      <p>I can help you analyze security reports, review your attack surface, investigate threats, and explore vulnerability data — all grounded in your organization's own data.</p>
+      <div class="suggestions">
+        <div class="suggestion" onclick="askSuggestion(this)"><strong>Top threats</strong>Show me the top 10 threat actors targeting my region</div>
+        <div class="suggestion" onclick="askSuggestion(this)"><strong>Critical vulns</strong>What critical vulnerabilities were found this week?</div>
+        <div class="suggestion" onclick="askSuggestion(this)"><strong>Attack surface</strong>Summarize my external attack surface exposure</div>
+        <div class="suggestion" onclick="askSuggestion(this)"><strong>Recent reports</strong>What security reports were generated in the last 30 days?</div>
+      </div>
+    </div>`;
+}
+
+function askSuggestion(el) {
+  const text = el.querySelector("strong").nextSibling.textContent.trim();
+  input.value = text;
+  sendMessage();
 }
 
 // ---- sessions sidebar ----
 async function loadSessions() {
   try {
-    const r = await fetch(`${CONFIG.API_BASE}/v1/sessions`, { headers: authHeaders() });
+    const r = await fetch(`${CONFIG.API_BASE}/v1/sessions`, {
+      headers: { "X-API-Key": CONFIG.API_KEY, "Authorization": `Bearer ${CONFIG.JWT_TOKEN}` },
+    });
     if (!r.ok) return;
-    const rows = await r.json();
+    const data = await r.json();
+    const rows = data.sessions || data;
     sessionsEl.innerHTML = "";
     rows.forEach((s) => {
+      const id = s.session_id || s.id;
       const d = document.createElement("div");
-      d.className = "sess" + (s.id === currentSession ? " active" : "");
+      d.className = "sess" + (id === currentSession ? " active" : "");
       d.textContent = s.title || "New chat";
       d.title = s.title || "";
-      d.onclick = () => openSession(s.id);
+      d.onclick = () => openSession(id);
       sessionsEl.appendChild(d);
     });
-  } catch (e) { console.error(e); }
+  } catch (e) { console.error("sessions:", e); }
 }
 
-function newChat() { currentSession = null; messagesEl.innerHTML = ""; setTopbar(); loadSessions(); input.focus(); }
+function newChat() { currentSession = null; showWelcome(); loadSessions(); input.focus(); }
 
-// ---- render one turn (avatar + content; typing dots for an empty assistant bubble) ----
+// ---- render a turn ----
 function addTurn(role, html) {
+  // Remove welcome if present
+  const welcome = messagesEl.querySelector(".welcome");
+  if (welcome) welcome.remove();
+
   const turn = document.createElement("div");
   turn.className = "turn " + role;
-  const avatar = role === "user" ? "🧑" : "✦";
-  const label = role === "user" ? "You" : "Assistant";
+  const avatar = role === "user" ? "Y" : "S";
   const body = (role !== "user" && html === "") ? TYPING : html;
   turn.innerHTML =
-    `<div class="avatar">${avatar}</div>` +
-    `<div class="content">` +
-      `<div class="role">${label}</div>` +
-      `<details class="think" style="display:none"><summary>` +
-        `<span class="think-dot"></span><span class="think-label">Thinking…</span></summary>` +
-        `<div class="think-body"></div></details>` +
-      `<div class="bubble">${body}</div>` +
-      `<div class="status"></div>` +
+    `<div class="turn-inner">` +
+      `<div class="avatar">${avatar}</div>` +
+      `<div class="content">` +
+        `<details class="think" style="display:none"><summary>` +
+          `<span class="think-dot"></span><span class="think-label">Thinking…</span></summary>` +
+          `<div class="think-body"></div></details>` +
+        `<div class="bubble">${body}</div>` +
+        `<div class="status"></div>` +
+      `</div>` +
     `</div>`;
   messagesEl.appendChild(turn);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return turn;
 }
 
-// ---- post-render: syntax-highlight code + add a header bar (language label + copy) ----
+// ---- code highlighting + copy bar ----
 function enhance(bubble) {
   bubble.querySelectorAll("pre code").forEach((code) => {
     const pre = code.parentElement;
@@ -292,7 +391,7 @@ function enhance(bubble) {
     btn.onclick = () => {
       navigator.clipboard.writeText(code.textContent).then(() => {
         btn.textContent = "Copied"; btn.classList.add("done");
-        setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("done"); }, 1300);
+        setTimeout(() => { btn.textContent = "Copy"; btn.classList.remove("done"); }, 1500);
       });
     };
     bar.append(tag, btn);
@@ -300,17 +399,17 @@ function enhance(bubble) {
     wrap.append(bar, pre);
   });
 }
-// ---- trailing blink caret while streaming ----
+
 function addCaret(bubble) {
   const c = document.createElement("span"); c.className = "caret";
   bubble.appendChild(c);
 }
-// ---- visible reasoning ("thinking") panel ----
+
 function addThinking(turn, stage, text) {
   const panel = turn.querySelector(".think");
   if (!panel) return;
-  panel.style.display = "";          // reveal on first thinking event
-  panel.open = true;                  // expanded while the turn runs
+  panel.style.display = "";
+  panel.open = true;
   const body = panel.querySelector(".think-body");
   const line = document.createElement("div");
   line.className = "tline";
@@ -318,19 +417,20 @@ function addThinking(turn, stage, text) {
                    escapeHtml(text || "").replace(/\n/g, "<br>");
   body.appendChild(line);
 }
+
 function finishThinking(turn) {
   const panel = turn.querySelector(".think");
   if (!panel || panel.style.display === "none") return;
-  panel.open = false;                 // collapse once the answer is done (ChatGPT-style)
+  panel.open = false;
   const lbl = panel.querySelector(".think-label"); if (lbl) lbl.textContent = "Thought process";
-  const dot = panel.querySelector(".think-dot");   if (dot) dot.classList.add("done");
+  const dot = panel.querySelector(".think-dot"); if (dot) dot.classList.add("done");
 }
 
 function citeRow(cites) {
   const wrap = document.createElement("div"); wrap.className = "cites";
   cites.forEach((c) => {
     const el = document.createElement("span"); el.className = "cite";
-    const badge = document.createElement("span"); badge.className = "n"; badge.textContent = c.n ?? "•";
+    const badge = document.createElement("span"); badge.className = "n"; badge.textContent = c.n ?? "";
     const lbl = document.createElement("span"); lbl.textContent = c.title || c.source || c.doc_id || "source";
     el.append(badge, lbl);
     el.title = c.snippet || "";
@@ -338,6 +438,7 @@ function citeRow(cites) {
   });
   return wrap;
 }
+
 function metaRow(messageId, feedback, text) {
   const m = document.createElement("div"); m.className = "meta";
   if (messageId) {
@@ -348,32 +449,36 @@ function metaRow(messageId, feedback, text) {
     down.onclick = () => sendFeedback(messageId, -1, down, up);
     m.append(up, down);
   }
-  const copy = document.createElement("button"); copy.className = "mbtn copy"; copy.textContent = "⧉ Copy"; copy.title = "Copy answer";
+  const copy = document.createElement("button"); copy.className = "mbtn"; copy.textContent = "📋"; copy.title = "Copy";
   copy.onclick = () => navigator.clipboard.writeText(text || "").then(() => {
-    copy.textContent = "✓ Copied"; setTimeout(() => copy.textContent = "⧉ Copy", 1300);
+    copy.textContent = "✓"; setTimeout(() => copy.textContent = "📋", 1500);
   });
   m.append(copy);
   return m;
 }
+
 async function sendFeedback(id, value, onEl, offEl) {
   try {
     await fetch(`${CONFIG.API_BASE}/v1/messages/${id}/feedback`, {
-      method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
+      method: "POST",
+      headers: { "X-API-Key": CONFIG.API_KEY, "Authorization": `Bearer ${CONFIG.JWT_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify({ value }),
     });
     onEl.classList.add("on"); if (offEl) offEl.classList.remove("on");
   } catch (e) { console.error(e); }
 }
 
-// ---- load a stored conversation (renders markdown + highlight + citations + feedback) ----
+// ---- load stored conversation ----
 async function openSession(id) {
-  currentSession = id; setTopbar(); loadSessions();
+  currentSession = id; loadSessions();
   messagesEl.innerHTML = "";
-  const r = await fetch(`${CONFIG.API_BASE}/v1/sessions/${id}`, { headers: authHeaders() });
+  const r = await fetch(`${CONFIG.API_BASE}/v1/sessions/${id}/messages`, {
+    headers: { "X-API-Key": CONFIG.API_KEY, "Authorization": `Bearer ${CONFIG.JWT_TOKEN}` },
+  });
   if (!r.ok) return;
   const data = await r.json();
   (data.messages || []).forEach((m) => {
-    if (m.role === "user") { addTurn("user", escapeHtml(m.content)); return; }
+    if (m.role === "user") { addTurn("user", `<p>${escapeHtml(m.content)}</p>`); return; }
     if (m.role !== "assistant") return;
     const turn = addTurn("assistant", md(m.content));
     const bubble = turn.querySelector(".bubble");
@@ -383,32 +488,55 @@ async function openSession(id) {
   });
 }
 
-// ---- send + STREAM the answer ----
+// ---- send message: try streaming first, fallback to POST ----
 function sendMessage() {
   const text = input.value.trim();
   if (!text || streaming) return;
   input.value = ""; input.style.height = "auto";
-  addTurn("user", escapeHtml(text));
+  addTurn("user", `<p>${escapeHtml(text)}</p>`);
 
   const turn = addTurn("assistant", "");
   const bubble = turn.querySelector(".bubble"), statusEl = turn.querySelector(".status");
   let acc = "";
   streaming = true; $("#send").disabled = true;
 
+  // Try streaming via EventSource (GET with query params for auth)
   const qs = new URLSearchParams({
-    api_key: CONFIG.API_KEY, org_id: CONFIG.ORG_ID, user_id: CONFIG.USER_ID,
-    roles: CONFIG.ROLES, message: text,
+    api_key: CONFIG.API_KEY,
+    access_token: CONFIG.JWT_TOKEN,
+    message: text,
   });
   if (currentSession) qs.set("session_id", currentSession);
-  const es = new EventSource(`${CONFIG.API_BASE}/v1/chat/stream?${qs.toString()}`);
 
-  es.addEventListener("session", (e) => { currentSession = JSON.parse(e.data).session_id; setTopbar(); });
+  const es = new EventSource(`${CONFIG.API_BASE}/v1/chat/stream?${qs.toString()}`);
+  let streamOpened = false;
+
+  es.onopen = () => { streamOpened = true; };
+
+  es.addEventListener("session", (e) => { currentSession = JSON.parse(e.data).session_id; });
   es.addEventListener("status", (e) => { statusEl.textContent = JSON.parse(e.data).stage || ""; });
-  es.addEventListener("plan",   (e) => { statusEl.textContent = "planning (" + (JSON.parse(e.data).steps?.length || 0) + " steps)"; });
-  es.addEventListener("route",  (e) => { statusEl.textContent = "routing → " + (JSON.parse(e.data).modules || []).join(", "); });
-  es.addEventListener("thinking", (e) => { const d = JSON.parse(e.data); addThinking(turn, d.stage, d.text); messagesEl.scrollTop = messagesEl.scrollHeight; });
-  es.addEventListener("tool",   (e) => { const d = JSON.parse(e.data); statusEl.textContent = "tool: " + (d.module || d.step || "") + (d.found != null ? " (" + d.found + ")" : ""); });
-  es.addEventListener("token",  (e) => { acc += JSON.parse(e.data).text; bubble.innerHTML = md(acc); addCaret(bubble); messagesEl.scrollTop = messagesEl.scrollHeight; });
+  es.addEventListener("plan", (e) => { statusEl.textContent = "Planning (" + (JSON.parse(e.data).steps?.length || 0) + " steps)"; });
+  es.addEventListener("route", (e) => { statusEl.textContent = "Routing → " + (JSON.parse(e.data).modules || []).join(", "); });
+  es.addEventListener("thinking", (e) => {
+    const d = JSON.parse(e.data);
+    addThinking(turn, d.stage, d.text);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+  es.addEventListener("tool", (e) => {
+    const d = JSON.parse(e.data);
+    statusEl.textContent = "Retrieving: " + (d.module || d.step || "") + (d.found != null ? " (" + d.found + " found)" : "");
+  });
+  es.addEventListener("token", (e) => {
+    acc += JSON.parse(e.data).text;
+    bubble.innerHTML = md(acc);
+    addCaret(bubble);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+  es.addEventListener("rollback", (e) => {
+    acc = JSON.parse(e.data).text;
+    bubble.innerHTML = md(acc);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
   es.addEventListener("done", (e) => {
     const d = JSON.parse(e.data);
     acc = d.answer || acc;
@@ -420,20 +548,79 @@ function sendMessage() {
     finishThinking(turn);
     finish(es); loadSessions();
   });
-  es.addEventListener("error", (e) => {                // server "error" event OR transport drop
-    try { statusEl.textContent = "⚠ " + (JSON.parse(e.data).message || "error"); } catch (_) { /* transport close */ }
-    if (acc === "") bubble.innerHTML = "<em>(connection error — is the server running with AUTH_PROVIDER=apikey, and the API key correct?)</em>";
+  es.addEventListener("error", (e) => {
+    // If stream never opened, fallback to POST
+    if (!streamOpened && !acc) {
+      es.close();
+      fallbackPost(text, turn, bubble, statusEl);
+      return;
+    }
+    try { statusEl.textContent = "⚠ " + (JSON.parse(e.data).message || "error"); } catch (_) {}
+    if (!acc) bubble.innerHTML = `<p style="color:var(--text-muted)"><em>Connection error — retrying with POST…</em></p>`;
     finish(es);
   });
+
+  // Timeout: if no events in 15s, fallback to POST (LLM planning takes time)
+  const timeout = setTimeout(() => {
+    if (!streamOpened && !acc) {
+      es.close();
+      fallbackPost(text, turn, bubble, statusEl);
+    }
+  }, 15000);
+
+  const origFinish = finish;
+  function finish(src) { clearTimeout(timeout); src.close(); streaming = false; $("#send").disabled = false; input.focus(); }
 }
-function finish(es) { es.close(); streaming = false; $("#send").disabled = false; input.focus(); }
+
+// POST fallback when streaming unavailable
+async function fallbackPost(text, turn, bubble, statusEl) {
+  statusEl.textContent = "Processing…";
+  try {
+    const r = await fetch(`${CONFIG.API_BASE}/v1/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": CONFIG.API_KEY,
+        "Authorization": `Bearer ${CONFIG.JWT_TOKEN}`,
+      },
+      body: JSON.stringify({ message: text, session_id: currentSession || undefined }),
+    });
+    if (!r.ok) {
+      const err = await r.text();
+      bubble.innerHTML = `<p style="color:#e57373"><em>Error ${r.status}: ${escapeHtml(err.slice(0, 200))}</em></p>`;
+      statusEl.textContent = "";
+      streaming = false; $("#send").disabled = false; input.focus();
+      return;
+    }
+    const d = await r.json();
+    if (d.session_id) currentSession = d.session_id;
+    bubble.innerHTML = md(d.answer || "");
+    enhance(bubble);
+    if (d.citations && d.citations.length) bubble.appendChild(citeRow(d.citations));
+    bubble.appendChild(metaRow(d.message_id, 0, d.answer || ""));
+    finishThinking(turn);
+    statusEl.textContent = "";
+    loadSessions();
+  } catch (e) {
+    bubble.innerHTML = `<p style="color:#e57373"><em>Network error: ${escapeHtml(e.message)}</em></p>`;
+    statusEl.textContent = "";
+  }
+  streaming = false; $("#send").disabled = false; input.focus();
+}
 
 // ---- wiring ----
 $("#send").onclick = sendMessage;
 $("#newchat").onclick = newChat;
-input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
-input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 180) + "px"; });
-setTopbar(); loadSessions(); input.focus();
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 200) + "px";
+});
+
+// init
+showWelcome(); loadSessions(); input.focus();
 </script>
 </body>
 </html>

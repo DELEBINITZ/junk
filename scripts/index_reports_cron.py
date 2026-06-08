@@ -45,9 +45,11 @@ from qdrant_client import QdrantClient, models
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "") or None
 TEI_EMBED_URL = os.getenv("TEI_EMBED_URL", "http://localhost:8080").rstrip("/")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "2560"))   # MUST equal settings.embedding_dim (Qwen3-Embedding-4B)
+EMBEDDING_DIM = int(
+    os.getenv("EMBEDDING_DIM", "2560")
+)  # MUST equal settings.embedding_dim (Qwen3-Embedding-4B)
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "reports_kb")  # MUST equal REPORTS_COLLECTION
-SOURCE = os.getenv("REPORTS_SOURCE", "aci_reports")       # provenance tag, NOT the collection name
+SOURCE = os.getenv("REPORTS_SOURCE", "aci_reports")  # provenance tag, NOT the collection name
 DELETE_FIRST = os.getenv("REINDEX_DELETE_FIRST", "0") == "1"
 
 CHUNK_MAX_WORDS = int(os.getenv("CHUNK_MAX_WORDS", "500"))
@@ -60,12 +62,14 @@ client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 # ---------------------------------------------------------------------------
 # 2. Chunking — split long reports into retrieval-sized passages.
 # ---------------------------------------------------------------------------
-def chunk_text_by_words(text: str, max_words: int = CHUNK_MAX_WORDS, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def chunk_text_by_words(
+    text: str, max_words: int = CHUNK_MAX_WORDS, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
     words = (text or "").split()
     if not words:
         return []
-    step = max(1, max_words - overlap)              # guard: never a zero/negative stride
-    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), step)]
+    step = max(1, max_words - overlap)  # guard: never a zero/negative stride
+    return [" ".join(words[i : i + max_words]) for i in range(0, len(words), step)]
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +107,7 @@ def ensure_collection() -> None:
             sys.exit(
                 f"FATAL: collection '{COLLECTION_NAME}' exists at dim {existing_dim}, "
                 f"but EMBEDDING_DIM={EMBEDDING_DIM}. Qdrant can't resize — DROP it first:\n"
-                f"  python -c \"from qdrant_client import QdrantClient; "
+                f'  python -c "from qdrant_client import QdrantClient; '
                 f"QdrantClient('{QDRANT_URL}').delete_collection('{COLLECTION_NAME}')\""
             )
     else:
@@ -119,7 +123,7 @@ def ensure_collection() -> None:
         ("doc_id", models.PayloadSchemaType.KEYWORD),
         ("published_at", models.PayloadSchemaType.DATETIME),  # recency range filtering
         ("customer_tags", models.PayloadSchemaType.KEYWORD),  # shared-visibility allow-list (array)
-        ("public", models.PayloadSchemaType.BOOL),            # explicit "visible to every org" flag
+        ("public", models.PayloadSchemaType.BOOL),  # explicit "visible to every org" flag
     ]
     for field, schema in indexes:
         try:
@@ -145,7 +149,7 @@ def _title(report: dict) -> str:
     return (
         report.get("title")
         or insight.get("title")
-        or " ".join((insight.get("content_text") or "").split()[:12])   # first ~12 words
+        or " ".join((insight.get("content_text") or "").split()[:12])  # first ~12 words
         or "Security advisory"
     )
 
@@ -155,10 +159,14 @@ def _light_metadata(report: dict, idx: int, total: int) -> dict:
     Deliberately does NOT copy the full content_text — that bloats every chunk."""
     return {
         "information_date": report.get("information_date"),
-        "geographies": [g.get("country") for g in report.get("geographies", []) if g.get("country")],
+        "geographies": [
+            g.get("country") for g in report.get("geographies", []) if g.get("country")
+        ],
         "industries": [i.get("name") for i in report.get("industries", []) if i.get("name")],
         "adversaries": [a.get("name") for a in report.get("adversaries", []) if a.get("name")],
-        "threat_types": report.get("threat_types", []),   # present on some reports; harmless when absent
+        "threat_types": report.get(
+            "threat_types", []
+        ),  # present on some reports; harmless when absent
         "tlp": report.get("tlp"),
         "report_type": report.get("report_type"),
         "chunk_index": idx,
@@ -174,7 +182,12 @@ def _is_public(report: dict) -> bool:
     fail-CLOSED rule: absence of a signal means PRIVATE, never public."""
     if bool(report.get("public")):
         return True
-    return str(report.get("tlp") or "").strip().upper() in {"CLEAR", "WHITE", "TLP:CLEAR", "TLP:WHITE"}
+    return str(report.get("tlp") or "").strip().upper() in {
+        "CLEAR",
+        "WHITE",
+        "TLP:CLEAR",
+        "TLP:WHITE",
+    }
 
 
 def build_points(report: dict) -> list[models.PointStruct]:
@@ -198,27 +211,29 @@ def build_points(report: dict) -> list[models.PointStruct]:
     points = []
     for idx, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True)):
         rid = f"{doc_id}_chunk_{idx}"
-        points.append(models.PointStruct(
-            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, rid)),   # deterministic => re-run overwrites
-            vector=vector,
-            payload={
-                # ---- keys the retriever READS (qdrant_backend.py search) ----
-                "rid": rid,
-                "text": chunk,                 # the passage the LLM grounds on
-                "doc_id": doc_id,
-                "source": SOURCE,
-                "title": title,
-                "section": f"chunk {idx}",
-                "published_at": published_at,
-                # ---- shared-visibility (top-level; matched by _filter, DEFAULT-DENY) ----
-                "customer_tags": customer_tags,   # orgs explicitly allow-listed for this doc
-                "public": public,                 # True => visible to EVERY org (explicit only)
-                # ---- arbitrary extras, filterable as metadata.<key> ----
-                "metadata": _light_metadata(report, idx, len(chunks)),
-                # NOTE: no org_id — shared corpus has no single owner; the shared
-                # filter never reads it.
-            },
-        ))
+        points.append(
+            models.PointStruct(
+                id=str(uuid.uuid5(uuid.NAMESPACE_DNS, rid)),  # deterministic => re-run overwrites
+                vector=vector,
+                payload={
+                    # ---- keys the retriever READS (qdrant_backend.py search) ----
+                    "rid": rid,
+                    "text": chunk,  # the passage the LLM grounds on
+                    "doc_id": doc_id,
+                    "source": SOURCE,
+                    "title": title,
+                    "section": f"chunk {idx}",
+                    "published_at": published_at,
+                    # ---- shared-visibility (top-level; matched by _filter, DEFAULT-DENY) ----
+                    "customer_tags": customer_tags,  # orgs explicitly allow-listed for this doc
+                    "public": public,  # True => visible to EVERY org (explicit only)
+                    # ---- arbitrary extras, filterable as metadata.<key> ----
+                    "metadata": _light_metadata(report, idx, len(chunks)),
+                    # NOTE: no org_id — shared corpus has no single owner; the shared
+                    # filter never reads it.
+                },
+            )
+        )
     return points
 
 
@@ -228,9 +243,13 @@ def index_report(report: dict) -> int:
         # Purge any prior chunks of this doc so a shrunk report leaves no orphans.
         client.delete(
             collection_name=COLLECTION_NAME,
-            points_selector=models.FilterSelector(filter=models.Filter(
-                must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))]
-            )),
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))
+                    ]
+                )
+            ),
         )
     try:
         points = build_points(report)
@@ -257,11 +276,13 @@ def fetch_reports():
     """Generator over report dicts from your source API. Replace the request block
     with your real endpoint; it must yield dicts shaped like your sample
     (``_id``, ``insight.content_text``, ``information_date``, optional ``customer_tags``)."""
-    url = os.environ["REPORTS_API_URL"]            # e.g. "https://.../reports?ts={timestamp}"
+    url = os.environ["REPORTS_API_URL"]  # e.g. "https://.../reports?ts={timestamp}"
     headers = {"Authorization": f"Bearer {os.environ.get('REPORTS_API_TOKEN', '')}"}
     payload: dict = {}
     for t in sliding_window(backfilling=True):
-        resp = requests.get(url.format(timestamp=t), headers=headers, json=payload, timeout=30).json()
+        resp = requests.get(
+            url.format(timestamp=t), headers=headers, json=payload, timeout=30
+        ).json()
         if resp.get("total", 0) == 0:
             continue
         yield from resp.get("items", [])
@@ -271,7 +292,9 @@ def fetch_reports():
 # 7. Entry point.
 # ---------------------------------------------------------------------------
 def main() -> None:
-    print(f"Indexing -> {QDRANT_URL} / '{COLLECTION_NAME}' via TEI {TEI_EMBED_URL} (dim {EMBEDDING_DIM})")
+    print(
+        f"Indexing -> {QDRANT_URL} / '{COLLECTION_NAME}' via TEI {TEI_EMBED_URL} (dim {EMBEDDING_DIM})"
+    )
     ensure_collection()
     total_reports = total_chunks = 0
     for report in fetch_reports():
