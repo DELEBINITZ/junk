@@ -84,16 +84,47 @@ def build_search_reports_tool(settings: Settings):
         embedding = await _embed_query(query, settings)
         access_filter = _build_access_filter(org_id)
 
+        fetch_limit = min(top_k, 20)
+        if settings.reranker_enabled:
+            fetch_limit = min(top_k * settings.reranker_overfetch_multiplier, 60)
+
         results = await qdrant.query_points(
             collection_name=settings.qdrant_collection,
             query=embedding,
             query_filter=access_filter,
-            limit=min(top_k, 20),
+            limit=fetch_limit,
             with_payload=True,
         )
 
         if not results.points:
             return "No relevant reports found for this query. Try different keywords or broader terms."
+
+        if settings.reranker_enabled:
+            passages = []
+            for point in results.points:
+                payload = point.payload or {}
+                passages.append({
+                    "text": payload.get("text", ""),
+                    "title": payload.get("title", "Untitled"),
+                    "doc_id": payload.get("doc_id", ""),
+                    "published_at": payload.get("published_at", "N/A"),
+                    "tlp": payload.get("tlp", ""),
+                    "vector_score": point.score,
+                })
+
+            reranked = await _rerank(query, passages, settings)
+            final_k = settings.reranker_top_n if settings.reranker_top_n > 0 else top_k
+            reranked = reranked[:min(final_k, 20)]
+
+            output_parts = []
+            for i, passage in enumerate(reranked, 1):
+                snippet = passage["text"][:500]
+                output_parts.append(
+                    f"[{i}] {passage['title']} (rerank: {passage.get('rerank_score', 0):.3f}, vector: {passage['vector_score']:.3f})\n"
+                    f"    Doc: {passage['doc_id']} | Published: {passage['published_at']} | TLP: {passage['tlp']}\n"
+                    f"    {snippet}"
+                )
+            return "\n\n---\n\n".join(output_parts)
 
         output_parts = []
         for i, point in enumerate(results.points, 1):
@@ -236,6 +267,38 @@ def build_search_by_filter_tool(settings: Settings):
         return f"Found {len(output_parts)} reports:\n" + "\n".join(output_parts)
 
     return search_reports_by_filter
+
+
+async def _rerank(query: str, passages: list[dict], settings: Settings) -> list[dict]:
+    """Rerank passages using TEI /rerank endpoint (Qwen3-Reranker).
+
+    Args:
+        query: Original search query.
+        passages: List of dicts with at least 'text' key.
+        settings: App settings with reranker_base_url.
+
+    Returns:
+        Passages reordered by reranker score (descending), with 'rerank_score' added.
+    """
+    if not passages:
+        return passages
+
+    client = _get_http_client()
+    texts = [p.get("text", "")[:2000] for p in passages]
+
+    resp = await client.post(
+        f"{settings.reranker_base_url}/rerank",
+        json={"query": query, "texts": texts, "truncate": True},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    rankings = resp.json()
+
+    for item in rankings:
+        idx = item["index"]
+        passages[idx]["rerank_score"] = item["score"]
+
+    return sorted(passages, key=lambda p: p.get("rerank_score", 0), reverse=True)
 
 
 async def _embed_query(query: str, settings: Settings) -> list[float]:
