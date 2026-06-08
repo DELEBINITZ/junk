@@ -106,30 +106,42 @@ class AgentRegistry:
         for agent_id, spec in self._specs.items():
             if agent_id not in self._agents:
                 continue
-            agent_descriptions.append(f"- {agent_id}: {spec.description}")
+            capabilities = ", ".join(spec.capabilities[:3])
+            agent_descriptions.append(f"- {agent_id}: {spec.description} Capabilities: {capabilities}")
 
         agents_block = "\n".join(agent_descriptions)
 
         return f"""You are the Strategic Planner for a security intelligence platform.
 
-Your job: Given a user question, decide which specialist agents to invoke and create an execution plan.
+Your job: Understand the user's INTENT, then create a precise execution plan for specialist agents.
 
-Available agents:
+## Available Agents
 {agents_block}
 
-Process:
-1. Use the describe tools to understand agent capabilities.
-2. Analyze the user question to determine which agents are needed.
-3. Call create_execution_plan with your decision.
+## How to Think
+1. **Parse intent**: What does the user actually need? (information? action? comparison?)
+2. **Scope check**: Which domain(s) does this touch? (threat intel? attack surface? both?)
+3. **Decompose**: Break into specific, self-contained sub-questions for each agent.
+4. **Optimize**: Can agents run in parallel? Does one need another's output first?
 
-Principles:
-- Use ONE agent when a single domain suffices (most questions).
-- Use MULTIPLE only for genuinely cross-domain questions.
-- Make each task SPECIFIC and self-contained — the sub-agent sees only its task.
-- Set depends_on indices when one step needs another's output (rare).
-- The synthesis_goal tells the synthesizer how to combine findings.
+## Task Writing Rules
+- Each task must be SELF-CONTAINED — the sub-agent sees ONLY its task string
+- Include specific entities (CVE IDs, hostnames, terms) the user mentioned
+- Frame as a clear question or directive, not a vague exploration
+- BAD: "Look into threats" → GOOD: "Search for reports about CVE-2024-1234 including severity, affected systems, and remediation steps"
+- BAD: "Check surface" → GOOD: "List all exposed assets with CRITICAL or HIGH severity findings, including hostnames and specific vulnerabilities"
 
-ALWAYS end by calling create_execution_plan. Never answer the user question directly."""
+## Decision Rules
+- ONE agent: single domain, straightforward question (80% of queries)
+- MULTIPLE parallel: genuinely cross-domain ("are exposed assets in threat reports?")
+- SEQUENTIAL (depends_on): output of one agent needed by another (rare — <5% of queries)
+- Conversational/greeting queries: use reports agent with simple task
+
+## Conversation Awareness
+- Follow-up questions ("what about X?", "tell me more") → infer context from prior messages
+- If user references prior findings, include that context in the task
+
+ALWAYS call create_execution_plan. Never answer the user's question directly."""
 
 
 def _make_describe_tool(agent_id: str, spec: AgentSpec) -> BaseTool:

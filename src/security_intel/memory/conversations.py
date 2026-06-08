@@ -1,4 +1,4 @@
-"""Chat session and message persistence (Postgres + RLS)."""
+"""Chat session and message persistence (Postgres with explicit org_id filtering)."""
 
 import json
 from dataclasses import dataclass, field
@@ -34,14 +34,14 @@ class ChatSession:
 
 
 class ConversationStore:
-    """CRUD for chat sessions and messages with org-scoped RLS."""
+    """CRUD for chat sessions and messages with explicit org_id filtering."""
 
     def __init__(self, db: Database):
         self._db = db
 
     async def create_session(self, org_id: str, user_id: str, title: str = "") -> ChatSession:
         session_id = f"sess_{uuid4().hex[:12]}"
-        async with self._db.org_transaction(org_id) as cur:
+        async with self._db.transaction() as cur:
             await cur.execute(
                 """INSERT INTO chat_sessions (id, org_id, user_id, title)
                    VALUES (%s, %s, %s, %s)
@@ -53,12 +53,12 @@ class ConversationStore:
         return self._row_to_session(row)
 
     async def get_session(self, org_id: str, session_id: str) -> ChatSession | None:
-        async with self._db.org_transaction(org_id) as cur:
+        async with self._db.transaction() as cur:
             await cur.execute(
                 """SELECT id, org_id, user_id, title, summary, message_count,
                           summarized_upto, created_at, updated_at
-                   FROM chat_sessions WHERE id = %s""",
-                (session_id,),
+                   FROM chat_sessions WHERE id = %s AND org_id = %s""",
+                (session_id, org_id),
             )
             row = await cur.fetchone()
         return self._row_to_session(row) if row else None
@@ -66,15 +66,15 @@ class ConversationStore:
     async def list_sessions(
         self, org_id: str, user_id: str, limit: int = 50, offset: int = 0
     ) -> list[ChatSession]:
-        async with self._db.org_transaction(org_id) as cur:
+        async with self._db.transaction() as cur:
             await cur.execute(
                 """SELECT id, org_id, user_id, title, summary, message_count,
                           summarized_upto, created_at, updated_at
                    FROM chat_sessions
-                   WHERE user_id = %s
+                   WHERE org_id = %s AND user_id = %s
                    ORDER BY updated_at DESC
                    LIMIT %s OFFSET %s""",
-                (user_id, limit, offset),
+                (org_id, user_id, limit, offset),
             )
             rows = await cur.fetchall()
         return [self._row_to_session(r) for r in rows]
@@ -90,7 +90,7 @@ class ConversationStore:
         meta: dict | None = None,
     ) -> ChatMessage:
         msg_id = f"msg_{uuid4().hex[:12]}"
-        async with self._db.org_transaction(org_id) as cur:
+        async with self._db.transaction() as cur:
             await cur.execute(
                 """INSERT INTO chat_messages (id, session_id, org_id, role, content, citations, tool_calls, meta)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -104,15 +104,14 @@ class ConversationStore:
             await cur.execute(
                 """UPDATE chat_sessions
                    SET message_count = message_count + 1, updated_at = NOW()
-                   WHERE id = %s""",
-                (session_id,),
+                   WHERE id = %s AND org_id = %s""",
+                (session_id, org_id),
             )
-            # Auto-title from first user message
             if role == "user":
                 await cur.execute(
                     """UPDATE chat_sessions SET title = %s
-                       WHERE id = %s AND title = ''""",
-                    (content[:60], session_id),
+                       WHERE id = %s AND org_id = %s AND title = ''""",
+                    (content[:60], session_id, org_id),
                 )
         return ChatMessage(
             id=msg_id, session_id=session_id, role=role,
@@ -124,14 +123,14 @@ class ConversationStore:
         self, org_id: str, session_id: str, limit: int = 20, offset: int = 0
     ) -> list[ChatMessage]:
         """Get recent messages for a session (newest last)."""
-        async with self._db.org_transaction(org_id) as cur:
+        async with self._db.transaction() as cur:
             await cur.execute(
                 """SELECT id, session_id, role, content, citations, tool_calls, meta, created_at
                    FROM chat_messages
-                   WHERE session_id = %s
+                   WHERE session_id = %s AND org_id = %s
                    ORDER BY created_at ASC
                    LIMIT %s OFFSET %s""",
-                (session_id, limit, offset),
+                (session_id, org_id, limit, offset),
             )
             rows = await cur.fetchall()
         return [self._row_to_message(r) for r in rows]
@@ -139,17 +138,20 @@ class ConversationStore:
     async def update_summary(
         self, org_id: str, session_id: str, summary: str, summarized_upto: int
     ) -> None:
-        async with self._db.org_transaction(org_id) as cur:
+        async with self._db.transaction() as cur:
             await cur.execute(
                 """UPDATE chat_sessions
                    SET summary = %s, summarized_upto = %s
-                   WHERE id = %s""",
-                (summary, summarized_upto, session_id),
+                   WHERE id = %s AND org_id = %s""",
+                (summary, summarized_upto, session_id, org_id),
             )
 
     async def delete_session(self, org_id: str, session_id: str) -> None:
-        async with self._db.org_transaction(org_id) as cur:
-            await cur.execute("DELETE FROM chat_sessions WHERE id = %s", (session_id,))
+        async with self._db.transaction() as cur:
+            await cur.execute(
+                "DELETE FROM chat_sessions WHERE id = %s AND org_id = %s",
+                (session_id, org_id),
+            )
 
     @staticmethod
     def _row_to_session(row) -> ChatSession:

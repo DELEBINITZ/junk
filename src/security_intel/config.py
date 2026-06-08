@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     guardrails_enabled: bool = True
     pii_redaction: bool = True
     human_approval_required: bool = True
+    security_llm_check: bool = True
+    security_timeout: float = 8.0
+    security_fail_open: bool = True
 
     # Observability - Langfuse
     langfuse_host: str = ""

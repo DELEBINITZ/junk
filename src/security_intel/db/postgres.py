@@ -8,7 +8,7 @@ from security_intel.config import Settings
 
 
 class Database:
-    """Async Postgres connection pool with RLS enforcement."""
+    """Async Postgres connection pool with explicit org_id filtering (no RLS)."""
 
     def __init__(self, pool: AsyncConnectionPool):
         self._pool = pool
@@ -28,21 +28,15 @@ class Database:
         await self._pool.close()
 
     @asynccontextmanager
-    async def org_transaction(self, org_id: str) -> AsyncIterator[psycopg.AsyncCursor]:
-        """Get a cursor with RLS set to the given org_id.
-
-        All queries within this context are automatically scoped to the org.
-        """
+    async def transaction(self) -> AsyncIterator[psycopg.AsyncCursor]:
+        """Get a cursor within a transaction. Org filtering is done in SQL WHERE clauses."""
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SET LOCAL app.organization_id = %s", (org_id,)
-                )
                 yield cur
             await conn.commit()
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[psycopg.AsyncConnection]:
-        """Raw connection without RLS (for migrations, admin ops)."""
+        """Raw connection for migrations and admin ops."""
         async with self._pool.connection() as conn:
             yield conn

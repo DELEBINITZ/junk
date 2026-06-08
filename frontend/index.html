@@ -333,14 +333,16 @@ async function loadSessions() {
       headers: { "X-API-Key": CONFIG.API_KEY, "Authorization": `Bearer ${CONFIG.JWT_TOKEN}` },
     });
     if (!r.ok) return;
-    const rows = await r.json();
+    const data = await r.json();
+    const rows = data.sessions || data;
     sessionsEl.innerHTML = "";
     rows.forEach((s) => {
+      const id = s.session_id || s.id;
       const d = document.createElement("div");
-      d.className = "sess" + (s.id === currentSession ? " active" : "");
+      d.className = "sess" + (id === currentSession ? " active" : "");
       d.textContent = s.title || "New chat";
       d.title = s.title || "";
-      d.onclick = () => openSession(s.id);
+      d.onclick = () => openSession(id);
       sessionsEl.appendChild(d);
     });
   } catch (e) { console.error("sessions:", e); }
@@ -470,7 +472,7 @@ async function sendFeedback(id, value, onEl, offEl) {
 async function openSession(id) {
   currentSession = id; loadSessions();
   messagesEl.innerHTML = "";
-  const r = await fetch(`${CONFIG.API_BASE}/v1/sessions/${id}`, {
+  const r = await fetch(`${CONFIG.API_BASE}/v1/sessions/${id}/messages`, {
     headers: { "X-API-Key": CONFIG.API_KEY, "Authorization": `Bearer ${CONFIG.JWT_TOKEN}` },
   });
   if (!r.ok) return;

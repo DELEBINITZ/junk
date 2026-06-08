@@ -48,49 +48,51 @@ async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
 
     # Reports Agent
     reports_tools = get_reports_tools(settings)
-    registry.register(AgentSpec(
-        id="reports",
-        display_name="Security Reports Agent",
-        description="Searches security reports corpus (threat intel, CVEs, scan findings, remediation). "
-                    "Use for known threats, vulnerabilities, past findings, compliance status.",
-        capabilities=[
-            "Semantic search over security reports",
-            "Filter by threat type, TLP level, report type",
-            "Get report metadata and details",
-            "Find remediation guidance",
-        ],
-        system_prompt=(
-            "You are a Security Reports specialist. Answer questions using the organization's "
-            "security reports corpus. Use search_reports for semantic search, search_reports_by_filter "
-            "for metadata queries, get_report_metadata for specific reports. "
-            "Always cite sources with report titles. Say 'no relevant reports found' if searches empty. "
-            "Be concise, factual, grounded in evidence."
-        ),
-        tools=reports_tools,
-    ))
+    registry.register(
+        AgentSpec(
+            id="reports",
+            display_name="Security Reports Agent",
+            description="Searches security reports corpus (threat intel, ai generated reports and more). ",
+            capabilities=[
+                "Semantic search over security reports",
+                "Filter by threat type, TLP level, report type",
+                "Get report metadata and details",
+            ],
+            system_prompt=(
+                "You are a Security Reports specialist. Answer questions using the organization's "
+                "security reports corpus. Use search_reports for semantic search, search_reports_by_filter "
+                "for metadata queries, get_report_metadata for specific reports. "
+                "Always cite sources with report titles. Say 'no relevant reports found' if searches empty. "
+                "Be concise, factual, grounded in evidence."
+            ),
+            tools=reports_tools,
+        )
+    )
 
     # EASM Agent
     easm_tools = await get_easm_tools(settings)
-    registry.register(AgentSpec(
-        id="easm",
-        display_name="EASM Agent",
-        description="Queries external attack surface (assets, exposures, changes, rescans). "
-                    "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
-        capabilities=[
-            "Query external-facing assets (domains, IPs, services)",
-            "Get current exposures and security findings",
-            "Track attack surface changes over time",
-            "Trigger asset rescans (requires approval)",
-        ],
-        system_prompt=(
-            "You are an External Attack Surface Management specialist. Answer questions about the "
-            "organization's internet-facing assets and exposures. Use query_assets to find assets, "
-            "get_exposures for vulnerabilities, get_asset_changes for recent changes. "
-            "trigger_rescan requires human approval. Be precise about severity and asset details."
-        ),
-        tools=easm_tools,
-        side_effecting_tools={"trigger_rescan"},
-    ))
+    registry.register(
+        AgentSpec(
+            id="easm",
+            display_name="EASM Agent",
+            description="Queries external attack surface (assets, exposures, changes, rescans). "
+            "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
+            capabilities=[
+                "Query external-facing assets (domains, IPs, services)",
+                "Get current exposures and security findings",
+                "Track attack surface changes over time",
+                "Trigger asset rescans (requires approval)",
+            ],
+            system_prompt=(
+                "You are an External Attack Surface Management specialist. Answer questions about the "
+                "organization's internet-facing assets and exposures. Use query_assets to find assets, "
+                "get_exposures for vulnerabilities, get_asset_changes for recent changes. "
+                "trigger_rescan requires human approval. Be precise about severity and asset details."
+            ),
+            tools=easm_tools,
+            side_effecting_tools={"trigger_rescan"},
+        )
+    )
 
     # --- ADD NEW AGENTS HERE ---
     # Example: Brand Protection Agent
@@ -127,14 +129,16 @@ async def lifespan(app: FastAPI):
         conversations = ConversationStore(db)
         app.state.db = db
         app.state.conversations = conversations
-        logger.info("Postgres connected (RLS enabled)")
+        logger.info("Postgres connected (explicit org_id filtering)")
     except Exception as e:
         logger.error(f"Postgres unavailable: {e}. Chat persistence disabled.")
 
     # LLM Lane Router
     lane_router = LaneRouter(settings)
     app.state.lane_router = lane_router
-    logger.info(f"LLM lanes: fast={settings.llm_fast_model}, standard={settings.llm_model}, deep={settings.llm_deep_model}")
+    logger.info(
+        f"LLM lanes: fast={settings.llm_fast_model}, standard={settings.llm_model}, deep={settings.llm_deep_model}"
+    )
 
     # Summarizer
     if conversations:
@@ -170,6 +174,16 @@ async def lifespan(app: FastAPI):
     )
     app.state.orchestrator = orchestrator
     logger.info(f"Orchestrator ready. Agents: {registry.agent_ids}")
+
+    # Warm up Presidio engines (avoids ~2s cold start on first request)
+    if settings.guardrails_enabled:
+        try:
+            from security_intel.security.guardrails import _get_analyzer, _get_anonymizer
+            _get_analyzer()
+            _get_anonymizer()
+            logger.info("Presidio engines warmed up")
+        except Exception as e:
+            logger.warning(f"Presidio warmup failed: {e}")
 
     yield
 

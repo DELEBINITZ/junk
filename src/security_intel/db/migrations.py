@@ -37,20 +37,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_session
 CREATE INDEX IF NOT EXISTS idx_messages_org
     ON chat_messages(org_id, created_at DESC);
 
--- Row-Level Security
-ALTER TABLE chat_sessions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE chat_sessions FORCE ROW LEVEL SECURITY;
-
+-- Remove RLS if previously enabled (migration from old schema)
+ALTER TABLE chat_sessions DISABLE ROW LEVEL SECURITY;
+ALTER TABLE chat_messages DISABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS sessions_org_isolation ON chat_sessions;
-CREATE POLICY sessions_org_isolation ON chat_sessions
-    USING (org_id = current_setting('app.organization_id', true));
-
-ALTER TABLE chat_messages ENABLE ROW LEVEL SECURITY;
-ALTER TABLE chat_messages FORCE ROW LEVEL SECURITY;
-
 DROP POLICY IF EXISTS messages_org_isolation ON chat_messages;
-CREATE POLICY messages_org_isolation ON chat_messages
-    USING (org_id = current_setting('app.organization_id', true));
 """
 
 

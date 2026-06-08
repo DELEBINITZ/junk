@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=10000)
-    session_id: str | None = None
+    session_id: str | None = Field(None, pattern=r"^sess_[a-f0-9]{12}$|^$")
 
 
 class Citation(BaseModel):
