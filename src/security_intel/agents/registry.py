@@ -114,6 +114,7 @@ class AgentRegistry:
         return f"""You are the Strategic Planner for a security intelligence platform.
 
 Your job: Understand the user's INTENT, then create a precise execution plan for specialist agents.
+Note: Greetings, chitchat, and non-security queries are already handled before reaching you — you only receive queries that genuinely need security data.
 
 ## Available Agents
 {agents_block}
@@ -128,6 +129,7 @@ Your job: Understand the user's INTENT, then create a precise execution plan for
 - Each task must be SELF-CONTAINED — the sub-agent sees ONLY its task string
 - Include specific entities (CVE IDs, hostnames, terms) the user mentioned
 - Frame as a clear question or directive, not a vague exploration
+- Remind agents to present findings in a friendly, clear manner
 - BAD: "Look into threats" → GOOD: "Search for reports about CVE-2024-1234 including severity, affected systems, and remediation steps"
 - BAD: "Check surface" → GOOD: "List all exposed assets with CRITICAL or HIGH severity findings, including hostnames and specific vulnerabilities"
 
@@ -135,7 +137,6 @@ Your job: Understand the user's INTENT, then create a precise execution plan for
 - ONE agent: single domain, straightforward question (80% of queries)
 - MULTIPLE parallel: genuinely cross-domain ("are exposed assets in threat reports?")
 - SEQUENTIAL (depends_on): output of one agent needed by another (rare — <5% of queries)
-- Conversational/greeting queries: use reports agent with simple task
 
 ## Conversation Awareness
 - Follow-up questions ("what about X?", "tell me more") → infer context from prior messages
@@ -153,12 +154,13 @@ def _make_describe_tool(agent_id: str, spec: AgentSpec) -> BaseTool:
         f"Use when: {spec.description}"
     )
 
-    @tool(name=f"describe_{agent_id}_agent")
+    @tool
     def describe() -> str:
-        f"""Get description of what the {spec.display_name} can do and when to use it."""
+        """Get description of what this agent can do and when to use it."""
         return description_text
 
-    describe.__doc__ = f"Get description of what the {spec.display_name} can do and when to use it."
+    describe.name = f"describe_{agent_id}_agent"
+    describe.description = f"Get description of what the {spec.display_name} can do and when to use it."
     return describe
 
 

@@ -33,6 +33,7 @@ async def stream_agent_events(
     try:
         final_answer = ""
         current_node = ""
+        collected_tokens = []
 
         async for event in orchestrator.astream_events(
             input_state, config=config, version="v2"
@@ -43,6 +44,8 @@ async def stream_agent_events(
                 chunk = event.get("data", {}).get("chunk")
                 if chunk and hasattr(chunk, "content") and chunk.content:
                     yield _sse("token", {"text": chunk.content})
+                    if current_node == "synthesize":
+                        collected_tokens.append(chunk.content)
 
             elif event_type == "on_tool_start":
                 tool_name = event.get("name", "")
@@ -76,22 +79,31 @@ async def stream_agent_events(
                 output = event.get("data", {}).get("output", "")
                 yield _sse("plan", {"steps": [], "summary": str(output)[:300]})
 
-        final_state = await orchestrator.aget_state(config)
-        if final_state and final_state.values:
-            vals = final_state.values
-            final_answer = vals.get("final_answer", "")
-            citations = vals.get("citations", [])
-            agents_used = [r["agent_id"] for r in vals.get("agent_results", [])]
+        try:
+            final_state = await orchestrator.aget_state(config)
+            if final_state and final_state.values:
+                vals = final_state.values
+                final_answer = vals.get("final_answer", "")
+                citations = vals.get("citations", [])
+                agents_used = [r["agent_id"] for r in vals.get("agent_results", [])]
 
-            yield _sse("done", {
-                "answer": final_answer,
-                "session_id": session_id,
-                "citations": citations,
-                "agents_used": agents_used,
-                "is_complex": vals.get("is_complex", False),
-            })
-        else:
-            yield _sse("done", {"answer": "", "session_id": session_id, "citations": []})
+                yield _sse("done", {
+                    "answer": final_answer,
+                    "session_id": session_id,
+                    "citations": citations,
+                    "agents_used": agents_used,
+                    "is_complex": vals.get("is_complex", False),
+                })
+                return
+        except ValueError:
+            pass
+
+        final_answer = "".join(collected_tokens) if collected_tokens else ""
+        yield _sse("done", {
+            "answer": final_answer,
+            "session_id": session_id,
+            "citations": [],
+        })
 
     except Exception as e:
         logger.error(f"Streaming error: {e}", exc_info=True)

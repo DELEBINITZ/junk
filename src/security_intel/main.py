@@ -59,11 +59,17 @@ async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
                 "Get report metadata and details",
             ],
             system_prompt=(
-                "You are a Security Reports specialist. Answer questions using the organization's "
-                "security reports corpus. Use search_reports for semantic search, search_reports_by_filter "
-                "for metadata queries, get_report_metadata for specific reports. "
-                "Always cite sources with report titles. Say 'no relevant reports found' if searches empty. "
-                "Be concise, factual, grounded in evidence."
+                "You are a friendly Security Reports specialist — think of yourself as a helpful "
+                "colleague who knows the report library inside out.\n\n"
+                "How to work:\n"
+                "- Use search_reports for semantic search, search_reports_by_filter for metadata queries, "
+                "get_report_metadata for specific reports\n"
+                "- Always cite sources with report titles so the user can find them\n"
+                "- If searches come up empty, say so honestly and suggest alternative search terms "
+                "or angles they could try\n"
+                "- Present findings clearly — lead with the most relevant/critical items\n"
+                "- Keep a warm, professional tone throughout\n"
+                "- If you find something concerning, flag it clearly but calmly"
             ),
             tools=reports_tools,
         )
@@ -84,10 +90,17 @@ async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
                 "Trigger asset rescans (requires approval)",
             ],
             system_prompt=(
-                "You are an External Attack Surface Management specialist. Answer questions about the "
-                "organization's internet-facing assets and exposures. Use query_assets to find assets, "
-                "get_exposures for vulnerabilities, get_asset_changes for recent changes. "
-                "trigger_rescan requires human approval. Be precise about severity and asset details."
+                "You are a friendly External Attack Surface Management specialist — the go-to "
+                "colleague for anything about the organization's internet-facing infrastructure.\n\n"
+                "How to work:\n"
+                "- Use query_assets to find assets, get_exposures for vulnerabilities, "
+                "get_asset_changes for recent changes\n"
+                "- trigger_rescan requires human approval — explain what it does before requesting\n"
+                "- Be precise about severity and asset details — specifics help teams act\n"
+                "- Present findings in order of severity/risk\n"
+                "- If you spot something critical, highlight it clearly but calmly\n"
+                "- Suggest logical next steps when appropriate (e.g., 'You might also want to check...')\n"
+                "- Keep a warm, professional tone — security can be stressful, be the calm expert"
             ),
             tools=easm_tools,
             side_effecting_tools={"trigger_rescan"},
@@ -146,8 +159,9 @@ async def lifespan(app: FastAPI):
 
     # LangGraph Checkpointer
     checkpointer = None
+    checkpoint_pool = None
     try:
-        checkpointer = await get_checkpointer(settings)
+        checkpointer, checkpoint_pool = await get_checkpointer(settings)
         logger.info("LangGraph checkpointer ready (Postgres)")
     except Exception as e:
         logger.warning(f"Checkpointer unavailable: {e}")
@@ -188,6 +202,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    if checkpoint_pool:
+        await checkpoint_pool.close()
     if db:
         await db.close()
         logger.info("Postgres pool closed")

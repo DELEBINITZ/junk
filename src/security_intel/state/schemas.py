@@ -30,6 +30,8 @@ class OrchestratorState(TypedDict):
     roles: list[str]
     session_id: str
     is_complex: bool
+    is_chitchat: bool
+    direct_response: str
     plan: ExecutionPlan | None
     agent_results: list[AgentResult]
     final_answer: str
