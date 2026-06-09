@@ -16,9 +16,9 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph.state import CompiledStateGraph
 
-from security_intel.config import Settings
-from security_intel.observability.logging import get_logger
-from security_intel.prompts.planner import PLANNER_SYSTEM_TEMPLATE
+from src.config import Settings
+from src.observability.logging import get_logger
+from src.prompts.planner import PLANNER_SYSTEM_TEMPLATE
 
 logger = get_logger("registry")
 
@@ -141,9 +141,7 @@ def _make_plan_tool(available_agents: list[str]) -> BaseTool:
     """Generate the create_execution_plan tool with available agent IDs."""
     agents_str = ", ".join(f"'{a}'" for a in available_agents)
 
-    @tool
-    def create_execution_plan(steps: list[dict], synthesis_goal: str) -> str:
-        f"""Create the execution plan for sub-agents.
+    desc = f"""Create the execution plan for sub-agents.
 
         Args:
             steps: List of plan steps. Each step is a dict with:
@@ -152,6 +150,10 @@ def _make_plan_tool(available_agents: list[str]) -> BaseTool:
                 - depends_on: List of step indices (0-based) that must complete first
             synthesis_goal: How the synthesizer should combine the findings.
         """
+
+    @tool(description=desc)
+    def create_execution_plan(steps: list[dict], synthesis_goal: str) -> str:
+
         plan_summary = f"Plan created with {len(steps)} step(s).\n"
         for i, step in enumerate(steps):
             deps = f" (after step {step.get('depends_on', [])})" if step.get("depends_on") else ""
