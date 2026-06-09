@@ -31,13 +31,14 @@ from security_intel.agents.orchestrator import build_orchestrator
 from security_intel.tools.mcp_loader import load_mcp_tools_for_agent
 from security_intel.agents.reports.tools import get_reports_tools
 from security_intel.agents.easm.tools import get_easm_tools
+from security_intel.tools.query_enrichment import QueryEnricher
 from security_intel.observability.logging import setup_logging, get_logger
 from security_intel.observability.middleware import TracingMiddleware
 from security_intel.observability.tracing import get_langfuse_handler
 from security_intel.api.routes import router
 
 
-async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
+async def _register_agents(registry: AgentRegistry, settings: Settings, lane_router=None) -> None:
     """Register all specialist agents with the registry.
 
     To add a new agent:
@@ -46,8 +47,13 @@ async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
     3. Done — planner auto-discovers it, orchestrator auto-routes to it.
     """
 
+    # Query enricher for RAG optimization (uses fast LLM for expansion)
+    enricher = None
+    if settings.query_enrichment_enabled and lane_router:
+        enricher = QueryEnricher(lane_router.fast)
+
     # Reports Agent
-    reports_tools = get_reports_tools(settings)
+    reports_tools = get_reports_tools(settings, enricher=enricher)
     registry.register(
         AgentSpec(
             id="reports",
@@ -59,11 +65,17 @@ async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
                 "Get report metadata and details",
             ],
             system_prompt=(
-                "You are a Security Reports specialist. Answer questions using the organization's "
-                "security reports corpus. Use search_reports for semantic search, search_reports_by_filter "
-                "for metadata queries, get_report_metadata for specific reports. "
-                "Always cite sources with report titles. Say 'no relevant reports found' if searches empty. "
-                "Be concise, factual, grounded in evidence."
+                "You are a friendly Security Reports specialist — think of yourself as a helpful "
+                "colleague who knows the report library inside out.\n\n"
+                "How to work:\n"
+                "- Use search_reports for semantic search, search_reports_by_filter for metadata queries, "
+                "get_report_metadata for specific reports\n"
+                "- Always cite sources with report titles so the user can find them\n"
+                "- If searches come up empty, say so honestly and suggest alternative search terms "
+                "or angles they could try\n"
+                "- Present findings clearly — lead with the most relevant/critical items\n"
+                "- Keep a warm, professional tone throughout\n"
+                "- If you find something concerning, flag it clearly but calmly"
             ),
             tools=reports_tools,
         )
@@ -84,10 +96,17 @@ async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
                 "Trigger asset rescans (requires approval)",
             ],
             system_prompt=(
-                "You are an External Attack Surface Management specialist. Answer questions about the "
-                "organization's internet-facing assets and exposures. Use query_assets to find assets, "
-                "get_exposures for vulnerabilities, get_asset_changes for recent changes. "
-                "trigger_rescan requires human approval. Be precise about severity and asset details."
+                "You are a friendly External Attack Surface Management specialist — the go-to "
+                "colleague for anything about the organization's internet-facing infrastructure.\n\n"
+                "How to work:\n"
+                "- Use query_assets to find assets, get_exposures for vulnerabilities, "
+                "get_asset_changes for recent changes\n"
+                "- trigger_rescan requires human approval — explain what it does before requesting\n"
+                "- Be precise about severity and asset details — specifics help teams act\n"
+                "- Present findings in order of severity/risk\n"
+                "- If you spot something critical, highlight it clearly but calmly\n"
+                "- Suggest logical next steps when appropriate (e.g., 'You might also want to check...')\n"
+                "- Keep a warm, professional tone — security can be stressful, be the calm expert"
             ),
             tools=easm_tools,
             side_effecting_tools={"trigger_rescan"},
@@ -146,8 +165,9 @@ async def lifespan(app: FastAPI):
 
     # LangGraph Checkpointer
     checkpointer = None
+    checkpoint_pool = None
     try:
-        checkpointer = await get_checkpointer(settings)
+        checkpointer, checkpoint_pool = await get_checkpointer(settings)
         logger.info("LangGraph checkpointer ready (Postgres)")
     except Exception as e:
         logger.warning(f"Checkpointer unavailable: {e}")
@@ -158,11 +178,16 @@ async def lifespan(app: FastAPI):
 
     # Agent Registry
     registry = AgentRegistry()
-    await _register_agents(registry, settings)
+    await _register_agents(registry, settings, lane_router=lane_router)
 
     # Build LangGraph agents
     registry.build_agents(lane_router.standard)
     app.state.registry = registry
+
+    # Query enricher for orchestrator-level task enrichment
+    orchestrator_enricher = None
+    if settings.query_enrichment_enabled:
+        orchestrator_enricher = QueryEnricher(lane_router.fast)
 
     # Build orchestrator (main LangGraph StateGraph)
     orchestrator = build_orchestrator(
@@ -171,6 +196,7 @@ async def lifespan(app: FastAPI):
         conversations=conversations,
         summarizer=summarizer,
         checkpointer=checkpointer,
+        query_enricher=orchestrator_enricher,
     )
     app.state.orchestrator = orchestrator
     logger.info(f"Orchestrator ready. Agents: {registry.agent_ids}")
@@ -188,6 +214,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    if checkpoint_pool:
+        await checkpoint_pool.close()
     if db:
         await db.close()
         logger.info("Postgres pool closed")

@@ -30,68 +30,86 @@ async def stream_agent_events(
     session_id = config["configurable"].get("thread_id", "")
     yield _sse("session", {"session_id": session_id})
 
+    # Only stream LLM tokens from these nodes to the user
+    _STREAMABLE_NODES = {"synthesize", "chitchat"}
+
     try:
         final_answer = ""
         current_node = ""
+        collected_tokens = []
 
         async for event in orchestrator.astream_events(
             input_state, config=config, version="v2"
         ):
             event_type = event.get("event", "")
+            # langgraph_node in metadata is the reliable way to identify source node
+            event_node = event.get("metadata", {}).get("langgraph_node", "")
 
             if event_type == "on_chat_model_stream":
                 chunk = event.get("data", {}).get("chunk")
                 if chunk and hasattr(chunk, "content") and chunk.content:
-                    yield _sse("token", {"text": chunk.content})
+                    if event_node in _STREAMABLE_NODES:
+                        yield _sse("token", {"text": chunk.content})
+                        collected_tokens.append(chunk.content)
 
             elif event_type == "on_tool_start":
-                tool_name = event.get("name", "")
-                tool_input = event.get("data", {}).get("input", {})
-                yield _sse("tool", {
-                    "module": tool_name,
-                    "step": tool_name,
-                    "input": _truncate(str(tool_input), 200),
-                })
+                if event_node in ("dispatch", "plan"):
+                    tool_name = event.get("name", "")
+                    tool_input = event.get("data", {}).get("input", {})
+                    yield _sse("tool", {
+                        "module": tool_name,
+                        "step": tool_name,
+                        "input": _truncate(str(tool_input), 200),
+                    })
 
             elif event_type == "on_tool_end":
-                tool_name = event.get("name", "")
-                output = event.get("data", {}).get("output", "")
-                if hasattr(output, "content"):
-                    output = output.content
-                found = str(output).count("\n") + 1 if output else None
-                yield _sse("tool", {
-                    "module": tool_name,
-                    "step": tool_name,
-                    "found": found,
-                })
+                if event_node in ("dispatch", "plan"):
+                    tool_name = event.get("name", "")
+                    output = event.get("data", {}).get("output", "")
+                    if hasattr(output, "content"):
+                        output = output.content
+                    if tool_name == "create_execution_plan":
+                        yield _sse("plan", {"steps": [], "summary": _truncate(str(output), 300)})
+                    else:
+                        found = str(output).count("\n") + 1 if output else None
+                        yield _sse("tool", {
+                            "module": tool_name,
+                            "step": tool_name,
+                            "found": found,
+                        })
 
             elif event_type == "on_chain_start":
                 name = event.get("name", "")
-                if name in ("context_and_classify", "plan", "dispatch", "synthesize",
-                           "security_gate", "output_guardrail"):
+                if name in ("context_and_classify", "plan", "dispatch",
+                           "synthesize", "security_gate", "output_guardrail"):
                     current_node = name
                     yield _sse("status", {"stage": _friendly_stage(name)})
 
-            elif event_type == "on_tool_end" and event.get("name") == "create_execution_plan":
-                output = event.get("data", {}).get("output", "")
-                yield _sse("plan", {"steps": [], "summary": str(output)[:300]})
+        try:
+            final_state = await orchestrator.aget_state(config)
+            if final_state and final_state.values:
+                vals = final_state.values
+                final_answer = vals.get("final_answer", "")
+                citations = vals.get("citations", [])
+                agents_used = [r["agent_id"] for r in vals.get("agent_results", [])]
 
-        final_state = await orchestrator.aget_state(config)
-        if final_state and final_state.values:
-            vals = final_state.values
-            final_answer = vals.get("final_answer", "")
-            citations = vals.get("citations", [])
-            agents_used = [r["agent_id"] for r in vals.get("agent_results", [])]
+                yield _sse("done", {
+                    "answer": final_answer,
+                    "session_id": session_id,
+                    "citations": citations,
+                    "agents_used": agents_used,
+                    "is_complex": vals.get("is_complex", False),
+                })
+                return
+        except ValueError:
+            pass
 
-            yield _sse("done", {
-                "answer": final_answer,
-                "session_id": session_id,
-                "citations": citations,
-                "agents_used": agents_used,
-                "is_complex": vals.get("is_complex", False),
-            })
-        else:
-            yield _sse("done", {"answer": "", "session_id": session_id, "citations": []})
+        final_answer = "".join(collected_tokens) if collected_tokens else ""
+        yield _sse("done", {
+            "answer": final_answer,
+            "session_id": session_id,
+            "citations": [],
+        })
 
     except Exception as e:
         logger.error(f"Streaming error: {e}", exc_info=True)

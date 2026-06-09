@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     embedding_model: str = "Qwen/Qwen3-Embedding-4B"
     embedding_dim: int = 2560
 
+    # Reranker (TEI /rerank endpoint)
+    reranker_base_url: str = "http://localhost:9092"
+    reranker_enabled: bool = True
+    reranker_top_n: int = 0  # 0 = use top_k from search, >0 = override final count
+    reranker_overfetch_multiplier: int = 3  # fetch N*top_k from Qdrant, rerank, take top_k
+
+    # Query enrichment
+    query_enrichment_enabled: bool = True  # adaptive multi-query, HyDE, step-back
+
     # Qdrant
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
