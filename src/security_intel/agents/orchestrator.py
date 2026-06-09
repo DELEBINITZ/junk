@@ -482,7 +482,10 @@ def build_orchestrator(
         try:
             session = await conversations.get_session(org_id, session_id)
             if not session:
-                session = await conversations.create_session(org_id, user_id, state["user_query"][:60])
+                # Create under the thread_id so later turns (and load_context) find it.
+                session = await conversations.create_session(
+                    org_id, user_id, state["user_query"][:60], session_id=session_id
+                )
                 session_id = session.id
 
             await conversations.append_message(org_id, session_id, "user", state["user_query"])

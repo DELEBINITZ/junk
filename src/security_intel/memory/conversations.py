@@ -39,8 +39,13 @@ class ConversationStore:
     def __init__(self, db: Database):
         self._db = db
 
-    async def create_session(self, org_id: str, user_id: str, title: str = "") -> ChatSession:
-        session_id = f"sess_{uuid4().hex[:12]}"
+    async def create_session(
+        self, org_id: str, user_id: str, title: str = "", session_id: str | None = None
+    ) -> ChatSession:
+        # Honor an explicit id (the graph thread_id) so persisted messages live under
+        # the SAME id the client and load_context use — otherwise turn 1 is orphaned
+        # under a random id and every later turn finds no history.
+        session_id = session_id or f"sess_{uuid4().hex[:12]}"
         async with self._db.transaction() as cur:
             await cur.execute(
                 """INSERT INTO chat_sessions (id, org_id, user_id, title)
