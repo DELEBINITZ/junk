@@ -24,6 +24,11 @@ class AgentResult(TypedDict):
 
 class OrchestratorState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    # Ordered prior-turn history loaded from the conversation store. Kept separate
+    # from `messages` (whose add_messages reducer would append it after the current
+    # query, corrupting order). Plain field = deterministic last-write-wins.
+    history: list[BaseMessage]
+    summary: str
     user_query: str
     org_id: str
     user_id: str

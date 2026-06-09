@@ -47,6 +47,33 @@ SECURITY_TIMEOUT = 8
 # LangGraph recursion limit for sub-agents
 AGENT_RECURSION_LIMIT = 15
 
+# Max prior messages loaded verbatim for context (the unsummarized tail). Older
+# turns are represented by the rolling summary. Kept small to avoid overburdening
+# the LLM. Matches SUMMARIZE_TRIGGER so the tail is normally loaded in full.
+MAX_RECENT_MESSAGES = 6
+
+# Detached background tasks (e.g. summarization) — kept referenced so the event
+# loop doesn't garbage-collect them mid-flight.
+_BACKGROUND_TASKS: set = set()
+
+
+def _run_in_background(coro, label: str = "background task") -> None:
+    """Fire-and-forget a coroutine without blocking the current turn.
+
+    Runs after the response has streamed (spawned from persist, the last node),
+    so heavy work like summarization never adds latency. Failures are logged
+    instead of silently swallowed, so a stale summary is visible in logs.
+    """
+    async def _guarded():
+        try:
+            await coro
+        except Exception as e:
+            logger.error(f"{label} failed: {e}", exc_info=True)
+
+    task = asyncio.ensure_future(_guarded())
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
 def build_orchestrator(
     lane_router: LaneRouter,
     registry: AgentRegistry,
@@ -101,7 +128,12 @@ def build_orchestrator(
         return result
 
     async def load_context_node(state: OrchestratorState, config: RunnableConfig) -> dict:
-        """Load conversation history + rolling summary for multi-turn context."""
+        """Load ordered prior-turn history + rolling summary for multi-turn context.
+
+        Writes to the dedicated `history`/`summary` state fields (NOT `messages`),
+        so downstream nodes see correctly-ordered prior turns regardless of the
+        add_messages reducer or whether a checkpointer is active.
+        """
         if not conversations:
             return {}
 
@@ -115,20 +147,22 @@ def build_orchestrator(
             if not session:
                 return {}
 
-            history = await conversations.get_messages(org_id, session_id, limit=20)
-            context_messages = []
-
-            if session.summary:
-                context_messages.append(
-                    SystemMessage(content=f"Conversation summary: {session.summary}")
-                )
-            for msg in history[-10:]:
+            # Load the unsummarized tail (messages after the summary watermark),
+            # contiguous with the rolling summary so there is no gap. If the
+            # summarizer has fallen behind, anchor to the most-recent messages so
+            # recent turns are never dropped in favor of stale older ones.
+            start = max(session.summarized_upto, session.message_count - MAX_RECENT_MESSAGES)
+            past = await conversations.get_messages(
+                org_id, session_id, limit=MAX_RECENT_MESSAGES, offset=start
+            )
+            history: list = []
+            for msg in past:
                 if msg.role == "user":
-                    context_messages.append(HumanMessage(content=msg.content))
+                    history.append(HumanMessage(content=msg.content))
                 elif msg.role == "assistant":
-                    context_messages.append(AIMessage(content=msg.content))
+                    history.append(AIMessage(content=msg.content))
 
-            return {"messages": context_messages}
+            return {"history": history, "summary": session.summary or ""}
         except Exception as e:
             logger.error(f"Failed to load context: {e}")
             return {}
@@ -141,7 +175,7 @@ def build_orchestrator(
         full planner for multi-agent decomposition.
         """
         question = state["user_query"]
-        context = _summarize_context(state.get("messages", []))
+        context = _summarize_context(state.get("history", []), state.get("summary", ""))
         agents_str = ", ".join(
             f"{aid} ({registry.get_spec(aid).description[:60]})"
             for aid in registry.agent_ids
@@ -192,7 +226,7 @@ def build_orchestrator(
     async def plan_node(state: OrchestratorState, config: RunnableConfig) -> dict:
         """Invoke planner agent with full conversation context."""
         planner_messages = []
-        prior = state.get("messages", [])
+        prior = state.get("history", [])
         if prior:
             for msg in prior[-6:]:
                 planner_messages.append(msg)
@@ -337,7 +371,7 @@ def build_orchestrator(
 
         synthesis_goal = plan.get("synthesis_goal", "Combine into clear answer.") if plan else ""
 
-        context_summary = _summarize_context(state.get("messages", []))
+        context_summary = _summarize_context(state.get("history", []), state.get("summary", ""))
         context_block = f"\nPrior conversation context:\n{context_summary}\n" if context_summary else ""
 
         prompt = (
@@ -373,11 +407,16 @@ def build_orchestrator(
         }
 
     async def context_and_classify_node(state: OrchestratorState, config: RunnableConfig) -> dict:
-        """Run load_context and classify in parallel — saves ~1-2s on every request."""
-        context_task = asyncio.create_task(load_context_node(state, config))
-        classify_task = asyncio.create_task(classify_node(state, config))
+        """Load context, THEN classify with that context available.
 
-        ctx_result, cls_result = await asyncio.gather(context_task, classify_task)
+        The router must see prior-turn history to route follow-ups ("tell me more",
+        "what were we discussing") and to write context-aware tasks. So load_context
+        runs first (a fast DB read) and its result is merged into the state the router
+        sees — rather than racing it in parallel where the router would route blind.
+        """
+        ctx_result = await load_context_node(state, config)
+        classify_state = {**state, **ctx_result}
+        cls_result = await classify_node(classify_state, config)
 
         merged = {}
         merged.update(ctx_result)
@@ -393,16 +432,20 @@ def build_orchestrator(
         """
         user_query = state["user_query"]
         fallback = state.get("direct_response", "")
+        history = state.get("history", [])
+        summary = state.get("summary", "")
+
+        # Include prior-turn context so meta-questions ("what were we discussing?",
+        # "tell me more") and follow-ups are answered with real conversation memory.
+        llm_messages = [SystemMessage(content=CHITCHAT_PROMPT.format(persona=ORCHESTRATOR_PERSONA))]
+        if summary:
+            llm_messages.append(SystemMessage(content=f"Earlier conversation summary: {summary}"))
+        llm_messages.extend(history[-MAX_RECENT_MESSAGES:])
+        llm_messages.append(HumanMessage(content=user_query))
 
         try:
             response = await asyncio.wait_for(
-                lane_router.standard.ainvoke(
-                    [
-                        SystemMessage(content=CHITCHAT_PROMPT.format(persona=ORCHESTRATOR_PERSONA)),
-                        HumanMessage(content=user_query),
-                    ],
-                    config=config,
-                ),
+                lane_router.standard.ainvoke(llm_messages, config=config),
                 timeout=SYNTHESIS_TIMEOUT,
             )
             answer = response.content
@@ -454,7 +497,14 @@ def build_orchestrator(
             if summarizer:
                 session = await conversations.get_session(org_id, session_id)
                 if session:
-                    await summarizer.maybe_summarize(org_id, session)
+                    # Summarize in the background — folding old turns must never
+                    # add latency to the response path. By the next user query the
+                    # refreshed summary is ready; if not, load_context still loads
+                    # the recent verbatim tail, so context is never lost.
+                    _run_in_background(
+                        summarizer.maybe_summarize(org_id, session),
+                        label="rolling summary",
+                    )
 
         except Exception as e:
             logger.error(f"Persist failed: {e}", exc_info=True)
@@ -692,15 +742,16 @@ def _parse_router_response(content: str) -> dict:
     return {"action": "SIMPLE"}
 
 
-def _summarize_context(messages: list) -> str:
-    """Create brief context summary for the classifier."""
-    if not messages:
-        return ""
+def _summarize_context(history: list, summary: str = "") -> str:
+    """Render prior-turn context (rolling summary + recent turns) for a prompt."""
     parts = []
-    for msg in messages[-4:]:
+    if summary:
+        parts.append(f"Earlier conversation summary: {summary}")
+    for msg in history[-6:]:
         content = getattr(msg, "content", "")
         if content:
-            parts.append(f"{type(msg).__name__}: {content[:100]}")
+            role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+            parts.append(f"{role}: {content[:200]}")
     return "\n".join(parts)
 
 
