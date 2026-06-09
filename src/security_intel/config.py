@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     reranker_enabled: bool = True
     reranker_top_n: int = 0  # 0 = use top_k from search, >0 = override final count
     reranker_overfetch_multiplier: int = 3  # fetch N*top_k from Qdrant, rerank, take top_k
+    reranker_score_threshold: float = 0.0  # drop reranked passages below this relevance (0 = keep all)
 
     # Query enrichment
     query_enrichment_enabled: bool = True  # adaptive multi-query, HyDE, step-back

@@ -124,6 +124,15 @@ def build_search_reports_tool(settings: Settings, enricher=None):
 
         if settings.reranker_enabled:
             reranked = await _rerank(query, merged, settings)
+
+            # Drop clearly-irrelevant passages by rerank relevance. Only when the
+            # reranker actually scored them (skip when it degraded to vector order),
+            # and always keep at least the top hit so we never return empty.
+            threshold = settings.reranker_score_threshold
+            if threshold > 0 and any("rerank_score" in p for p in reranked):
+                kept = [p for p in reranked if p.get("rerank_score", 0) >= threshold]
+                reranked = kept or reranked[:1]
+
             final_k = settings.reranker_top_n if settings.reranker_top_n > 0 else top_k
             reranked = reranked[:min(final_k, 20)]
 
@@ -433,22 +442,31 @@ async def _rerank(query: str, passages: list[dict], settings: Settings) -> list[
     texts = [p.get("text", "")[:2000] for p in passages]
 
     try:
+        # Payload matches the reranker's accepted schema: {query, texts}. Extra
+        # fields (e.g. "truncate") trigger 422 Unprocessable Entity on this server.
         resp = await client.post(
             f"{settings.reranker_base_url}/rerank",
-            json={"query": query, "texts": texts, "truncate": True},
+            json={"query": query, "texts": texts},
             timeout=15,
         )
         resp.raise_for_status()
         rankings = resp.json()
-    except (httpx.HTTPError, httpx.ConnectError) as e:
-        # Reranker down/unreachable — degrade gracefully to existing order
-        # (vector score / RRF) instead of crashing the whole agent.
+        # Some servers wrap results: {"results": [...]} — accept either shape.
+        if isinstance(rankings, dict):
+            rankings = rankings.get("results") or rankings.get("data") or []
+
+        for item in rankings:
+            idx = item["index"]
+            # Server indexes into the texts we sent; guard against out-of-range.
+            if not isinstance(idx, int) or idx < 0 or idx >= len(passages):
+                continue
+            score = item.get("score", item.get("relevance_score", 0))
+            passages[idx]["rerank_score"] = score
+    except (httpx.HTTPError, httpx.ConnectError, KeyError, TypeError, ValueError) as e:
+        # Reranker down/unreachable or unexpected response — degrade gracefully to
+        # the existing order (vector score / RRF) instead of crashing the agent.
         logger.warning(f"Rerank failed ({e}), returning passages without reranking")
         return passages
-
-    for item in rankings:
-        idx = item["index"]
-        passages[idx]["rerank_score"] = item["score"]
 
     return sorted(passages, key=lambda p: p.get("rerank_score", 0), reverse=True)
 
