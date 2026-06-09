@@ -16,9 +16,9 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.prebuilt import create_react_agent
 from langgraph.graph.state import CompiledStateGraph
 
-from src.config import Settings
-from src.observability.logging import get_logger
-from src.prompts.planner import PLANNER_SYSTEM_TEMPLATE
+from security_intel.config import Settings
+from security_intel.observability.logging import get_logger
+from security_intel.prompts.planner import PLANNER_SYSTEM_TEMPLATE
 
 logger = get_logger("registry")
 
