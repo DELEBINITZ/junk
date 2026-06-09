@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     reranker_top_n: int = 0  # 0 = use top_k from search, >0 = override final count
     reranker_overfetch_multiplier: int = 3  # fetch N*top_k from Qdrant, rerank, take top_k
 
+    # Query enrichment
+    query_enrichment_enabled: bool = True  # adaptive multi-query, HyDE, step-back
+
     # Qdrant
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""

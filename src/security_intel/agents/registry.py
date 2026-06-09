@@ -25,6 +25,7 @@ logger = get_logger("registry")
 @dataclass
 class AgentSpec:
     """Specification for a specialist agent."""
+
     id: str
     display_name: str
     description: str
@@ -107,7 +108,9 @@ class AgentRegistry:
             if agent_id not in self._agents:
                 continue
             capabilities = ", ".join(spec.capabilities[:3])
-            agent_descriptions.append(f"- {agent_id}: {spec.description} Capabilities: {capabilities}")
+            agent_descriptions.append(
+                f"- {agent_id}: {spec.description} Capabilities: {capabilities}"
+            )
 
         agents_block = "\n".join(agent_descriptions)
 
@@ -149,9 +152,7 @@ def _make_describe_tool(agent_id: str, spec: AgentSpec) -> BaseTool:
     """Generate a describe tool for the planner."""
     capabilities_text = "\n".join(f"  - {c}" for c in spec.capabilities)
     description_text = (
-        f"{spec.display_name} capabilities:\n"
-        f"{capabilities_text}\n\n"
-        f"Use when: {spec.description}"
+        f"{spec.display_name} capabilities:\n{capabilities_text}\n\nUse when: {spec.description}"
     )
 
     @tool
@@ -160,7 +161,9 @@ def _make_describe_tool(agent_id: str, spec: AgentSpec) -> BaseTool:
         return description_text
 
     describe.name = f"describe_{agent_id}_agent"
-    describe.description = f"Get description of what the {spec.display_name} can do and when to use it."
+    describe.description = (
+        f"Get description of what the {spec.display_name} can do and when to use it."
+    )
     return describe
 
 

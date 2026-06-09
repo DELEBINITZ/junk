@@ -61,33 +61,33 @@ When findings are critical, lead with that clearly but without alarm.
 Always ground answers in evidence from specialist agent findings.
 End with a helpful nudge when appropriate — "Would you like me to dig deeper into X?" or "I can also check Y if that helps.\""""
 
-ROUTER_PROMPT = """You are the friendly gateway for a Security Intelligence Platform. You receive the user's message and decide:
+ROUTER_PROMPT = """You are the intelligent gateway for a Security Intelligence Platform. You route queries and — for simple cases — generate the agent task directly.
 
-1. Can you answer this DIRECTLY without searching security data? (greetings, chitchat, general questions about yourself, thanks, help requests, clarifications, off-topic questions, etc.)
-2. Or does this REQUIRE the agentic workflow? (threat lookups, CVE searches, attack surface queries, report analysis, anything needing real security data)
+Given the user's message, respond with EXACTLY one JSON object:
 
-Respond with EXACTLY one JSON object:
-- If you can answer directly: {{"action": "DIRECT", "response": "your brief response here"}}
-- If agents needed (single domain): {{"action": "SIMPLE"}}
-- If agents needed (cross-domain/complex): {{"action": "COMPLEX"}}
+1. DIRECT — You can answer without security data (greetings, chitchat, "who are you", thanks, help)
+   {{"action": "DIRECT", "response": "your brief response here"}}
+
+2. SIMPLE — Single-domain query needing one agent. You generate the task inline (saves a planning step).
+   {{"action": "SIMPLE", "agent": "<agent_id>", "task": "<self-contained task for the agent>"}}
+
+3. COMPLEX — Multi-domain, cross-referencing, or multi-step query requiring a planner.
+   {{"action": "COMPLEX"}}
+
+Available agents: {agents}
 
 Rules:
-- DIRECT: greetings, thanks, "who are you", "what can you do", general conversation, off-topic questions, anything answerable from your persona alone
-- SIMPLE: single-domain questions needing one data source (e.g., "What is CVE-2024-1234?")
-- COMPLEX: multi-domain, cross-referencing, multi-step (e.g., "Compare our exposed assets against recent threats")
-- NEVER make up security data in DIRECT responses — if the user asks about specific threats/CVEs/assets, route to agents
+- DIRECT: greetings, thanks, "who are you", "what can you do", general conversation, off-topic
+- SIMPLE: single-domain question → pick ONE agent, write a self-contained task string (include specific entities from the user's question: CVE IDs, hostnames, terms)
+- COMPLEX: genuinely needs multiple agents OR cross-domain correlation (e.g., "Compare our exposed assets against recent threats")
+- NEVER make up security data in DIRECT responses
+- For SIMPLE: task must be SELF-CONTAINED — the agent sees ONLY the task string, not the user's original query
+- BAD task: "Look into threats" → GOOD: "Search for reports about CVE-2024-1234 including severity, affected systems, and remediation steps"
 
-Your persona and tone for DIRECT responses:
-- Warm, professional, and genuinely helpful — like a knowledgeable colleague
-- Keep it concise (1-3 sentences)
-- Naturally guide users toward what you can help with:
-  • Threat intelligence (CVEs, threat actors, malware, IOCs)
-  • Attack surface management (exposed assets, misconfigurations, vulnerabilities)
-  • Security report analysis (findings, remediation, compliance)
-- For off-topic questions: acknowledge politely, then gently redirect to your security expertise
-- For greetings: welcome them warmly and briefly mention how you can help
-- For "what can you do": give specific examples of questions they can ask
-- Never be dismissive — always leave the user feeling supported
+Persona for DIRECT:
+- Warm, professional, concise (1-3 sentences)
+- Guide users toward: threat intel, attack surface, security reports
+- Never dismissive
 
 Question: {question}
 
@@ -118,6 +118,7 @@ def build_orchestrator(
     conversations: ConversationStore | None = None,
     summarizer: RollingSummarizer | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    query_enricher=None,
 ) -> CompiledStateGraph:
     """Build production orchestrator as LangGraph StateGraph."""
 
@@ -136,17 +137,21 @@ def build_orchestrator(
     # -------------------------------------------------------------------------
 
     async def security_gate_node(state: OrchestratorState, config: RunnableConfig) -> dict:
-        """Parallel security checks with early cancellation.
+        """Tiered security checks — regex-only for short queries, full LLM check for longer ones.
 
-        Runs all security checks concurrently. If any check detects a threat,
-        remaining checks are cancelled immediately (fast-fail pattern).
-        This minimizes latency — clean queries pass through in ~50ms.
+        Optimization: queries under 200 chars skip the LLM injection check (~2-3s savings)
+        since regex patterns catch known attacks and short queries have limited attack surface.
+        LLM check still runs for longer queries where sophisticated attacks hide.
         """
         from security_intel.security.guardrails import input_guardrail_node
 
+        query = state["user_query"]
+        use_llm = len(query) > 200
+        llm = lane_router.fast if use_llm else None
+
         try:
             result = await asyncio.wait_for(
-                input_guardrail_node(state, config, llm=lane_router.fast),
+                input_guardrail_node(state, config, llm=llm),
                 timeout=SECURITY_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -156,7 +161,7 @@ def build_orchestrator(
         if result.get("blocked"):
             logger.warning("Input blocked", extra={"extra_data": {
                 "reason": result.get("block_reason"),
-                "query": state["user_query"][:100],
+                "query": query[:100],
             }})
         return result
 
@@ -194,19 +199,26 @@ def build_orchestrator(
             return {}
 
     async def classify_node(state: OrchestratorState, config: RunnableConfig) -> dict:
-        """Single fast LLM call that either answers directly or routes to agents.
+        """Unified router that classifies AND plans for simple queries.
 
-        This is the gateway — if the query doesn't need security data,
-        the LLM answers inline (no planner, no agents, no synthesis overhead).
+        For SIMPLE queries, the router generates the agent task inline — eliminating
+        the separate planner LLM call entirely. Only COMPLEX queries proceed to the
+        full planner for multi-agent decomposition.
         """
         question = state["user_query"]
         context = _summarize_context(state.get("messages", []))
+        agents_str = ", ".join(
+            f"{aid} ({registry.get_spec(aid).description[:60]})"
+            for aid in registry.agent_ids
+        )
 
         try:
             response = await asyncio.wait_for(
                 lane_router.fast.ainvoke([
                     HumanMessage(content=ROUTER_PROMPT.format(
-                        question=question, context=context or "(new conversation)"
+                        question=question,
+                        context=context or "(new conversation)",
+                        agents=agents_str,
                     ))
                 ]),
                 timeout=CLASSIFY_TIMEOUT,
@@ -226,8 +238,20 @@ def build_orchestrator(
                 "direct_response": parsed.get("response", ""),
             }
 
+        if action == "SIMPLE" and parsed.get("agent") and parsed.get("task"):
+            agent_id = parsed["agent"]
+            if agent_id in registry.agent_ids:
+                logger.info(f"Query routed: SIMPLE → {agent_id} (planner bypassed)")
+                plan = ExecutionPlan(
+                    steps=[PlanStep(agent=agent_id, task=parsed["task"], depends_on=[])],
+                    synthesis_goal="Return findings directly.",
+                )
+                return {"is_complex": False, "is_chitchat": False, "plan": plan}
+            else:
+                logger.warning(f"Router picked unknown agent '{agent_id}', falling through to planner")
+
         is_complex = action == "COMPLEX"
-        logger.info(f"Query routed: {action}")
+        logger.info(f"Query routed: {action} → planner")
         return {"is_complex": is_complex, "is_chitchat": False}
 
     async def plan_node(state: OrchestratorState, config: RunnableConfig) -> dict:
@@ -293,6 +317,9 @@ def build_orchestrator(
 
         Independent agents run concurrently for minimum wall-clock time.
         Dependent agents wait only for their specific dependencies.
+
+        When query_enricher is available and query is complex, enriches agent tasks
+        with expanded search hints so agents start with better context.
         """
         plan = state["plan"]
         steps = plan["steps"]
@@ -311,6 +338,9 @@ def build_orchestrator(
                     prior_context = [completed[d] for d in step["depends_on"] if d in completed]
                     if prior_context:
                         task_content += "\n\nContext from prior analysis:\n" + "\n---\n".join(prior_context)
+
+                if query_enricher and state.get("is_complex"):
+                    task_content = await _enrich_agent_task(query_enricher, task_content)
 
                 agent = registry.get_agent(step["agent"])
                 if not agent:
@@ -498,8 +528,8 @@ def build_orchestrator(
     )
     graph.add_conditional_edges(
         "context_and_classify",
-        lambda s: "chitchat" if s.get("is_chitchat") else "plan",
-        {"chitchat": "chitchat", "plan": "plan"},
+        lambda s: "chitchat" if s.get("is_chitchat") else ("dispatch" if s.get("plan") else "plan"),
+        {"chitchat": "chitchat", "plan": "plan", "dispatch": "dispatch"},
     )
     graph.add_edge("chitchat", "persist")
     graph.add_edge("plan", "validate_plan")
@@ -696,3 +726,24 @@ def _summarize_context(messages: list) -> str:
         if content:
             parts.append(f"{type(msg).__name__}: {content[:100]}")
     return "\n".join(parts)
+
+
+async def _enrich_agent_task(enricher, task: str) -> str:
+    """Enrich a complex agent task with search hints from query expansion.
+
+    For complex multi-domain queries, provides the agent with alternative
+    search angles so it can make more targeted tool calls.
+    """
+    try:
+        enriched = await enricher.enrich(task)
+        if len(enriched.search_queries) <= 1:
+            return task
+
+        hints = "\n".join(f"  - {q}" for q in enriched.search_queries[1:])
+        return (
+            f"{task}\n\n"
+            f"Search optimization hints (alternative angles to try):\n{hints}"
+        )
+    except Exception as e:
+        logger.debug(f"Task enrichment failed ({e}), using original task")
+        return task

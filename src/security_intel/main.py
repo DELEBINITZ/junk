@@ -31,13 +31,14 @@ from security_intel.agents.orchestrator import build_orchestrator
 from security_intel.tools.mcp_loader import load_mcp_tools_for_agent
 from security_intel.agents.reports.tools import get_reports_tools
 from security_intel.agents.easm.tools import get_easm_tools
+from security_intel.tools.query_enrichment import QueryEnricher
 from security_intel.observability.logging import setup_logging, get_logger
 from security_intel.observability.middleware import TracingMiddleware
 from security_intel.observability.tracing import get_langfuse_handler
 from security_intel.api.routes import router
 
 
-async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
+async def _register_agents(registry: AgentRegistry, settings: Settings, lane_router=None) -> None:
     """Register all specialist agents with the registry.
 
     To add a new agent:
@@ -46,8 +47,13 @@ async def _register_agents(registry: AgentRegistry, settings: Settings) -> None:
     3. Done — planner auto-discovers it, orchestrator auto-routes to it.
     """
 
+    # Query enricher for RAG optimization (uses fast LLM for expansion)
+    enricher = None
+    if settings.query_enrichment_enabled and lane_router:
+        enricher = QueryEnricher(lane_router.fast)
+
     # Reports Agent
-    reports_tools = get_reports_tools(settings)
+    reports_tools = get_reports_tools(settings, enricher=enricher)
     registry.register(
         AgentSpec(
             id="reports",
@@ -172,11 +178,16 @@ async def lifespan(app: FastAPI):
 
     # Agent Registry
     registry = AgentRegistry()
-    await _register_agents(registry, settings)
+    await _register_agents(registry, settings, lane_router=lane_router)
 
     # Build LangGraph agents
     registry.build_agents(lane_router.standard)
     app.state.registry = registry
+
+    # Query enricher for orchestrator-level task enrichment
+    orchestrator_enricher = None
+    if settings.query_enrichment_enabled:
+        orchestrator_enricher = QueryEnricher(lane_router.fast)
 
     # Build orchestrator (main LangGraph StateGraph)
     orchestrator = build_orchestrator(
@@ -185,6 +196,7 @@ async def lifespan(app: FastAPI):
         conversations=conversations,
         summarizer=summarizer,
         checkpointer=checkpointer,
+        query_enricher=orchestrator_enricher,
     )
     app.state.orchestrator = orchestrator
     logger.info(f"Orchestrator ready. Agents: {registry.agent_ids}")

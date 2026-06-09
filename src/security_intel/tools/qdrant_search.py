@@ -8,9 +8,12 @@ Access rules (matching the ingestion contract):
 Production features:
 - Shared AsyncQdrantClient (connection pooling)
 - Reusable httpx client for embeddings
-- Query rewriting for better retrieval
-- Multi-query expansion for complex questions
+- Query enrichment: multi-query fan-out, HyDE, step-back
+- Reciprocal Rank Fusion for merging multi-query results
+- Reranking via cross-encoder
 """
+
+import asyncio
 
 import httpx
 from langchain_core.tools import tool
@@ -18,6 +21,9 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
 
 from security_intel.config import Settings
+from security_intel.observability.logging import get_logger
+
+logger = get_logger("qdrant_search")
 
 
 _qdrant_clients: dict[str, AsyncQdrantClient] = {}
@@ -59,8 +65,12 @@ def _build_access_filter(org_id: str, extra_must: list | None = None) -> Filter:
     )
 
 
-def build_search_reports_tool(settings: Settings):
-    """Factory: creates org-scoped Qdrant search tool with tenant access control."""
+def build_search_reports_tool(settings: Settings, enricher=None):
+    """Factory: creates org-scoped Qdrant search tool with query enrichment.
+
+    When enricher is provided, queries are expanded via multi-query/HyDE/step-back
+    strategies and results are merged using Reciprocal Rank Fusion before reranking.
+    """
 
     qdrant = _get_qdrant_client(settings)
 
@@ -68,9 +78,8 @@ def build_search_reports_tool(settings: Settings):
     async def search_reports(query: str, top_k: int = 6) -> str:
         """Semantic search over the organization's security reports corpus.
 
-        Returns relevant passages with citations (title, snippet, score).
-        Automatically filters to reports the requesting org is authorized to see.
-        For best results, use specific keywords: CVE IDs, threat actor names, asset names.
+        Uses adaptive query enrichment: automatically expands broad queries into
+        multiple search variants for better recall, while keeping precise queries fast.
 
         Args:
             query: Natural language search query about threats, CVEs, findings, or remediation.
@@ -80,39 +89,41 @@ def build_search_reports_tool(settings: Settings):
 
         config = get_config()
         org_id = config["configurable"].get("org_id", "default")
-
-        embedding = await _embed_query(query, settings)
         access_filter = _build_access_filter(org_id)
 
-        fetch_limit = min(top_k, 20)
-        if settings.reranker_enabled:
-            fetch_limit = min(top_k * settings.reranker_overfetch_multiplier, 60)
+        search_queries = [query]
+        if enricher:
+            try:
+                enriched = await enricher.enrich(query)
+                search_queries = enriched.search_queries
+                logger.info(
+                    f"Enriched query: strategy={enriched.strategy.value}, "
+                    f"variants={len(search_queries)}"
+                )
+            except Exception as e:
+                logger.warning(f"Query enrichment failed ({e}), using original query")
 
-        results = await qdrant.query_points(
-            collection_name=settings.qdrant_collection,
-            query=embedding,
-            query_filter=access_filter,
-            limit=fetch_limit,
-            with_payload=True,
+        per_query_limit = min(top_k * 2, 30) if len(search_queries) > 1 else min(top_k, 20)
+        if settings.reranker_enabled:
+            per_query_limit = min(top_k * settings.reranker_overfetch_multiplier, 60)
+
+        all_passages = await _fan_out_search(
+            qdrant, search_queries, access_filter, per_query_limit, settings
         )
 
-        if not results.points:
+        if not all_passages:
+            return "No relevant reports found for this query. Try different keywords or broader terms."
+
+        if len(search_queries) > 1 and len(all_passages) > 1:
+            merged = _reciprocal_rank_fusion(all_passages, k=60)
+        else:
+            merged = all_passages[0] if all_passages else []
+
+        if not merged:
             return "No relevant reports found for this query. Try different keywords or broader terms."
 
         if settings.reranker_enabled:
-            passages = []
-            for point in results.points:
-                payload = point.payload or {}
-                passages.append({
-                    "text": payload.get("text", ""),
-                    "title": payload.get("title", "Untitled"),
-                    "doc_id": payload.get("doc_id", ""),
-                    "published_at": payload.get("published_at", "N/A"),
-                    "tlp": payload.get("tlp", ""),
-                    "vector_score": point.score,
-                })
-
-            reranked = await _rerank(query, passages, settings)
+            reranked = await _rerank(query, merged, settings)
             final_k = settings.reranker_top_n if settings.reranker_top_n > 0 else top_k
             reranked = reranked[:min(final_k, 20)]
 
@@ -120,31 +131,103 @@ def build_search_reports_tool(settings: Settings):
             for i, passage in enumerate(reranked, 1):
                 snippet = passage["text"][:500]
                 output_parts.append(
-                    f"[{i}] {passage['title']} (rerank: {passage.get('rerank_score', 0):.3f}, vector: {passage['vector_score']:.3f})\n"
+                    f"[{i}] {passage['title']} (rerank: {passage.get('rerank_score', 0):.3f}, "
+                    f"vector: {passage.get('vector_score', 0):.3f}, rrf: {passage.get('rrf_score', 0):.4f})\n"
                     f"    Doc: {passage['doc_id']} | Published: {passage['published_at']} | TLP: {passage['tlp']}\n"
                     f"    {snippet}"
                 )
             return "\n\n---\n\n".join(output_parts)
 
+        final = merged[:min(top_k, 20)]
         output_parts = []
-        for i, point in enumerate(results.points, 1):
-            payload = point.payload or {}
-            title = payload.get("title", "Untitled")
-            snippet = payload.get("text", "")[:500]
-            score = f"{point.score:.3f}"
-            doc_id = payload.get("doc_id", "")
-            published = payload.get("published_at", "N/A")
-            tlp = payload.get("tlp", "")
-
+        for i, passage in enumerate(final, 1):
+            snippet = passage["text"][:500]
+            score_str = f"relevance: {passage.get('vector_score', 0):.3f}"
+            if passage.get("rrf_score"):
+                score_str += f", rrf: {passage['rrf_score']:.4f}"
             output_parts.append(
-                f"[{i}] {title} (relevance: {score})\n"
-                f"    Doc: {doc_id} | Published: {published} | TLP: {tlp}\n"
+                f"[{i}] {passage['title']} ({score_str})\n"
+                f"    Doc: {passage['doc_id']} | Published: {passage['published_at']} | TLP: {passage['tlp']}\n"
                 f"    {snippet}"
             )
 
         return "\n\n---\n\n".join(output_parts)
 
     return search_reports
+
+
+async def _fan_out_search(
+    qdrant: AsyncQdrantClient,
+    queries: list[str],
+    access_filter: Filter,
+    per_query_limit: int,
+    settings: Settings,
+) -> list[list[dict]]:
+    """Execute parallel vector searches for all query variants.
+
+    Returns list of passage lists (one per query variant).
+    """
+
+    async def _search_single(q: str) -> list[dict]:
+        embedding = await _embed_query(q, settings)
+        results = await qdrant.query_points(
+            collection_name=settings.qdrant_collection,
+            query=embedding,
+            query_filter=access_filter,
+            limit=per_query_limit,
+            with_payload=True,
+        )
+        passages = []
+        for point in results.points:
+            payload = point.payload or {}
+            passages.append({
+                "text": payload.get("text", ""),
+                "title": payload.get("title", "Untitled"),
+                "doc_id": payload.get("doc_id", ""),
+                "published_at": payload.get("published_at", "N/A"),
+                "tlp": payload.get("tlp", ""),
+                "vector_score": point.score,
+                "point_id": str(point.id),
+            })
+        return passages
+
+    results = await asyncio.gather(*[_search_single(q) for q in queries], return_exceptions=True)
+    valid = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            logger.warning(f"Fan-out search variant {i} failed: {r}")
+        elif r:
+            valid.append(r)
+    return valid
+
+
+def _reciprocal_rank_fusion(
+    result_lists: list[list[dict]], k: int = 60
+) -> list[dict]:
+    """Merge multiple ranked lists using Reciprocal Rank Fusion.
+
+    RRF score = sum(1 / (k + rank_i)) across all lists where document appears.
+    Higher k = more emphasis on lower-ranked documents (smoother distribution).
+    """
+    scores: dict[str, float] = {}
+    passages: dict[str, dict] = {}
+
+    for ranked_list in result_lists:
+        for rank, passage in enumerate(ranked_list):
+            doc_key = f"{passage['doc_id']}:{passage['text'][:100]}"
+            scores[doc_key] = scores.get(doc_key, 0) + 1.0 / (k + rank + 1)
+            if doc_key not in passages:
+                passages[doc_key] = passage
+
+    sorted_keys = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+
+    merged = []
+    for key in sorted_keys:
+        passage = passages[key]
+        passage["rrf_score"] = scores[key]
+        merged.append(passage)
+
+    return merged
 
 
 def build_get_report_metadata_tool(settings: Settings):
