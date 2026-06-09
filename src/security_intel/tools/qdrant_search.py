@@ -369,13 +369,19 @@ async def _rerank(query: str, passages: list[dict], settings: Settings) -> list[
     client = _get_http_client()
     texts = [p.get("text", "")[:2000] for p in passages]
 
-    resp = await client.post(
-        f"{settings.reranker_base_url}/rerank",
-        json={"query": query, "texts": texts, "truncate": True},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    rankings = resp.json()
+    try:
+        resp = await client.post(
+            f"{settings.reranker_base_url}/rerank",
+            json={"query": query, "texts": texts, "truncate": True},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        rankings = resp.json()
+    except (httpx.HTTPError, httpx.ConnectError) as e:
+        # Reranker down/unreachable — degrade gracefully to existing order
+        # (vector score / RRF) instead of crashing the whole agent.
+        logger.warning(f"Rerank failed ({e}), returning passages without reranking")
+        return passages
 
     for item in rankings:
         idx = item["index"]

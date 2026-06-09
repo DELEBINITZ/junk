@@ -96,6 +96,17 @@ Context from prior conversation:
 
 Respond with ONE JSON object only:"""
 
+CHITCHAT_PROMPT = """You are the Security Intelligence Assistant handling a message that needs no security data lookup (greeting, "who are you", thanks, general/off-topic question, or a quick coding/how-to ask).
+
+{persona}
+
+Rules:
+1. Answer the user's message directly and helpfully — if it's a general question (weather, a snippet of code, etc.), give a concise useful answer.
+2. Keep it short (1-4 sentences unless code is requested).
+3. After answering off-topic asks, gently steer toward what you do best: threat intel, attack surface, security reports.
+4. Never fabricate security data, CVEs, or findings."""
+
+
 SYNTHESIS_PROMPT = """You are the Security Intelligence Assistant synthesizing findings for the user.
 
 {persona}
@@ -385,15 +396,10 @@ def build_orchestrator(
             )
             return {"final_answer": friendly_empty, "citations": []}
 
-        if len(agent_results) == 1 and not is_complex:
-            findings = agent_results[0]["findings"]
-            if not findings.startswith("Agent failed:"):
-                return {
-                    "final_answer": findings,
-                    "citations": agent_results[0]["citations"],
-                    "messages": [AIMessage(content=findings)],
-                }
-
+        # NOTE: previously single-agent simple queries returned findings directly
+        # here (no LLM call). That path emitted zero on_chat_model_stream events,
+        # so the UI never streamed — the answer only arrived in the final `done`.
+        # Always route through the synthesis LLM so tokens stream from this node.
         llm = lane_router.deep if is_complex else lane_router.standard
 
         findings_text = ""
@@ -452,10 +458,34 @@ def build_orchestrator(
         return merged
 
     async def chitchat_node(state: OrchestratorState, config: RunnableConfig) -> dict:
-        """Pass through the direct response from the router — no extra LLM call."""
-        answer = state.get("direct_response", "")
-        if not answer:
-            answer = "Hello! I'm your Security Intelligence Assistant. Ask me about threats, CVEs, attack surface, or security reports."
+        """Generate the DIRECT answer with a streaming LLM call.
+
+        Runs an actual LLM invocation (not a pass-through) so token events fire
+        from this node — DIRECT/off-topic answers stream to the UI like every
+        other response. The router's inline draft is used only as a fallback.
+        """
+        user_query = state["user_query"]
+        fallback = state.get("direct_response", "")
+
+        try:
+            response = await asyncio.wait_for(
+                lane_router.standard.ainvoke(
+                    [
+                        SystemMessage(content=CHITCHAT_PROMPT.format(persona=ORCHESTRATOR_PERSONA)),
+                        HumanMessage(content=user_query),
+                    ],
+                    config=config,
+                ),
+                timeout=SYNTHESIS_TIMEOUT,
+            )
+            answer = response.content
+        except Exception as e:
+            logger.warning(f"Chitchat generation failed ({e}), using router draft")
+            answer = fallback or (
+                "Hello! I'm your Security Intelligence Assistant. Ask me about "
+                "threats, CVEs, attack surface, or security reports."
+            )
+
         return {
             "final_answer": answer,
             "citations": [],

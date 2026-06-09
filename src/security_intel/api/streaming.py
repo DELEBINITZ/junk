@@ -38,9 +38,7 @@ async def stream_agent_events(
         current_node = ""
         collected_tokens = []
 
-        async for event in orchestrator.astream_events(
-            input_state, config=config, version="v2"
-        ):
+        async for event in orchestrator.astream_events(input_state, config=config, version="v2"):
             event_type = event.get("event", "")
             # langgraph_node in metadata is the reliable way to identify source node
             event_node = event.get("metadata", {}).get("langgraph_node", "")
@@ -56,11 +54,14 @@ async def stream_agent_events(
                 if event_node in ("dispatch", "plan"):
                     tool_name = event.get("name", "")
                     tool_input = event.get("data", {}).get("input", {})
-                    yield _sse("tool", {
-                        "module": tool_name,
-                        "step": tool_name,
-                        "input": _truncate(str(tool_input), 200),
-                    })
+                    yield _sse(
+                        "tool",
+                        {
+                            "module": tool_name,
+                            "step": tool_name,
+                            "input": _truncate(str(tool_input), 200),
+                        },
+                    )
 
             elif event_type == "on_tool_end":
                 if event_node in ("dispatch", "plan"):
@@ -72,16 +73,25 @@ async def stream_agent_events(
                         yield _sse("plan", {"steps": [], "summary": _truncate(str(output), 300)})
                     else:
                         found = str(output).count("\n") + 1 if output else None
-                        yield _sse("tool", {
-                            "module": tool_name,
-                            "step": tool_name,
-                            "found": found,
-                        })
+                        yield _sse(
+                            "tool",
+                            {
+                                "module": tool_name,
+                                "step": tool_name,
+                                "found": found,
+                            },
+                        )
 
             elif event_type == "on_chain_start":
                 name = event.get("name", "")
-                if name in ("context_and_classify", "plan", "dispatch",
-                           "synthesize", "security_gate", "output_guardrail"):
+                if name in (
+                    "context_and_classify",
+                    "plan",
+                    "dispatch",
+                    "synthesize",
+                    "security_gate",
+                    "output_guardrail",
+                ):
                     current_node = name
                     yield _sse("status", {"stage": _friendly_stage(name)})
 
@@ -93,23 +103,29 @@ async def stream_agent_events(
                 citations = vals.get("citations", [])
                 agents_used = [r["agent_id"] for r in vals.get("agent_results", [])]
 
-                yield _sse("done", {
-                    "answer": final_answer,
-                    "session_id": session_id,
-                    "citations": citations,
-                    "agents_used": agents_used,
-                    "is_complex": vals.get("is_complex", False),
-                })
+                yield _sse(
+                    "done",
+                    {
+                        "answer": final_answer,
+                        "session_id": session_id,
+                        "citations": citations,
+                        "agents_used": agents_used,
+                        "is_complex": vals.get("is_complex", False),
+                    },
+                )
                 return
         except ValueError:
             pass
 
         final_answer = "".join(collected_tokens) if collected_tokens else ""
-        yield _sse("done", {
-            "answer": final_answer,
-            "session_id": session_id,
-            "citations": [],
-        })
+        yield _sse(
+            "done",
+            {
+                "answer": final_answer,
+                "session_id": session_id,
+                "citations": [],
+            },
+        )
 
     except Exception as e:
         logger.error(f"Streaming error: {e}", exc_info=True)
@@ -125,12 +141,12 @@ def _friendly_stage(node_name: str) -> str:
     """Convert node name to user-friendly stage description."""
     stages = {
         "security_gate": "Running security checks...",
-        "context_and_classify": "Loading context & analyzing...",
+        "context_and_classify": "Thinking...",
         "plan": "Creating execution plan...",
         "validate_plan": "Validating plan...",
         "dispatch": "Running specialist agents...",
-        "synthesize": "Synthesizing findings...",
-        "output_guardrail": "Checking output safety...",
+        "synthesize": "Synthesizing answer...",
+        "output_guardrail": "Finalizing...",
     }
     return stages.get(node_name, node_name)
 
