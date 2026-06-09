@@ -127,33 +127,30 @@ def build_search_reports_tool(settings: Settings, enricher=None):
             final_k = settings.reranker_top_n if settings.reranker_top_n > 0 else top_k
             reranked = reranked[:min(final_k, 20)]
 
-            output_parts = []
-            for i, passage in enumerate(reranked, 1):
-                snippet = passage["text"][:500]
-                output_parts.append(
-                    f"[{i}] {passage['title']} (rerank: {passage.get('rerank_score', 0):.3f}, "
-                    f"vector: {passage.get('vector_score', 0):.3f}, rrf: {passage.get('rrf_score', 0):.4f})\n"
-                    f"    Doc: {passage['doc_id']} | Published: {passage['published_at']} | TLP: {passage['tlp']}\n"
-                    f"    {snippet}"
-                )
-            return "\n\n---\n\n".join(output_parts)
+            return _format_passages(reranked)
 
         final = merged[:min(top_k, 20)]
-        output_parts = []
-        for i, passage in enumerate(final, 1):
-            snippet = passage["text"][:500]
-            score_str = f"relevance: {passage.get('vector_score', 0):.3f}"
-            if passage.get("rrf_score"):
-                score_str += f", rrf: {passage['rrf_score']:.4f}"
-            output_parts.append(
-                f"[{i}] {passage['title']} ({score_str})\n"
-                f"    Doc: {passage['doc_id']} | Published: {passage['published_at']} | TLP: {passage['tlp']}\n"
-                f"    {snippet}"
-            )
-
-        return "\n\n---\n\n".join(output_parts)
+        return _format_passages(final)
 
     return search_reports
+
+
+def _format_passages(passages: list[dict]) -> str:
+    """Render passages for the LLM using report content only.
+
+    Deliberately excludes internal fields (doc_id, point_id, TLP, and
+    vector/rerank/rrf scores) so they cannot leak into user-facing answers.
+    Title and publish date are legitimate report metadata, kept for grounding.
+    """
+    parts = []
+    for i, p in enumerate(passages, 1):
+        snippet = p.get("text", "")[:500]
+        published = p.get("published_at", "")
+        header = f"[{i}] {p.get('title', 'Untitled')}"
+        if published and published != "N/A":
+            header += f" (published {published})"
+        parts.append(f"{header}\n    {snippet}")
+    return "\n\n---\n\n".join(parts)
 
 
 async def _fan_out_search(
@@ -277,6 +274,72 @@ def build_get_report_metadata_tool(settings: Settings):
         )
 
     return get_report_metadata
+
+
+def build_get_report_content_tool(settings: Settings):
+    """Factory: fetch the full text of one report by doc_id (org-scoped).
+
+    Use for "summarize report <ID>" — pulls all chunks for the document and
+    returns them in section order so the agent summarizes from real content
+    instead of semantic-searching a numeric ID (which retrieves poorly).
+    """
+
+    qdrant = _get_qdrant_client(settings)
+
+    @tool
+    async def get_report_content(doc_id: str, max_chars: int = 6000) -> str:
+        """Get the full text content of a specific security report by its document ID.
+
+        Use this to summarize or answer questions about ONE specific report when you
+        already know its ID (e.g., "summarize report 2024020924468").
+
+        Args:
+            doc_id: The document/report identifier.
+            max_chars: Max characters of combined content to return (default 6000).
+        """
+        from langgraph.config import get_config
+
+        config = get_config()
+        org_id = config["configurable"].get("org_id", "default")
+        access_filter = _build_access_filter(
+            org_id,
+            extra_must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))],
+        )
+
+        points, _ = await qdrant.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=access_filter,
+            limit=100,
+            with_payload=True,
+        )
+        if not points:
+            return f"No report found with ID '{doc_id}' (or access denied)."
+
+        def _section_key(p):
+            payload = p.payload or {}
+            sec = payload.get("section", payload.get("chunk_index", 0))
+            try:
+                return int(sec)
+            except (TypeError, ValueError):
+                return 0
+
+        ordered = sorted(points, key=_section_key)
+        title = (ordered[0].payload or {}).get("title", "Untitled")
+
+        parts, total = [], 0
+        for p in ordered:
+            text = (p.payload or {}).get("text", "")
+            if not text:
+                continue
+            parts.append(text)
+            total += len(text)
+            if total >= max_chars:
+                break
+
+        body = "\n\n".join(parts)[:max_chars]
+        return f"Report: {title}\n\n{body}"
+
+    return get_report_content
 
 
 def build_search_by_filter_tool(settings: Settings):

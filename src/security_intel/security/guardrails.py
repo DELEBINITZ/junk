@@ -85,6 +85,30 @@ def _get_anonymizer() -> AnonymizerEngine:
     return _anonymizer
 
 
+# Output-side PII config — shared by the post-hoc node and the streaming redactor
+# so streamed tokens and the final answer redact identically (no content flash).
+_OUTPUT_PII_ENTITIES = [
+    "CREDIT_CARD", "CRYPTO", "EMAIL_ADDRESS", "IBAN_CODE",
+    "IP_ADDRESS", "PHONE_NUMBER", "US_SSN", "US_BANK_NUMBER",
+    "PERSON", "LOCATION", "MEDICAL_LICENSE", "US_DRIVER_LICENSE",
+    "US_PASSPORT", "UK_NHS",
+]
+
+_OUTPUT_OPERATORS = {
+    "US_SSN": OperatorConfig("replace", {"new_value": "[REDACTED_SSN]"}),
+    "CREDIT_CARD": OperatorConfig("replace", {"new_value": "[REDACTED_CARD]"}),
+    "US_BANK_NUMBER": OperatorConfig("replace", {"new_value": "[REDACTED_BANK]"}),
+    "PHONE_NUMBER": OperatorConfig("replace", {"new_value": "[REDACTED_PHONE]"}),
+    "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "[REDACTED_EMAIL]"}),
+    "PERSON": OperatorConfig("replace", {"new_value": "[REDACTED_NAME]"}),
+    "IP_ADDRESS": OperatorConfig("replace", {"new_value": "[REDACTED_IP]"}),
+    "MEDICAL_LICENSE": OperatorConfig("replace", {"new_value": "[REDACTED_MEDICAL]"}),
+    "US_DRIVER_LICENSE": OperatorConfig("replace", {"new_value": "[REDACTED_DL]"}),
+    "US_PASSPORT": OperatorConfig("replace", {"new_value": "[REDACTED_PASSPORT]"}),
+    "DEFAULT": OperatorConfig("replace", {"new_value": "[REDACTED]"}),
+}
+
+
 # ---------------------------------------------------------------------------
 # Individual security checks (designed to run in parallel)
 # ---------------------------------------------------------------------------
@@ -259,9 +283,12 @@ async def input_guardrail_node(
                 "query_preview": query[:100],
             }},
         )
+        # Generic, user-facing reason only — the specific threat type and detector
+        # detail stay in logs above. Exposing which pattern fired lets an attacker
+        # iterate around the filters.
         return {
             "blocked": True,
-            "block_reason": f"Security violation: {threat['threat']}. {threat.get('detail', '')}",
+            "block_reason": "Your request was blocked by our security policy.",
         }
 
     if pii_warnings:
@@ -284,12 +311,7 @@ async def output_guardrail_node(state: OrchestratorState, config: RunnableConfig
     results = analyzer.analyze(
         text=answer,
         language="en",
-        entities=[
-            "CREDIT_CARD", "CRYPTO", "EMAIL_ADDRESS", "IBAN_CODE",
-            "IP_ADDRESS", "PHONE_NUMBER", "US_SSN", "US_BANK_NUMBER",
-            "PERSON", "LOCATION", "MEDICAL_LICENSE", "US_DRIVER_LICENSE",
-            "US_PASSPORT", "UK_NHS",
-        ],
+        entities=_OUTPUT_PII_ENTITIES,
         score_threshold=0.7,
     )
 
@@ -299,21 +321,7 @@ async def output_guardrail_node(state: OrchestratorState, config: RunnableConfig
             return {"final_answer": cleaned}
         return {}
 
-    operators = {
-        "US_SSN": OperatorConfig("replace", {"new_value": "[REDACTED_SSN]"}),
-        "CREDIT_CARD": OperatorConfig("replace", {"new_value": "[REDACTED_CARD]"}),
-        "US_BANK_NUMBER": OperatorConfig("replace", {"new_value": "[REDACTED_BANK]"}),
-        "PHONE_NUMBER": OperatorConfig("replace", {"new_value": "[REDACTED_PHONE]"}),
-        "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "[REDACTED_EMAIL]"}),
-        "PERSON": OperatorConfig("replace", {"new_value": "[REDACTED_NAME]"}),
-        "IP_ADDRESS": OperatorConfig("replace", {"new_value": "[REDACTED_IP]"}),
-        "MEDICAL_LICENSE": OperatorConfig("replace", {"new_value": "[REDACTED_MEDICAL]"}),
-        "US_DRIVER_LICENSE": OperatorConfig("replace", {"new_value": "[REDACTED_DL]"}),
-        "US_PASSPORT": OperatorConfig("replace", {"new_value": "[REDACTED_PASSPORT]"}),
-        "DEFAULT": OperatorConfig("replace", {"new_value": "[REDACTED]"}),
-    }
-
-    anonymized = anonymizer.anonymize(text=answer, analyzer_results=results, operators=operators)
+    anonymized = anonymizer.anonymize(text=answer, analyzer_results=results, operators=_OUTPUT_OPERATORS)
     cleaned = anonymized.text
 
     cleaned = re.sub(r"!\[([^\]]*)\]\(https?://[^\)]+\)", r"[Image removed: \1]", cleaned)
@@ -353,3 +361,70 @@ def anonymize_for_llm(text: str) -> tuple[str, list[RecognizerResult]]:
     anonymized = anonymizer.anonymize(text=text, analyzer_results=results, operators=operators)
 
     return anonymized.text, results
+
+
+# ---------------------------------------------------------------------------
+# Streaming-time PII redaction
+# ---------------------------------------------------------------------------
+
+
+class StreamingRedactor:
+    """Redacts PII from a token stream before it reaches the UI.
+
+    The output_guardrail node redacts the *final* answer, but streamed tokens
+    would otherwise hit the screen raw (an SSN/email flashing before the final
+    redacted answer replaces it). This buffers the stream and only emits text
+    far enough from the leading edge that a PII entity can no longer be forming,
+    redacting with the same entities/operators as the post-hoc node so the
+    streamed text and final answer match exactly.
+
+    Presidio is sync/CPU-bound, so redaction runs in a thread and is throttled
+    to fire once every FLUSH_EVERY new characters rather than per token.
+    """
+
+    HOLDBACK = 64      # chars held back from the edge (> longest expected PII span)
+    FLUSH_EVERY = 48   # redact + emit once this many new chars accumulate
+
+    def __init__(self):
+        self._buf = ""
+        self._emitted = 0
+        self._pending = 0
+
+    def _redact(self, text: str) -> str:
+        if not text:
+            return text
+        analyzer = _get_analyzer()
+        results = analyzer.analyze(
+            text=text, language="en",
+            entities=_OUTPUT_PII_ENTITIES, score_threshold=0.7,
+        )
+        if not results:
+            return text
+        return _get_anonymizer().anonymize(
+            text=text, analyzer_results=results, operators=_OUTPUT_OPERATORS,
+        ).text
+
+    async def feed(self, chunk: str) -> str:
+        """Add a token; return redacted text now safe to emit (may be empty)."""
+        if not chunk:
+            return ""
+        self._buf += chunk
+        self._pending += len(chunk)
+        if self._pending < self.FLUSH_EVERY:
+            return ""
+        self._pending = 0
+
+        redacted = await asyncio.to_thread(self._redact, self._buf)
+        safe_len = max(0, len(redacted) - self.HOLDBACK)
+        if safe_len <= self._emitted:
+            return ""
+        out = redacted[self._emitted:safe_len]
+        self._emitted = safe_len
+        return out
+
+    async def flush(self) -> str:
+        """Emit any remaining redacted text at stream end."""
+        redacted = await asyncio.to_thread(self._redact, self._buf)
+        out = redacted[self._emitted:]
+        self._emitted = len(redacted)
+        return out

@@ -17,6 +17,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph.state import CompiledStateGraph
 
 from security_intel.observability.logging import get_logger
+from security_intel.security.guardrails import StreamingRedactor
 
 logger = get_logger("streaming")
 
@@ -37,6 +38,7 @@ async def stream_agent_events(
         final_answer = ""
         current_node = ""
         collected_tokens = []
+        redactor = StreamingRedactor()
 
         async for event in orchestrator.astream_events(input_state, config=config, version="v2"):
             event_type = event.get("event", "")
@@ -47,8 +49,11 @@ async def stream_agent_events(
                 chunk = event.get("data", {}).get("chunk")
                 if chunk and hasattr(chunk, "content") and chunk.content:
                     if event_node in _STREAMABLE_NODES:
-                        yield _sse("token", {"text": chunk.content})
-                        collected_tokens.append(chunk.content)
+                        # Redact PII before it reaches the UI (matches final answer).
+                        safe = await redactor.feed(chunk.content)
+                        if safe:
+                            yield _sse("token", {"text": safe})
+                            collected_tokens.append(safe)
 
             elif event_type == "on_tool_start":
                 if event_node in ("dispatch", "plan"):
@@ -95,10 +100,34 @@ async def stream_agent_events(
                     current_node = name
                     yield _sse("status", {"stage": _friendly_stage(name)})
 
+        # Flush any redacted tail held back during streaming.
+        tail = await redactor.flush()
+        if tail:
+            yield _sse("token", {"text": tail})
+            collected_tokens.append(tail)
+
         try:
             final_state = await orchestrator.aget_state(config)
             if final_state and final_state.values:
                 vals = final_state.values
+
+                # Security-blocked requests end the graph early with no answer.
+                # Surface a generic notice — never the internal block reason.
+                if vals.get("blocked"):
+                    yield _sse(
+                        "done",
+                        {
+                            "answer": (
+                                "I can't help with that request — it was flagged by our "
+                                "security policy. Try rephrasing it as a security "
+                                "intelligence question (threats, CVEs, assets, or reports)."
+                            ),
+                            "session_id": session_id,
+                            "citations": [],
+                        },
+                    )
+                    return
+
                 final_answer = vals.get("final_answer", "")
                 citations = vals.get("citations", [])
                 agents_used = [r["agent_id"] for r in vals.get("agent_results", [])]
@@ -128,8 +157,12 @@ async def stream_agent_events(
         )
 
     except Exception as e:
+        # Log the real error; never leak internals (stack/DB/host info) to the UI.
         logger.error(f"Streaming error: {e}", exc_info=True)
-        yield _sse("error", {"message": str(e)})
+        yield _sse(
+            "error",
+            {"message": "Something went wrong while generating the response. Please try again."},
+        )
 
 
 def _sse(event_name: str, data: dict) -> str:

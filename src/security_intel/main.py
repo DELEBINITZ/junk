@@ -31,6 +31,8 @@ from security_intel.agents.orchestrator import build_orchestrator
 from security_intel.tools.mcp_loader import load_mcp_tools_for_agent
 from security_intel.agents.reports.tools import get_reports_tools
 from security_intel.agents.easm.tools import get_easm_tools
+from security_intel.prompts.reports import REPORTS_SYSTEM_PROMPT
+from security_intel.prompts.easm import EASM_SYSTEM_PROMPT
 from security_intel.tools.query_enrichment import QueryEnricher
 from security_intel.observability.logging import setup_logging, get_logger
 from security_intel.observability.middleware import TracingMiddleware
@@ -46,6 +48,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
     2. Register with AgentSpec here
     3. Done — planner auto-discovers it, orchestrator auto-routes to it.
     """
+    logger = get_logger("registry")
 
     # Query enricher for RAG optimization (uses fast LLM for expansion)
     enricher = None
@@ -64,54 +67,34 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
                 "Filter by threat type, TLP level, report type",
                 "Get report metadata and details",
             ],
-            system_prompt=(
-                "You are a friendly Security Reports specialist — think of yourself as a helpful "
-                "colleague who knows the report library inside out.\n\n"
-                "How to work:\n"
-                "- Use search_reports for semantic search, search_reports_by_filter for metadata queries, "
-                "get_report_metadata for specific reports\n"
-                "- Always cite sources with report titles so the user can find them\n"
-                "- If searches come up empty, say so honestly and suggest alternative search terms "
-                "or angles they could try\n"
-                "- Present findings clearly — lead with the most relevant/critical items\n"
-                "- Keep a warm, professional tone throughout\n"
-                "- If you find something concerning, flag it clearly but calmly"
-            ),
+            system_prompt=REPORTS_SYSTEM_PROMPT,
             tools=reports_tools,
         )
     )
 
-    # EASM Agent
+    # EASM Agent — only registered when a real MCP server provides tools.
+    # No stubs: without tools the agent is omitted rather than serving fake data.
     easm_tools = await get_easm_tools(settings)
-    registry.register(
-        AgentSpec(
-            id="easm",
-            display_name="EASM Agent",
-            description="Queries external attack surface (assets, exposures, changes, rescans). "
-            "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
-            capabilities=[
-                "Query external-facing assets (domains, IPs, services)",
-                "Get current exposures and security findings",
-                "Track attack surface changes over time",
-                "Trigger asset rescans (requires approval)",
-            ],
-            system_prompt=(
-                "You are a friendly External Attack Surface Management specialist — the go-to "
-                "colleague for anything about the organization's internet-facing infrastructure.\n\n"
-                "How to work:\n"
-                "- Use query_assets to find assets, get_exposures for vulnerabilities, "
-                "get_asset_changes for recent changes\n"
-                "- trigger_rescan requires human approval — explain what it does before requesting\n"
-                "- Be precise about severity and asset details — specifics help teams act\n"
-                "- Present findings in order of severity/risk\n"
-                "- If you spot something critical, highlight it clearly but calmly\n"
-                "- Suggest logical next steps when appropriate (e.g., 'You might also want to check...')\n"
-                "- Keep a warm, professional tone — security can be stressful, be the calm expert"
-            ),
-            tools=easm_tools,
-            side_effecting_tools={"trigger_rescan"},
+    if not easm_tools:
+        logger.warning("EASM agent not registered — no MCP tools available.")
+    else:
+        registry.register(
+            AgentSpec(
+                id="easm",
+                display_name="EASM Agent",
+                description="Queries external attack surface (assets, exposures, changes, rescans). "
+                "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
+                capabilities=[
+                    "Query external-facing assets (domains, IPs, services)",
+                    "Get current exposures and security findings",
+                    "Track attack surface changes over time",
+                    "Trigger asset rescans (requires approval)",
+                ],
+                system_prompt=EASM_SYSTEM_PROMPT,
+                tools=easm_tools,
+                side_effecting_tools={"trigger_rescan"},
+            )
         )
-    )
 
     # --- ADD NEW AGENTS HERE ---
     # Example: Brand Protection Agent

@@ -27,6 +27,13 @@ from security_intel.memory.conversations import ConversationStore, ChatSession
 from security_intel.memory.summarizer import RollingSummarizer
 from security_intel.agents.registry import AgentRegistry
 from security_intel.observability.logging import get_logger, set_trace_context
+from security_intel.prompts.orchestrator import (
+    ORCHESTRATOR_PERSONA,
+    ROUTER_PROMPT,
+    CHITCHAT_PROMPT,
+    SYNTHESIS_PROMPT,
+    SYNTH_FALLBACK_MSG,
+)
 
 logger = get_logger("orchestrator")
 
@@ -39,89 +46,6 @@ SECURITY_TIMEOUT = 8
 
 # LangGraph recursion limit for sub-agents
 AGENT_RECURSION_LIMIT = 15
-
-ORCHESTRATOR_PERSONA = """You are an expert Security Intelligence Assistant for an enterprise platform.
-
-Your personality:
-- Warm and approachable — like a knowledgeable colleague who genuinely wants to help
-- Explain complex security concepts in clear, accessible language
-- Proactive — flag related risks the user might not have asked about
-- Precise — cite specific reports, CVEs, asset details; never hallucinate
-- Context-aware — remember prior conversation turns, build on earlier findings
-- Encouraging — help users feel confident navigating security topics
-
-You help security teams with:
-- Threat intelligence: CVE analysis, threat actor TTPs, IOC lookups
-- Attack surface: external assets, exposures, misconfigurations
-- Report analysis: security assessments, compliance findings, remediation
-- Cross-domain correlation: connecting threat intel with exposed assets
-
-When you don't have information, say so honestly and suggest alternative queries they could try.
-When findings are critical, lead with that clearly but without alarm.
-Always ground answers in evidence from specialist agent findings.
-End with a helpful nudge when appropriate — "Would you like me to dig deeper into X?" or "I can also check Y if that helps.\""""
-
-ROUTER_PROMPT = """You are the intelligent gateway for a Security Intelligence Platform. You route queries and — for simple cases — generate the agent task directly.
-
-Given the user's message, respond with EXACTLY one JSON object:
-
-1. DIRECT — You can answer without security data (greetings, chitchat, "who are you", thanks, help)
-   {{"action": "DIRECT", "response": "your brief response here"}}
-
-2. SIMPLE — Single-domain query needing one agent. You generate the task inline (saves a planning step).
-   {{"action": "SIMPLE", "agent": "<agent_id>", "task": "<self-contained task for the agent>"}}
-
-3. COMPLEX — Multi-domain, cross-referencing, or multi-step query requiring a planner.
-   {{"action": "COMPLEX"}}
-
-Available agents: {agents}
-
-Rules:
-- DIRECT: greetings, thanks, "who are you", "what can you do", general conversation, off-topic
-- SIMPLE: single-domain question → pick ONE agent, write a self-contained task string (include specific entities from the user's question: CVE IDs, hostnames, terms)
-- COMPLEX: genuinely needs multiple agents OR cross-domain correlation (e.g., "Compare our exposed assets against recent threats")
-- NEVER make up security data in DIRECT responses
-- For SIMPLE: task must be SELF-CONTAINED — the agent sees ONLY the task string, not the user's original query
-- BAD task: "Look into threats" → GOOD: "Search for reports about CVE-2024-1234 including severity, affected systems, and remediation steps"
-
-Persona for DIRECT:
-- Warm, professional, concise (1-3 sentences)
-- Guide users toward: threat intel, attack surface, security reports
-- Never dismissive
-
-Question: {question}
-
-Context from prior conversation:
-{context}
-
-Respond with ONE JSON object only:"""
-
-CHITCHAT_PROMPT = """You are the Security Intelligence Assistant handling a message that needs no security data lookup (greeting, "who are you", thanks, general/off-topic question, or a quick coding/how-to ask).
-
-{persona}
-
-Rules:
-1. Answer the user's message directly and helpfully — if it's a general question (weather, a snippet of code, etc.), give a concise useful answer.
-2. Keep it short (1-4 sentences unless code is requested).
-3. After answering off-topic asks, gently steer toward what you do best: threat intel, attack surface, security reports.
-4. Never fabricate security data, CVEs, or findings."""
-
-
-SYNTHESIS_PROMPT = """You are the Security Intelligence Assistant synthesizing findings for the user.
-
-{persona}
-
-Rules:
-1. Combine findings into a clear, actionable answer that feels helpful and human
-2. Cite sources: [Report: title] or [EASM: finding]
-3. Highlight CRITICAL items first with clear severity indicators — but stay calm, not alarmist
-4. Note conflicts between sources transparently
-5. For simple queries: concise paragraph. For complex: structured with headers
-6. If findings are empty or irrelevant: say so honestly, suggest specific alternative questions they could try
-7. End complex answers with "Next steps" or offer to dig deeper into specific areas
-8. Maintain conversation continuity — reference prior context when relevant
-9. Write like a knowledgeable colleague explaining findings — clear, warm, and professional"""
-
 
 def build_orchestrator(
     lane_router: LaneRouter,
@@ -386,13 +310,16 @@ def build_orchestrator(
         user_query = state["user_query"]
         is_complex = state.get("is_complex", False)
 
-        if not agent_results:
+        # Drop error/timeout results — their raw diagnostics must never reach the user.
+        real_results = [r for r in agent_results if not _is_error_finding(r["findings"])]
+
+        if not real_results:
             friendly_empty = (
-                "I searched our security intelligence sources but couldn't find relevant "
-                "information for your question. Could you try:\n"
-                "- Being more specific (e.g., a CVE ID, asset name, or date range)\n"
+                "I wasn't able to retrieve results for that just now. This can happen "
+                "when a query is very broad or a source is slow to respond. Could you try:\n"
+                "- Being more specific (e.g., a CVE ID, report ID, asset name, or date range)\n"
                 "- Rephrasing your question\n"
-                "- Asking about a related topic I can help with"
+                "- Asking again in a moment"
             )
             return {"final_answer": friendly_empty, "citations": []}
 
@@ -404,7 +331,7 @@ def build_orchestrator(
 
         findings_text = ""
         all_citations = []
-        for r in agent_results:
+        for r in real_results:
             findings_text += f"\n\n### {r['agent_id'].upper()} Agent Findings:\n{r['findings']}"
             all_citations.extend(r["citations"])
 
@@ -433,11 +360,11 @@ def build_orchestrator(
             )
             answer = response.content
         except asyncio.TimeoutError:
-            logger.error("Synthesis timed out, returning raw findings")
-            answer = "Here are the findings from the analysis:\n" + findings_text
+            logger.error("Synthesis timed out")
+            answer = SYNTH_FALLBACK_MSG
         except Exception as e:
             logger.error(f"Synthesis failed: {e}")
-            answer = "Here are the findings from the analysis:\n" + findings_text
+            answer = SYNTH_FALLBACK_MSG
 
         return {
             "final_answer": answer,
@@ -639,6 +566,25 @@ async def _invoke_agent(
         citations=[],
         tool_calls=tool_calls_log,
     )
+
+
+_ERROR_FINDING_MARKERS = (
+    "Agent failed",
+    "timed out after",
+    "not available",
+    "All connection attempts failed",
+)
+
+
+def _is_error_finding(findings: str) -> bool:
+    """True if an agent result is an internal error/timeout, not real content.
+
+    Used to keep raw diagnostics out of the synthesized, user-facing answer.
+    """
+    if not findings:
+        return True
+    head = findings[:200]
+    return any(m in head for m in _ERROR_FINDING_MARKERS)
 
 
 async def _make_error_result(agent_id: str, error_msg: str) -> AgentResult:
