@@ -13,6 +13,7 @@ Key design decisions:
 
 import asyncio
 import json
+from datetime import datetime, timezone
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -303,11 +304,15 @@ def build_orchestrator(
 
         batches = _topological_sort(steps)
 
+        # Give agents temporal grounding so they can resolve "last 30 days" / "recent"
+        # and never present stale reports as current.
+        today = datetime.now(timezone.utc).date().isoformat()
+
         for batch in batches:
             tasks = []
             for idx in batch:
                 step = steps[idx]
-                task_content = step["task"]
+                task_content = f"(Current date: {today}.)\n{step['task']}"
 
                 if step.get("depends_on"):
                     prior_context = [completed[d] for d in step["depends_on"] if d in completed]

@@ -1,0 +1,36 @@
+name: security
+
+# Red-team regression gate. The static-detection corpus runs with no heavy deps
+# so it is fast and always-on; it fails the build if a known attack stops being
+# caught or a benign security query starts being flagged (false positive).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/security_intel/security/**"
+      - "src/security_intel/prompts/**"
+      - "tests/test_security_redteam.py"
+      - ".github/workflows/security.yml"
+
+jobs:
+  redteam:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test deps (static layer is dependency-free)
+        run: pip install pytest pytest-asyncio
+
+      - name: Run red-team security suite
+        # The static-detection + leak tests need no project deps; the two dynamic
+        # plumbing tests importorskip if Presidio isn't installed. -p no:cacheprovider
+        # keeps it hermetic.
+        env:
+          PYTHONPATH: src
+        run: pytest tests/test_security_redteam.py -v -p no:cacheprovider

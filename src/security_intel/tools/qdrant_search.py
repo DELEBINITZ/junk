@@ -14,16 +14,55 @@ Production features:
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from langchain_core.tools import tool
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
+from qdrant_client.models import (
+    Filter, FieldCondition, MatchValue, MatchAny, DatetimeRange, OrderBy,
+)
 
 from security_intel.config import Settings
 from security_intel.observability.logging import get_logger
 
 logger = get_logger("qdrant_search")
+
+
+def _date_range_condition(days: int = 0, start_date: str = "", end_date: str = "") -> FieldCondition | None:
+    """Build a published_at datetime-range filter (indexed as DATETIME in Qdrant).
+
+    days>0 → "last N days" relative to the server's current UTC time (no LLM date
+    math). start_date/end_date → absolute RFC3339/ISO bounds. Returns None if no
+    temporal constraint was requested.
+    """
+    gte = lte = None
+    if days and days > 0:
+        gte = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    if start_date:
+        gte = start_date
+    if end_date:
+        lte = end_date
+    if gte is None and lte is None:
+        return None
+    return FieldCondition(key="published_at", range=DatetimeRange(gte=gte, lte=lte))
+
+
+async def _latest_report_date(qdrant: AsyncQdrantClient, settings: Settings, access_filter: Filter) -> str | None:
+    """Most recent published_at available to this org (for honest 'no recent reports' messages)."""
+    try:
+        points, _ = await qdrant.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=access_filter,
+            limit=1,
+            with_payload=True,
+            order_by=OrderBy(key="published_at", direction="desc"),
+        )
+        if points:
+            return (points[0].payload or {}).get("published_at")
+    except Exception as e:
+        logger.warning(f"latest-report-date lookup failed: {e}")
+    return None
 
 
 _qdrant_clients: dict[str, AsyncQdrantClient] = {}
@@ -75,7 +114,7 @@ def build_search_reports_tool(settings: Settings, enricher=None):
     qdrant = _get_qdrant_client(settings)
 
     @tool
-    async def search_reports(query: str, top_k: int = 6) -> str:
+    async def search_reports(query: str, top_k: int = 6, days: int = 0) -> str:
         """Semantic search over the organization's security reports corpus.
 
         Uses adaptive query enrichment: automatically expands broad queries into
@@ -84,12 +123,16 @@ def build_search_reports_tool(settings: Settings, enricher=None):
         Args:
             query: Natural language search query about threats, CVEs, findings, or remediation.
             top_k: Number of results to return (1-20, default 6).
+            days: If >0, only return reports published in the last N days (e.g. 30 for
+                "last 30 days", 7 for "this week"). The cutoff is computed from the
+                current date — use this for any time-bound request.
         """
         from langgraph.config import get_config
 
         config = get_config()
         org_id = config["configurable"].get("org_id", "default")
-        access_filter = _build_access_filter(org_id)
+        date_cond = _date_range_condition(days=days)
+        access_filter = _build_access_filter(org_id, extra_must=[date_cond] if date_cond else None)
 
         search_queries = [query]
         if enricher:
@@ -112,6 +155,16 @@ def build_search_reports_tool(settings: Settings, enricher=None):
         )
 
         if not all_passages:
+            if date_cond:
+                # Time-bound search came back empty — be explicit about the window
+                # and the most recent report we DO have, instead of silently
+                # returning nothing or (worse) stale reports as if they were recent.
+                latest = await _latest_report_date(qdrant, settings, _build_access_filter(org_id))
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+                msg = f"No reports published in the last {days} days (since {cutoff})."
+                if latest:
+                    msg += f" The most recent report available is dated {latest}."
+                return msg
             return "No relevant reports found for this query. Try different keywords or broader terms."
 
         if len(search_queries) > 1 and len(all_passages) > 1:
@@ -362,6 +415,7 @@ def build_search_by_filter_tool(settings: Settings):
         tlp: str = "",
         report_type: str = "",
         limit: int = 10,
+        days: int = 0,
     ) -> str:
         """Search reports by metadata filters (no semantic search, exact match).
 
@@ -372,6 +426,7 @@ def build_search_by_filter_tool(settings: Settings):
             tlp: Filter by TLP level (e.g., 'RED', 'AMBER', 'GREEN', 'CLEAR').
             report_type: Filter by report type (e.g., 'threat_advisory', 'vulnerability').
             limit: Max results (1-50, default 10).
+            days: If >0, only reports published in the last N days (cutoff from current date).
         """
         from langgraph.config import get_config
 
@@ -391,6 +446,9 @@ def build_search_by_filter_tool(settings: Settings):
             extra_must.append(
                 FieldCondition(key="report_type", match=MatchValue(value=report_type))
             )
+        date_cond = _date_range_condition(days=days)
+        if date_cond:
+            extra_must.append(date_cond)
 
         access_filter = _build_access_filter(org_id, extra_must=extra_must)
 
@@ -403,6 +461,13 @@ def build_search_by_filter_tool(settings: Settings):
 
         points = results[0] if results else []
         if not points:
+            if days > 0:
+                latest = await _latest_report_date(qdrant, settings, _build_access_filter(org_id))
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+                msg = f"No reports published in the last {days} days (since {cutoff})."
+                if latest:
+                    msg += f" The most recent report available is dated {latest}."
+                return msg
             return "No reports found matching the given filters."
 
         seen_docs = set()
