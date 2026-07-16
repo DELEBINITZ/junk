@@ -83,6 +83,8 @@ async def chat(
 
     input_state = {
         "messages": [HumanMessage(content=body.message)],
+        "history": [],
+        "summary": "",
         "user_query": body.message,
         "org_id": sc.org_id,
         "user_id": sc.user_id,
@@ -141,6 +143,8 @@ async def chat_stream(
 
     input_state = {
         "messages": [HumanMessage(content=message)],
+        "history": [],
+        "summary": "",
         "user_query": message,
         "org_id": sc.org_id,
         "user_id": sc.user_id,

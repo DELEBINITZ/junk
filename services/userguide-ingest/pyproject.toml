@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fortirecon-userguide-ingest"
+version = "1.0.0"
+description = "Standalone service that ingests the FortiRecon user guide into Qdrant"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+# Deliberately minimal + independent of the main `security_intel` app. This
+# service shares NOTHING at the code level with the platform — only the Qdrant
+# collection name, payload schema, and embedding model/dim, which are coordinated
+# purely through environment variables. It can be built, versioned, and deployed
+# on its own (one-shot Job / cron), separately from the API.
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "qdrant-client>=1.12",
+]
+
+[project.scripts]
+index-user-guide = "index_user_guide:main"
+
+[tool.hatch.build.targets.wheel]
+# Single-module service.
+only-include = ["index_user_guide.py"]
+sources = ["."]

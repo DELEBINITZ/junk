@@ -1,0 +1,42 @@
+name: tests
+
+# Routing-plumbing regression gate. Runs the orchestrator end-to-end with a scripted
+# fake LLM and canned tool_call agents — NO LLM, Qdrant, or Presidio needed — so it
+# is fast and always-on. Fails the build if a routing decision stops being executed
+# correctly (DIRECT/REFUSE must stay agent-free; SIMPLE must dispatch to the right
+# agent). Decision QUALITY is validated separately by tests/eval/run_eval.py against
+# a live staging LLM.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/security_intel/agents/**"
+      - "src/security_intel/prompts/orchestrator.py"
+      - "src/security_intel/state/schemas.py"
+      - "tests/test_routing.py"
+      - "tests/eval/**"
+      - ".github/workflows/tests.yml"
+
+jobs:
+  routing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (routing plumbing only — no Presidio/Qdrant/LLM)
+        run: |
+          pip install pytest pytest-asyncio \
+            "langgraph>=0.4" "langchain-core>=0.3" "langchain-openai>=0.3" \
+            "qdrant-client>=1.12" "pydantic>=2.6" "pydantic-settings>=2.2" \
+            "httpx>=0.27" "psycopg[binary]>=3.1"
+
+      - name: Routing regression (fake LLM, no external services)
+        env:
+          PYTHONPATH: src
+        run: pytest tests/test_routing.py -v -p no:cacheprovider

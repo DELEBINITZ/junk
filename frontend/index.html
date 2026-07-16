@@ -22,6 +22,7 @@
     --text-muted: #8e8e8e;
     --accent: #10a37f;
     --accent-hover: #0d8c6d;
+    --accent-dim: rgba(16,163,127,.12);
     --user-bg: #2f2f2f;
     --code-bg: #1e1e1e;
     --shadow: 0 2px 6px rgba(0,0,0,.15);
@@ -46,6 +47,11 @@
   #sidebar {
     width: 260px; background: var(--bg-secondary); display: flex; flex-direction: column;
     border-right: 1px solid var(--border); flex-shrink: 0;
+    transition: transform .2s;
+  }
+  @media (max-width: 768px) {
+    #sidebar { position: absolute; z-index: 100; height: 100%; transform: translateX(-100%); }
+    #sidebar.open { transform: translateX(0); }
   }
   #sidebar header {
     padding: 12px; display: flex; align-items: center; justify-content: space-between;
@@ -68,15 +74,19 @@
     padding: 10px 12px; margin: 2px 0; border-radius: 8px; cursor: pointer;
     font-size: 13px; color: var(--text-secondary); white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; transition: background .12s;
+    display: flex; align-items: center; justify-content: space-between;
   }
   .sess:hover { background: var(--surface); }
   .sess.active { background: var(--surface); color: var(--text); }
+  .sess-del { opacity: 0; font-size: 11px; color: var(--text-muted); cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+  .sess:hover .sess-del { opacity: .7; }
+  .sess-del:hover { opacity: 1; background: var(--surface-active); }
 
   /* ---------- main ---------- */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
   /* ---------- messages ---------- */
-  #messages { flex: 1; overflow-y: auto; padding: 24px 0; }
+  #messages { flex: 1; overflow-y: auto; padding: 24px 0; scroll-behavior: smooth; }
 
   /* ---------- welcome screen ---------- */
   .welcome {
@@ -92,12 +102,13 @@
   .suggestions {
     display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 28px; max-width: 520px; width: 100%;
   }
+  @media (max-width: 600px) { .suggestions { grid-template-columns: 1fr; } }
   .suggestion {
     background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
     padding: 14px 16px; cursor: pointer; text-align: left; transition: background .12s, border-color .12s;
     font-size: 13px; color: var(--text-secondary); line-height: 1.4;
   }
-  .suggestion:hover { background: var(--surface-hover); border-color: var(--border-light); }
+  .suggestion:hover { background: var(--surface-hover); border-color: var(--accent); }
   .suggestion strong { display: block; color: var(--text); margin-bottom: 4px; font-size: 13px; }
 
   /* ---------- turn layout ---------- */
@@ -106,7 +117,7 @@
   }
   .turn.assistant { background: var(--bg); }
   .turn.user { background: var(--bg); }
-  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
 
   .turn-inner {
     max-width: var(--max-width); margin: 0 auto; padding: 0 24px;
@@ -192,6 +203,37 @@
   .mbtn:hover { opacity: 1; background: var(--surface); border-color: var(--border); }
   .mbtn.on { opacity: 1; color: var(--accent); }
 
+  /* ---------- progress pipeline ---------- */
+  .pipeline {
+    margin: 8px 0 12px; padding: 10px 14px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; font-size: 13px;
+  }
+  .pipeline-steps { display: flex; align-items: center; gap: 0; margin-bottom: 8px; }
+  .pipe-step {
+    display: flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 6px; color: var(--text-muted); transition: all .3s;
+    white-space: nowrap;
+  }
+  .pipe-step.active { color: var(--accent); background: var(--accent-dim); }
+  .pipe-step.done { color: var(--text-secondary); }
+  .pipe-step .dot {
+    width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+    flex-shrink: 0;
+  }
+  .pipe-step.active .dot { animation: pulse 1.2s ease-in-out infinite; }
+  .pipe-connector { width: 16px; height: 1px; background: var(--border); flex-shrink: 0; }
+  .pipe-detail {
+    font-size: 12px; color: var(--text-muted); min-height: 16px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .pipe-detail .spinner {
+    width: 12px; height: 12px; border: 2px solid var(--border);
+    border-top-color: var(--accent); border-radius: 50%;
+    animation: spin .6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .pipe-elapsed { color: var(--text-muted); font-size: 11px; margin-left: auto; }
+
   /* ---------- thinking panel ---------- */
   .think {
     margin: 4px 0 12px; border-left: 2px solid var(--border);
@@ -202,14 +244,14 @@
     display: flex; align-items: center; gap: 8px; user-select: none; font-weight: 500;
   }
   .think > summary::-webkit-details-marker { display: none; }
-  .think > summary::after { content: "▸"; font-size: 10px; margin-left: auto; transition: transform .15s; }
+  .think > summary::after { content: "\25B8"; font-size: 10px; margin-left: auto; transition: transform .15s; }
   .think[open] > summary::after { transform: rotate(90deg); }
   .think-dot {
     width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
     animation: pulse 1.2s ease-in-out infinite;
   }
   .think-dot.done { animation: none; opacity: .4; }
-  .think-body { padding: 0 14px 10px; color: var(--text-muted); line-height: 1.5; }
+  .think-body { padding: 0 14px 10px; color: var(--text-muted); line-height: 1.5; max-height: 200px; overflow-y: auto; }
   .tline { padding: 4px 0; border-top: 1px dashed var(--border); white-space: pre-wrap; }
   .tline:first-child { border-top: 0; }
   .tstage {
@@ -220,10 +262,6 @@
 
   /* ---------- status + typing ---------- */
   .status { font-size: 12px; color: var(--text-muted); margin: 6px 0; min-height: 16px; display: flex; align-items: center; gap: 6px; }
-  .status:not(:empty)::before {
-    content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
-    animation: pulse 1.2s ease-in-out infinite;
-  }
   @keyframes pulse { 0%,100% { opacity: .4; transform: scale(.8); } 50% { opacity: 1; transform: scale(1.1); } }
   .typing { display: inline-flex; gap: 4px; padding: 4px 0; }
   .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); display: inline-block; animation: bounce 1.2s infinite ease-in-out; }
@@ -259,10 +297,18 @@
     background: var(--accent); color: #fff; border: 0; border-radius: 10px;
     width: 36px; height: 36px; cursor: pointer; display: grid; place-items: center;
     transition: background .12s, transform .1s;
+    flex-shrink: 0;
   }
   #send:hover:not(:disabled) { background: var(--accent-hover); transform: scale(1.05); }
   #send:disabled { opacity: .4; cursor: default; }
   #send svg { width: 18px; height: 18px; }
+  #stop-btn {
+    display: none; background: var(--surface-active); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; width: 36px; height: 36px; cursor: pointer; place-items: center;
+    transition: background .12s; flex-shrink: 0;
+  }
+  #stop-btn:hover { background: var(--border); }
+  #stop-btn svg { width: 14px; height: 14px; }
   .hint { max-width: var(--max-width); margin: 8px auto 0; font-size: 11px; color: var(--text-muted); text-align: center; }
 </style>
 </head>
@@ -279,10 +325,11 @@
     <div id="composer">
       <div class="wrap">
         <div class="row">
-          <textarea id="input" rows="1" placeholder="Ask about security reports, threats, vulnerabilities…"></textarea>
+          <textarea id="input" rows="1" placeholder="Ask about security reports, threats, vulnerabilities..."></textarea>
+          <button id="stop-btn" title="Stop generation"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
           <button id="send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button>
         </div>
-        <div class="hint">Enter to send · Shift+Enter for newline · Powered by your security intelligence platform</div>
+        <div class="hint">Enter to send &middot; Shift+Enter for newline</div>
       </div>
     </div>
   </main>
@@ -299,11 +346,19 @@ const CONFIG = {
 marked.setOptions({ breaks: true, gfm: true });
 const $ = (s) => document.querySelector(s);
 const messagesEl = $("#messages"), sessionsEl = $("#sessions"), input = $("#input");
-let currentSession = null, streaming = false;
+let currentSession = null, streaming = false, activeES = null;
 
 const escapeHtml = (s) => { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; };
 const md = (t) => DOMPurify.sanitize(marked.parse(t || ""));
 const TYPING = `<span class="typing"><i></i><i></i><i></i></span>`;
+
+// ---- Pipeline stages for visual progress ----
+const PIPELINE_STAGES = [
+  { id: "security", label: "Security" },
+  { id: "routing", label: "Routing" },
+  { id: "agents", label: "Agents" },
+  { id: "answer", label: "Answer" },
+];
 
 function showWelcome() {
   messagesEl.innerHTML = `
@@ -340,19 +395,36 @@ async function loadSessions() {
       const id = s.session_id || s.id;
       const d = document.createElement("div");
       d.className = "sess" + (id === currentSession ? " active" : "");
-      d.textContent = s.title || "New chat";
-      d.title = s.title || "";
+      const title = document.createElement("span");
+      title.textContent = s.title || "New chat";
+      title.title = s.title || "";
+      d.appendChild(title);
+      const del = document.createElement("span");
+      del.className = "sess-del";
+      del.textContent = "✕";
+      del.onclick = (e) => { e.stopPropagation(); deleteSession(id); };
+      d.appendChild(del);
       d.onclick = () => openSession(id);
       sessionsEl.appendChild(d);
     });
   } catch (e) { console.error("sessions:", e); }
 }
 
+async function deleteSession(id) {
+  try {
+    await fetch(`${CONFIG.API_BASE}/v1/sessions/${id}`, {
+      method: "DELETE",
+      headers: { "X-API-Key": CONFIG.API_KEY, "Authorization": `Bearer ${CONFIG.JWT_TOKEN}` },
+    });
+    if (id === currentSession) newChat();
+    else loadSessions();
+  } catch (e) { console.error("delete:", e); }
+}
+
 function newChat() { currentSession = null; showWelcome(); loadSessions(); input.focus(); }
 
 // ---- render a turn ----
 function addTurn(role, html) {
-  // Remove welcome if present
   const welcome = messagesEl.querySelector(".welcome");
   if (welcome) welcome.remove();
 
@@ -364,6 +436,7 @@ function addTurn(role, html) {
     `<div class="turn-inner">` +
       `<div class="avatar">${avatar}</div>` +
       `<div class="content">` +
+        `<div class="pipeline" style="display:none"></div>` +
         `<details class="think" style="display:none"><summary>` +
           `<span class="think-dot"></span><span class="think-label">Thinking…</span></summary>` +
           `<div class="think-body"></div></details>` +
@@ -374,6 +447,56 @@ function addTurn(role, html) {
   messagesEl.appendChild(turn);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return turn;
+}
+
+// ---- progress pipeline ----
+function initPipeline(turn) {
+  const el = turn.querySelector(".pipeline");
+  el.style.display = "";
+  let html = '<div class="pipeline-steps">';
+  PIPELINE_STAGES.forEach((s, i) => {
+    if (i > 0) html += '<div class="pipe-connector"></div>';
+    html += `<div class="pipe-step" data-stage="${s.id}"><span class="dot"></span>${s.label}</div>`;
+  });
+  html += '</div><div class="pipe-detail"><span class="spinner"></span><span class="pipe-text">Starting...</span><span class="pipe-elapsed"></span></div>';
+  el.innerHTML = html;
+  el._startTime = Date.now();
+  el._timer = setInterval(() => updateElapsed(el), 1000);
+}
+
+function updatePipeline(turn, stageId, detail) {
+  const el = turn.querySelector(".pipeline");
+  if (!el || el.style.display === "none") return;
+  const steps = el.querySelectorAll(".pipe-step");
+  let found = false;
+  steps.forEach((step) => {
+    if (step.dataset.stage === stageId) {
+      step.classList.add("active");
+      step.classList.remove("done");
+      found = true;
+    } else if (!found) {
+      step.classList.add("done");
+      step.classList.remove("active");
+    } else {
+      step.classList.remove("active", "done");
+    }
+  });
+  const text = el.querySelector(".pipe-text");
+  if (text && detail) text.textContent = detail;
+}
+
+function updateElapsed(el) {
+  const elapsed = el.querySelector(".pipe-elapsed");
+  if (!elapsed) return;
+  const sec = Math.round((Date.now() - el._startTime) / 1000);
+  elapsed.textContent = sec + "s";
+}
+
+function finishPipeline(turn) {
+  const el = turn.querySelector(".pipeline");
+  if (!el) return;
+  if (el._timer) clearInterval(el._timer);
+  el.style.display = "none";
 }
 
 // ---- code highlighting + copy bar ----
@@ -401,6 +524,7 @@ function enhance(bubble) {
 }
 
 function addCaret(bubble) {
+  bubble.querySelectorAll(".caret").forEach((c) => c.remove());
   const c = document.createElement("span"); c.className = "caret";
   bubble.appendChild(c);
 }
@@ -409,13 +533,13 @@ function addThinking(turn, stage, text) {
   const panel = turn.querySelector(".think");
   if (!panel) return;
   panel.style.display = "";
-  panel.open = true;
   const body = panel.querySelector(".think-body");
   const line = document.createElement("div");
   line.className = "tline";
   line.innerHTML = `<span class="tstage">${escapeHtml(stage || "")}</span>` +
                    escapeHtml(text || "").replace(/\n/g, "<br>");
   body.appendChild(line);
+  body.scrollTop = body.scrollHeight;
 }
 
 function finishThinking(turn) {
@@ -428,9 +552,9 @@ function finishThinking(turn) {
 
 function citeRow(cites) {
   const wrap = document.createElement("div"); wrap.className = "cites";
-  cites.forEach((c) => {
+  cites.forEach((c, i) => {
     const el = document.createElement("span"); el.className = "cite";
-    const badge = document.createElement("span"); badge.className = "n"; badge.textContent = c.n ?? "";
+    const badge = document.createElement("span"); badge.className = "n"; badge.textContent = c.n ?? (i + 1);
     const lbl = document.createElement("span"); lbl.textContent = c.title || c.source || c.doc_id || "source";
     el.append(badge, lbl);
     el.title = c.snippet || "";
@@ -488,7 +612,17 @@ async function openSession(id) {
   });
 }
 
-// ---- send message: try streaming first, fallback to POST ----
+// ---- stop generation ----
+function stopGeneration() {
+  if (activeES) { activeES.close(); activeES = null; }
+  streaming = false;
+  $("#send").style.display = "";
+  $("#stop-btn").style.display = "none";
+  $("#send").disabled = false;
+  input.focus();
+}
+
+// ---- send message: streaming with visual pipeline ----
 function sendMessage() {
   const text = input.value.trim();
   if (!text || streaming) return;
@@ -498,9 +632,13 @@ function sendMessage() {
   const turn = addTurn("assistant", "");
   const bubble = turn.querySelector(".bubble"), statusEl = turn.querySelector(".status");
   let acc = "";
-  streaming = true; $("#send").disabled = true;
+  streaming = true;
+  $("#send").style.display = "none";
+  $("#stop-btn").style.display = "grid";
 
-  // Try streaming via EventSource (GET with query params for auth)
+  initPipeline(turn);
+  updatePipeline(turn, "security", "Running security checks...");
+
   const qs = new URLSearchParams({
     api_key: CONFIG.API_KEY,
     access_token: CONFIG.JWT_TOKEN,
@@ -509,37 +647,76 @@ function sendMessage() {
   if (currentSession) qs.set("session_id", currentSession);
 
   const es = new EventSource(`${CONFIG.API_BASE}/v1/chat/stream?${qs.toString()}`);
+  activeES = es;
   let streamOpened = false;
+  let firstToken = false;
 
   es.onopen = () => { streamOpened = true; };
 
   es.addEventListener("session", (e) => { currentSession = JSON.parse(e.data).session_id; });
-  es.addEventListener("status", (e) => { statusEl.textContent = JSON.parse(e.data).stage || ""; });
-  es.addEventListener("plan", (e) => { statusEl.textContent = "Planning (" + (JSON.parse(e.data).steps?.length || 0) + " steps)"; });
-  es.addEventListener("route", (e) => { statusEl.textContent = "Routing → " + (JSON.parse(e.data).modules || []).join(", "); });
+
+  es.addEventListener("status", (e) => {
+    const stage = JSON.parse(e.data).stage || "";
+    statusEl.textContent = stage;
+    // Map backend stages to pipeline visualization
+    if (stage.includes("security")) updatePipeline(turn, "security", stage);
+    else if (stage.includes("context") || stage.includes("nalyz") || stage.includes("Routing") || stage.includes("plan"))
+      updatePipeline(turn, "routing", stage);
+    else if (stage.includes("agent") || stage.includes("specialist") || stage.includes("Running"))
+      updatePipeline(turn, "agents", stage);
+    else if (stage.includes("Synth") || stage.includes("answer"))
+      updatePipeline(turn, "answer", stage);
+  });
+
+  es.addEventListener("plan", (e) => {
+    const d = JSON.parse(e.data);
+    const count = d.steps?.length || 0;
+    updatePipeline(turn, "agents", `Executing plan (${count} step${count !== 1 ? "s" : ""})`);
+    if (d.summary) addThinking(turn, "plan", d.summary);
+  });
+
+  es.addEventListener("route", (e) => {
+    const d = JSON.parse(e.data);
+    const mods = (d.modules || []).join(", ");
+    updatePipeline(turn, "agents", "Querying: " + mods);
+  });
+
   es.addEventListener("thinking", (e) => {
     const d = JSON.parse(e.data);
     addThinking(turn, d.stage, d.text);
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+
   es.addEventListener("tool", (e) => {
     const d = JSON.parse(e.data);
-    statusEl.textContent = "Retrieving: " + (d.module || d.step || "") + (d.found != null ? " (" + d.found + " found)" : "");
+    const detail = (d.module || d.step || "") + (d.found != null ? ` (${d.found} found)` : "");
+    updatePipeline(turn, "agents", "Retrieving: " + detail);
   });
+
   es.addEventListener("token", (e) => {
+    if (!firstToken) {
+      firstToken = true;
+      updatePipeline(turn, "answer", "Generating response...");
+      bubble.innerHTML = "";
+      // Hide pipeline once tokens start streaming — user sees real content now
+      setTimeout(() => finishPipeline(turn), 600);
+    }
     acc += JSON.parse(e.data).text;
     bubble.innerHTML = md(acc);
     addCaret(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+
   es.addEventListener("rollback", (e) => {
     acc = JSON.parse(e.data).text;
     bubble.innerHTML = md(acc);
     messagesEl.scrollTop = messagesEl.scrollHeight;
   });
+
   es.addEventListener("done", (e) => {
     const d = JSON.parse(e.data);
     acc = d.answer || acc;
+    finishPipeline(turn);
     bubble.innerHTML = md(acc);
     enhance(bubble);
     if (d.citations && d.citations.length) bubble.appendChild(citeRow(d.citations));
@@ -548,33 +725,42 @@ function sendMessage() {
     finishThinking(turn);
     finish(es); loadSessions();
   });
+
   es.addEventListener("error", (e) => {
-    // If stream never opened, fallback to POST
     if (!streamOpened && !acc) {
-      es.close();
+      es.close(); activeES = null;
+      finishPipeline(turn);
       fallbackPost(text, turn, bubble, statusEl);
       return;
     }
     try { statusEl.textContent = "⚠ " + (JSON.parse(e.data).message || "error"); } catch (_) {}
-    if (!acc) bubble.innerHTML = `<p style="color:var(--text-muted)"><em>Connection error — retrying with POST…</em></p>`;
+    if (!acc) bubble.innerHTML = `<p style="color:var(--text-muted)"><em>Connection error — retrying...</em></p>`;
+    finishPipeline(turn);
     finish(es);
   });
 
-  // Timeout: if no events in 15s, fallback to POST (LLM planning takes time)
+  // Timeout: if no events in 20s, fallback
   const timeout = setTimeout(() => {
     if (!streamOpened && !acc) {
-      es.close();
+      es.close(); activeES = null;
+      finishPipeline(turn);
       fallbackPost(text, turn, bubble, statusEl);
     }
-  }, 15000);
+  }, 20000);
 
-  const origFinish = finish;
-  function finish(src) { clearTimeout(timeout); src.close(); streaming = false; $("#send").disabled = false; input.focus(); }
+  function finish(src) {
+    clearTimeout(timeout); src.close(); activeES = null;
+    streaming = false;
+    $("#send").style.display = "";
+    $("#stop-btn").style.display = "none";
+    $("#send").disabled = false;
+    input.focus();
+  }
 }
 
 // POST fallback when streaming unavailable
 async function fallbackPost(text, turn, bubble, statusEl) {
-  statusEl.textContent = "Processing…";
+  statusEl.textContent = "Processing...";
   try {
     const r = await fetch(`${CONFIG.API_BASE}/v1/chat`, {
       method: "POST",
@@ -589,7 +775,7 @@ async function fallbackPost(text, turn, bubble, statusEl) {
       const err = await r.text();
       bubble.innerHTML = `<p style="color:#e57373"><em>Error ${r.status}: ${escapeHtml(err.slice(0, 200))}</em></p>`;
       statusEl.textContent = "";
-      streaming = false; $("#send").disabled = false; input.focus();
+      streaming = false; $("#send").style.display = ""; $("#stop-btn").style.display = "none"; $("#send").disabled = false; input.focus();
       return;
     }
     const d = await r.json();
@@ -605,11 +791,12 @@ async function fallbackPost(text, turn, bubble, statusEl) {
     bubble.innerHTML = `<p style="color:#e57373"><em>Network error: ${escapeHtml(e.message)}</em></p>`;
     statusEl.textContent = "";
   }
-  streaming = false; $("#send").disabled = false; input.focus();
+  streaming = false; $("#send").style.display = ""; $("#stop-btn").style.display = "none"; $("#send").disabled = false; input.focus();
 }
 
 // ---- wiring ----
 $("#send").onclick = sendMessage;
+$("#stop-btn").onclick = stopGeneration;
 $("#newchat").onclick = newChat;
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }

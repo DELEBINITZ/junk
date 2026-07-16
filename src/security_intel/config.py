@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     reranker_enabled: bool = True
     reranker_top_n: int = 0  # 0 = use top_k from search, >0 = override final count
     reranker_overfetch_multiplier: int = 3  # fetch N*top_k from Qdrant, rerank, take top_k
+    reranker_score_threshold: float = 0.0  # drop reranked passages below this relevance (0 = keep all)
 
     # Query enrichment
     query_enrichment_enabled: bool = True  # adaptive multi-query, HyDE, step-back
@@ -49,6 +50,9 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     qdrant_collection: str = "reports_kb"
+    # Product user-guide / documentation corpus (separate collection so doc how-to
+    # pages never pollute threat-report retrieval). Ingested by scripts/index_user_guide.py.
+    user_guide_collection: str = "user_guide_kb"
 
     # Postgres (checkpointing + sessions)
     database_url: str = "postgresql://asi:asi@localhost:5432/asi"

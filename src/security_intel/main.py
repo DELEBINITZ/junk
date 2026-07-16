@@ -19,23 +19,47 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from security_intel.agents.easm.tools import get_easm_tools
+from security_intel.agents.orchestrator import build_orchestrator
+from security_intel.agents.registry import AgentRegistry, AgentSpec
+from security_intel.agents.reports.tools import get_reports_tools
+from security_intel.agents.userguide.tools import get_user_guide_tools
+from security_intel.api.routes import router
 from security_intel.config import Settings
-from security_intel.llm.provider import LaneRouter
-from security_intel.db.postgres import Database
 from security_intel.db.migrations import run_migrations
+from security_intel.db.postgres import Database
+from security_intel.llm.provider import LaneRouter
 from security_intel.memory.checkpointer import get_checkpointer
 from security_intel.memory.conversations import ConversationStore
 from security_intel.memory.summarizer import RollingSummarizer
-from security_intel.agents.registry import AgentRegistry, AgentSpec
-from security_intel.agents.orchestrator import build_orchestrator
-from security_intel.tools.mcp_loader import load_mcp_tools_for_agent
-from security_intel.agents.reports.tools import get_reports_tools
-from security_intel.agents.easm.tools import get_easm_tools
-from security_intel.tools.query_enrichment import QueryEnricher
-from security_intel.observability.logging import setup_logging, get_logger
+from security_intel.observability.logging import get_logger, setup_logging
 from security_intel.observability.middleware import TracingMiddleware
 from security_intel.observability.tracing import get_langfuse_handler
-from security_intel.api.routes import router
+from security_intel.prompts.easm import EASM_SYSTEM_PROMPT
+from security_intel.prompts.reports import REPORTS_SYSTEM_PROMPT
+from security_intel.prompts.userguide import USER_GUIDE_SYSTEM_PROMPT
+from security_intel.tools.query_enrichment import QueryEnricher
+
+
+async def _user_guide_corpus_ready(settings: Settings) -> bool:
+    """True when the user-guide collection exists and holds at least one point.
+
+    Gates registration of the User Guide agent so it is never exposed against an
+    empty/absent corpus (which would let the planner route to a dead end). Any
+    connection/error is treated as "not ready" — fail closed, log, skip the agent.
+    """
+    from security_intel.tools.qdrant_search import _get_qdrant_client
+
+    try:
+        qdrant = _get_qdrant_client(settings)
+        collection = settings.user_guide_collection
+        if not await qdrant.collection_exists(collection):
+            return False
+        info = await qdrant.get_collection(collection)
+        return (info.points_count or 0) > 0
+    except Exception as e:
+        get_logger("registry").warning(f"User-guide corpus check failed: {e}")
+        return False
 
 
 async def _register_agents(registry: AgentRegistry, settings: Settings, lane_router=None) -> None:
@@ -46,6 +70,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
     2. Register with AgentSpec here
     3. Done — planner auto-discovers it, orchestrator auto-routes to it.
     """
+    logger = get_logger("registry")
 
     # Query enricher for RAG optimization (uses fast LLM for expansion)
     enricher = None
@@ -64,54 +89,77 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
                 "Filter by threat type, TLP level, report type",
                 "Get report metadata and details",
             ],
-            system_prompt=(
-                "You are a friendly Security Reports specialist — think of yourself as a helpful "
-                "colleague who knows the report library inside out.\n\n"
-                "How to work:\n"
-                "- Use search_reports for semantic search, search_reports_by_filter for metadata queries, "
-                "get_report_metadata for specific reports\n"
-                "- Always cite sources with report titles so the user can find them\n"
-                "- If searches come up empty, say so honestly and suggest alternative search terms "
-                "or angles they could try\n"
-                "- Present findings clearly — lead with the most relevant/critical items\n"
-                "- Keep a warm, professional tone throughout\n"
-                "- If you find something concerning, flag it clearly but calmly"
-            ),
+            system_prompt=REPORTS_SYSTEM_PROMPT,
             tools=reports_tools,
+            # tool_call: single-pass semantic search, no ReAct loop (cheaper/faster).
+            # TRADEOFF: this narrows the reports agent to search_reports at runtime —
+            # the by-ID (get_report_content) and filter (search_reports_by_filter)
+            # paths are NOT exercised in tool_call mode. If "summarize report <id>" or
+            # "show all TLP:RED reports" style queries matter, set mode="react" here.
+            mode="tool_call",
+            primary_tool="search_reports",
         )
     )
 
-    # EASM Agent
-    easm_tools = await get_easm_tools(settings)
-    registry.register(
-        AgentSpec(
-            id="easm",
-            display_name="EASM Agent",
-            description="Queries external attack surface (assets, exposures, changes, rescans). "
-            "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
-            capabilities=[
-                "Query external-facing assets (domains, IPs, services)",
-                "Get current exposures and security findings",
-                "Track attack surface changes over time",
-                "Trigger asset rescans (requires approval)",
-            ],
-            system_prompt=(
-                "You are a friendly External Attack Surface Management specialist — the go-to "
-                "colleague for anything about the organization's internet-facing infrastructure.\n\n"
-                "How to work:\n"
-                "- Use query_assets to find assets, get_exposures for vulnerabilities, "
-                "get_asset_changes for recent changes\n"
-                "- trigger_rescan requires human approval — explain what it does before requesting\n"
-                "- Be precise about severity and asset details — specifics help teams act\n"
-                "- Present findings in order of severity/risk\n"
-                "- If you spot something critical, highlight it clearly but calmly\n"
-                "- Suggest logical next steps when appropriate (e.g., 'You might also want to check...')\n"
-                "- Keep a warm, professional tone — security can be stressful, be the calm expert"
-            ),
-            tools=easm_tools,
-            side_effecting_tools={"trigger_rescan"},
+    # User Guide Agent — answers product how-to / dashboard-walkthrough / navigation
+    # questions from the FortiRecon documentation corpus (Qdrant: user_guide_collection).
+    # Registered only when that collection has been ingested (services/userguide-ingest),
+    # so we never route users to an empty docs corpus.
+    if await _user_guide_corpus_ready(settings):
+        user_guide_tools = get_user_guide_tools(settings, enricher=enricher)
+        registry.register(
+            AgentSpec(
+                id="userguide",
+                display_name="FortiRecon User Guide Agent",
+                description=(
+                    "Answers product how-to, navigation, and dashboard-walkthrough questions "
+                    "from the FortiRecon user guide. Use for 'how do I…', 'where do I find…', "
+                    "'walk me through…', feature explanations, and configuration steps about "
+                    "using the FortiRecon platform itself (NOT threat-report content)."
+                ),
+                capabilities=[
+                    "Explain FortiRecon dashboards, menus, and features",
+                    "Give step-by-step how-to and configuration instructions",
+                    "Walk through navigation and where to find things in the product",
+                ],
+                system_prompt=USER_GUIDE_SYSTEM_PROMPT,
+                tools=user_guide_tools,
+                # tool_call: single-pass doc search, no ReAct loop. Clean fit — the
+                # agent's job is "run one user-guide search and return".
+                mode="tool_call",
+                primary_tool="search_user_guide",
+            )
         )
-    )
+    else:
+        logger.warning(
+            "User Guide agent not registered — collection "
+            f"'{settings.user_guide_collection}' is empty or unavailable. "
+            "Run the services/userguide-ingest service to ingest the FortiRecon user guide."
+        )
+
+    # EASM Agent — only registered when a real MCP server provides tools.
+    # No stubs: without tools the agent is omitted rather than serving fake data.
+    easm_tools = await get_easm_tools(settings)
+    if not easm_tools:
+        logger.warning("EASM agent not registered — no MCP tools available.")
+    else:
+        registry.register(
+            AgentSpec(
+                id="easm",
+                display_name="EASM Agent",
+                description="Queries external attack surface (assets, exposures, changes, rescans). "
+                "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
+                capabilities=[
+                    "Query external-facing assets (domains, IPs, services)",
+                    "Get current exposures and security findings",
+                    "Track attack surface changes over time",
+                    "Trigger asset rescans (requires approval)",
+                ],
+                system_prompt=EASM_SYSTEM_PROMPT,
+                tools=easm_tools,
+                side_effecting_tools={"trigger_rescan"},
+            )
+        )
 
     # --- ADD NEW AGENTS HERE ---
     # Example: Brand Protection Agent

@@ -9,8 +9,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from security_intel.memory.conversations import ConversationStore, ChatMessage, ChatSession
 
-HISTORY_WINDOW = 20
-SUMMARIZE_THRESHOLD = 10
+# Summary-buffer tuning (1 turn = 1 user + 1 assistant message = 2 messages).
+# Keep the last KEEP_RECENT_MESSAGES verbatim after a fold; only fold once the
+# unsummarized tail reaches SUMMARIZE_TRIGGER (batches summary updates so we don't
+# summarize every turn). The watermark stays contiguous with the verbatim window
+# loaded for context, so there is never a gap and never a stale-summary-only case.
+KEEP_RECENT_MESSAGES = 4   # ~2 turns kept verbatim after summarizing
+SUMMARIZE_TRIGGER = 6      # fold once the tail reaches ~3 turns (folds ~2 msgs at a time)
 
 SUMMARIZE_PROMPT = """You are a conversation summarizer for a security intelligence platform.
 
@@ -38,8 +43,18 @@ class RollingSummarizer:
         self._llm = fast_llm
 
     async def maybe_summarize(self, org_id: str, session: ChatSession) -> None:
-        """Summarize if enough messages have fallen out of the live window."""
-        target = session.message_count - HISTORY_WINDOW
+        """Fold older turns into the rolling summary once the tail grows large.
+
+        Only runs when the unsummarized tail reaches SUMMARIZE_TRIGGER, then folds
+        everything except the last KEEP_RECENT_MESSAGES — leaving the watermark
+        exactly where the context loader resumes verbatim (contiguous, no gap).
+        Intended to be called in the background so it never delays a response.
+        """
+        unsummarized = session.message_count - session.summarized_upto
+        if unsummarized < SUMMARIZE_TRIGGER:
+            return
+
+        target = session.message_count - KEEP_RECENT_MESSAGES
         if target <= session.summarized_upto:
             return
 
