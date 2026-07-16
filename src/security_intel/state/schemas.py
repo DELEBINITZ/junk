@@ -43,6 +43,9 @@ class OrchestratorState(TypedDict):
     citations: list[dict]
     blocked: bool
     block_reason: str
+    # Reflection loop: how many times we've re-planned after unproductive results.
+    # Capped at 1 to bound latency (see orchestrator after_dispatch).
+    retry_count: int
 
 
 class SubAgentState(TypedDict):

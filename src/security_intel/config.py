@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     qdrant_collection: str = "reports_kb"
+    # Product user-guide / documentation corpus (separate collection so doc how-to
+    # pages never pollute threat-report retrieval). Ingested by scripts/index_user_guide.py.
+    user_guide_collection: str = "user_guide_kb"
 
     # Postgres (checkpointing + sessions)
     database_url: str = "postgresql://asi:asi@localhost:5432/asi"

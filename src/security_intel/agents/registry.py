@@ -9,12 +9,12 @@ No changes to planner prompts or orchestrator routing needed.
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable
+from typing import Awaitable, Callable
 
-from langchain_openai import ChatOpenAI
 from langchain_core.tools import BaseTool, tool
-from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.prebuilt import create_react_agent
 
 from security_intel.config import Settings
 from security_intel.observability.logging import get_logger
@@ -25,7 +25,15 @@ logger = get_logger("registry")
 
 @dataclass
 class AgentSpec:
-    """Specification for a specialist agent."""
+    """Specification for a specialist agent.
+
+    ``mode`` controls execution:
+    - "react": full create_react_agent tool-reasoning loop. Use when the agent
+      genuinely chains/chooses tools or does multi-step work (e.g. EASM).
+    - "tool_call": a single deterministic call to ``primary_tool`` (no LLM loop).
+      Use for pure-retrieval agents whose job is "run one search and return" —
+      cuts an entire LLM round-trip and its failure modes per query.
+    """
 
     id: str
     display_name: str
@@ -35,6 +43,9 @@ class AgentSpec:
     tools: list[BaseTool] = field(default_factory=list)
     side_effecting_tools: set[str] = field(default_factory=set)
     min_role: str = "viewer"
+    mode: str = "react"  # "react" | "tool_call"
+    primary_tool: str = ""  # required for mode="tool_call": the tool to invoke
+    primary_tool_arg: str = "query"  # the kwarg the task string is passed as
 
 
 class AgentRegistry:
@@ -42,18 +53,35 @@ class AgentRegistry:
 
     def __init__(self):
         self._specs: dict[str, AgentSpec] = {}
-        self._agents: dict[str, CompiledStateGraph] = {}
+        self._agents: dict[str, CompiledStateGraph] = {}  # mode="react" ReAct graphs
+        self._tool_agents: dict[str, BaseTool] = {}  # mode="tool_call" primary tools
 
     def register(self, spec: AgentSpec) -> None:
         """Register an agent specification."""
         self._specs[spec.id] = spec
-        logger.info(f"Registered agent: {spec.id} ({spec.display_name})")
+        logger.info(f"Registered agent: {spec.id} ({spec.display_name}, mode={spec.mode})")
 
     def build_agents(self, llm: ChatOpenAI) -> dict[str, CompiledStateGraph]:
-        """Build all registered agents as LangGraph ReAct agents."""
+        """Build all registered agents according to their execution mode.
+
+        mode="tool_call" agents are wired to their primary tool (no ReAct graph);
+        mode="react" agents are compiled as create_react_agent loops.
+        """
         for agent_id, spec in self._specs.items():
             if not spec.tools:
                 logger.warning(f"Agent '{agent_id}' has no tools, skipping build")
+                continue
+
+            if spec.mode == "tool_call":
+                tool = next((t for t in spec.tools if t.name == spec.primary_tool), None)
+                if tool is None:
+                    logger.error(
+                        f"Agent '{agent_id}' mode=tool_call but primary_tool "
+                        f"'{spec.primary_tool}' not found in its tools; skipping build"
+                    )
+                    continue
+                self._tool_agents[agent_id] = tool
+                logger.info(f"Built agent: {agent_id} (tool_call → {tool.name})")
                 continue
 
             agent = create_react_agent(
@@ -62,13 +90,25 @@ class AgentRegistry:
                 prompt=spec.system_prompt,
             )
             self._agents[agent_id] = agent
-            logger.info(f"Built agent: {agent_id} ({len(spec.tools)} tools)")
+            logger.info(f"Built agent: {agent_id} (react, {len(spec.tools)} tools)")
 
         return self._agents
 
+    def _is_built(self, agent_id: str) -> bool:
+        return agent_id in self._agents or agent_id in self._tool_agents
+
     def get_agent(self, agent_id: str) -> CompiledStateGraph | None:
-        """Get a built agent by ID."""
+        """Get a built ReAct agent by ID (mode=react only)."""
         return self._agents.get(agent_id)
+
+    def get_tool_agent(self, agent_id: str) -> BaseTool | None:
+        """Get a tool_call agent's primary tool by ID (mode=tool_call only)."""
+        return self._tool_agents.get(agent_id)
+
+    def get_mode(self, agent_id: str) -> str:
+        """Execution mode of a built agent ('react' | 'tool_call')."""
+        spec = self._specs.get(agent_id)
+        return spec.mode if spec else "react"
 
     def get_spec(self, agent_id: str) -> AgentSpec | None:
         """Get agent specification by ID."""
@@ -76,7 +116,8 @@ class AgentRegistry:
 
     @property
     def agent_ids(self) -> list[str]:
-        return list(self._agents.keys())
+        # Union of both execution modes, in registration order.
+        return [aid for aid in self._specs if self._is_built(aid)]
 
     @property
     def specs(self) -> dict[str, AgentSpec]:
@@ -91,7 +132,7 @@ class AgentRegistry:
         planner_tools = []
 
         for agent_id, spec in self._specs.items():
-            if agent_id not in self._agents:
+            if not self._is_built(agent_id):
                 continue
 
             # Create a describe tool for this agent
@@ -99,23 +140,31 @@ class AgentRegistry:
             planner_tools.append(desc_tool)
 
         # The plan creation tool
-        planner_tools.append(_make_plan_tool(list(self._agents.keys())))
+        planner_tools.append(_make_plan_tool(self.agent_ids))
         return planner_tools
+
+    def build_agent_catalog(self) -> str:
+        """Rich, single source of truth for agent routing context.
+
+        Full description + top capabilities per built agent. Used by BOTH the
+        router (classify) and the planner so routing decisions are never made on
+        truncated agent info. Regenerate whenever the built-agent set changes.
+        """
+        lines = []
+        for agent_id, spec in self._specs.items():
+            if not self._is_built(agent_id):
+                continue
+            caps = "; ".join(spec.capabilities[:4])
+            desc = " ".join((spec.description or "").split())  # collapse whitespace
+            line = f"- {agent_id}: {desc}"
+            if caps:
+                line += f" Capabilities: {caps}"
+            lines.append(line)
+        return "\n".join(lines)
 
     def build_planner_system_prompt(self) -> str:
         """Auto-generate planner system prompt from registered agents."""
-        agent_descriptions = []
-        for agent_id, spec in self._specs.items():
-            if agent_id not in self._agents:
-                continue
-            capabilities = ", ".join(spec.capabilities[:3])
-            agent_descriptions.append(
-                f"- {agent_id}: {spec.description} Capabilities: {capabilities}"
-            )
-
-        agents_block = "\n".join(agent_descriptions)
-
-        return PLANNER_SYSTEM_TEMPLATE.format(agents_block=agents_block)
+        return PLANNER_SYSTEM_TEMPLATE.format(agents_block=self.build_agent_catalog())
 
 
 def _make_describe_tool(agent_id: str, spec: AgentSpec) -> BaseTool:

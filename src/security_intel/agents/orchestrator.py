@@ -14,29 +14,48 @@ Key design decisions:
 import asyncio
 import json
 from datetime import datetime, timezone
+from typing import Literal
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import StateGraph, END, START
-from langgraph.graph.state import CompiledStateGraph
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from pydantic import BaseModel, Field
 
-from security_intel.state.schemas import OrchestratorState, AgentResult, ExecutionPlan, PlanStep
-from security_intel.llm.provider import LaneRouter
-from security_intel.memory.conversations import ConversationStore, ChatSession
-from security_intel.memory.summarizer import RollingSummarizer
 from security_intel.agents.registry import AgentRegistry
+from security_intel.llm.provider import LaneRouter
+from security_intel.memory.conversations import ChatSession, ConversationStore
+from security_intel.memory.summarizer import RollingSummarizer
 from security_intel.observability.logging import get_logger, set_trace_context
 from security_intel.prompts.orchestrator import (
+    CHITCHAT_PROMPT,
     ORCHESTRATOR_PERSONA,
     ROUTER_PROMPT,
-    CHITCHAT_PROMPT,
-    SYNTHESIS_PROMPT,
     SYNTH_FALLBACK_MSG,
+    SYNTHESIS_PROMPT,
 )
+from security_intel.state.schemas import AgentResult, ExecutionPlan, OrchestratorState, PlanStep
 
 logger = get_logger("orchestrator")
+
+
+class RouterDecision(BaseModel):
+    """Structured routing decision — enforced via the model's function-calling so
+    the router can't emit malformed JSON. Falls back to text parsing if the model
+    backend doesn't support structured output (see _route_query)."""
+
+    action: Literal["DIRECT", "SIMPLE", "COMPLEX", "REFUSE"] = Field(
+        description="DIRECT=answer without agents; SIMPLE=one agent; COMPLEX=planner; REFUSE=out of scope"
+    )
+    agent: str = Field(default="", description="For SIMPLE: the agent id to invoke")
+    task: str = Field(default="", description="For SIMPLE: a self-contained task for that agent")
+    response: str = Field(default="", description="For DIRECT/REFUSE: the brief reply text")
+    confidence: float = Field(
+        default=0.8, ge=0.0, le=1.0, description="Confidence in this routing decision (0-1)"
+    )
+
 
 # Timeouts (seconds)
 PLANNER_TIMEOUT = 30
@@ -88,12 +107,47 @@ def build_orchestrator(
     planner_tools = registry.build_planner_tools()
     planner_prompt = registry.build_planner_system_prompt()
 
+    # Rich agent catalog (full description + capabilities) — shared by the router
+    # and planner so routing is never decided on truncated agent info.
+    agent_catalog = registry.build_agent_catalog()
+
+    # Structured-output router: guarantees a schema-valid decision on backends that
+    # support function calling. Built once; _route_query falls back to text parsing
+    # if the backend rejects structured output.
+    try:
+        structured_router = lane_router.fast.with_structured_output(RouterDecision)
+    except Exception as e:  # noqa: BLE001 — backend without structured-output support
+        logger.warning(f"Structured router unavailable ({e}); using text-parse router")
+        structured_router = None
+
     from langgraph.prebuilt import create_react_agent
     planner = create_react_agent(
         model=lane_router.fast,
         tools=planner_tools,
         prompt=planner_prompt,
     )
+
+    async def _route_query(prompt_text: str) -> dict:
+        """Get a routing decision as a dict. Tries structured output first (schema-
+        guaranteed), falls back to the resilient text parser. Never raises."""
+        if structured_router is not None:
+            try:
+                decision = await asyncio.wait_for(
+                    structured_router.ainvoke([HumanMessage(content=prompt_text)]),
+                    timeout=CLASSIFY_TIMEOUT,
+                )
+                if isinstance(decision, RouterDecision):
+                    return decision.model_dump()
+                if isinstance(decision, dict):  # some backends return the raw dict
+                    return decision
+            except Exception as e:  # noqa: BLE001 — degrade to text parsing
+                logger.warning(f"Structured router failed ({e}); falling back to text parse")
+
+        response = await asyncio.wait_for(
+            lane_router.fast.ainvoke([HumanMessage(content=prompt_text)]),
+            timeout=CLASSIFY_TIMEOUT,
+        )
+        return _parse_router_response(response.content)
 
     # -------------------------------------------------------------------------
     # Graph Nodes
@@ -181,33 +235,24 @@ def build_orchestrator(
         """
         question = state["user_query"]
         context = _summarize_context(state.get("history", []), state.get("summary", ""))
-        agents_str = ", ".join(
-            f"{aid} ({registry.get_spec(aid).description[:60]})"
-            for aid in registry.agent_ids
-        )
 
         try:
-            response = await asyncio.wait_for(
-                lane_router.fast.ainvoke([
-                    HumanMessage(content=ROUTER_PROMPT.format(
-                        question=question,
-                        context=context or "(new conversation)",
-                        agents=agents_str,
-                    ))
-                ]),
-                timeout=CLASSIFY_TIMEOUT,
-            )
-            parsed = _parse_router_response(response.content)
+            parsed = await _route_query(ROUTER_PROMPT.format(
+                question=question,
+                context=context or "(new conversation)",
+                agents=agent_catalog,
+            ))
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning(f"Router failed ({e}), defaulting to SIMPLE")
             parsed = {"action": "SIMPLE"}
 
         action = parsed.get("action", "SIMPLE").upper()
+        confidence = float(parsed.get("confidence", 0.8) or 0.8)
 
         if action in ("DIRECT", "REFUSE"):
             # REFUSE = out-of-scope (code generation, general knowledge, off-topic).
             # Routed through chitchat, which regenerates a firm, on-brand refusal.
-            logger.info(f"Query routed: {action} (no agents needed)")
+            logger.info(f"Query routed: {action} (no agents needed, conf={confidence:.2f})")
             return {
                 "is_complex": False,
                 "is_chitchat": True,
@@ -217,7 +262,9 @@ def build_orchestrator(
         if action == "SIMPLE" and parsed.get("agent") and parsed.get("task"):
             agent_id = parsed["agent"]
             if agent_id in registry.agent_ids:
-                logger.info(f"Query routed: SIMPLE → {agent_id} (planner bypassed)")
+                logger.info(
+                    f"Query routed: SIMPLE → {agent_id} (planner bypassed, conf={confidence:.2f})"
+                )
                 plan = ExecutionPlan(
                     steps=[PlanStep(agent=agent_id, task=parsed["task"], depends_on=[])],
                     synthesis_goal="Return findings directly.",
@@ -227,7 +274,7 @@ def build_orchestrator(
                 logger.warning(f"Router picked unknown agent '{agent_id}', falling through to planner")
 
         is_complex = action == "COMPLEX"
-        logger.info(f"Query routed: {action} → planner")
+        logger.info(f"Query routed: {action} → planner (conf={confidence:.2f})")
         return {"is_complex": is_complex, "is_chitchat": False}
 
     async def plan_node(state: OrchestratorState, config: RunnableConfig) -> dict:
@@ -319,6 +366,18 @@ def build_orchestrator(
                     if prior_context:
                         task_content += "\n\nContext from prior analysis:\n" + "\n---\n".join(prior_context)
 
+                # tool_call agents: a single deterministic search — no ReAct loop, no
+                # orchestrator-side enrichment (the search tool runs its own query
+                # expansion). Pass the raw task as the query for cleaner retrieval.
+                if registry.get_mode(step["agent"]) == "tool_call":
+                    tool = registry.get_tool_agent(step["agent"])
+                    if not tool:
+                        tasks.append(_make_error_result(step["agent"], f"Agent '{step['agent']}' not available"))
+                        continue
+                    arg = registry.get_spec(step["agent"]).primary_tool_arg
+                    tasks.append(_invoke_tool_agent(tool, step["task"], config, step["agent"], arg))
+                    continue
+
                 if query_enricher and state.get("is_complex"):
                     task_content = await _enrich_agent_task(query_enricher, task_content)
 
@@ -347,6 +406,25 @@ def build_orchestrator(
                 completed[idx] = agent_result["findings"]
 
         return {"agent_results": results}
+
+    def after_dispatch(state: OrchestratorState) -> str:
+        """Reflection gate: if NO agent returned productive content, escalate to the
+        planner once (a mis-routed SIMPLE query gets a second, fuller decision).
+
+        Bounded to a single re-plan (retry_count) so latency is capped. Only fires
+        when more than one agent exists (else there's nowhere better to route).
+        """
+        results = state.get("agent_results", [])
+        productive = [r for r in results if not _is_unproductive(r["findings"])]
+        if not productive and state.get("retry_count", 0) < 1 and len(registry.agent_ids) > 1:
+            return "replan"
+        return "synthesize"
+
+    async def replan_node(state: OrchestratorState, config: RunnableConfig) -> dict:
+        """Escalate an unproductive turn to the planner for a fuller re-route."""
+        logger.info("No productive agent results — escalating to planner (re-plan)")
+        # is_complex=True routes the retry through the full planner; retry_count caps it.
+        return {"retry_count": state.get("retry_count", 0) + 1, "is_complex": True, "plan": None}
 
     async def synthesize_node(state: OrchestratorState, config: RunnableConfig) -> dict:
         """Synthesize findings with conversational persona."""
@@ -545,6 +623,7 @@ def build_orchestrator(
     graph.add_node("plan", plan_node)
     graph.add_node("validate_plan", validate_plan_node)
     graph.add_node("dispatch", dispatch_node)
+    graph.add_node("replan", replan_node)
     graph.add_node("synthesize", synthesize_node)
     graph.add_node("output_guardrail", output_guardrail_node)
     graph.add_node("persist", persist_node)
@@ -569,7 +648,14 @@ def build_orchestrator(
     graph.add_edge("chitchat", "output_guardrail")
     graph.add_edge("plan", "validate_plan")
     graph.add_edge("validate_plan", "dispatch")
-    graph.add_edge("dispatch", "synthesize")
+    # Reflection gate: unproductive results escalate to the planner ONCE (re-route a
+    # mis-picked SIMPLE query), else proceed to synthesis. retry_count bounds the loop.
+    graph.add_conditional_edges(
+        "dispatch",
+        after_dispatch,
+        {"replan": "replan", "synthesize": "synthesize"},
+    )
+    graph.add_edge("replan", "plan")
     graph.add_edge("synthesize", "output_guardrail")
     graph.add_edge("output_guardrail", "persist")
     graph.add_edge("persist", END)
@@ -646,11 +732,66 @@ async def _invoke_agent(
     )
 
 
+async def _invoke_tool_agent(
+    tool,
+    task: str,
+    config: RunnableConfig,
+    agent_id: str,
+    arg: str = "query",
+) -> AgentResult:
+    """Invoke a tool_call agent — a single direct call to its primary tool, no ReAct
+    loop. Cuts an LLM round-trip for pure-retrieval agents. Timeout + error-wrapped
+    exactly like _invoke_agent so downstream reflection/synthesis treat both uniformly.
+    """
+    agent_config = RunnableConfig(configurable=config["configurable"])
+    try:
+        findings = await asyncio.wait_for(
+            tool.ainvoke({arg: task}, config=agent_config),
+            timeout=SUB_AGENT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return AgentResult(
+            agent_id=agent_id,
+            findings=f"Agent '{agent_id}' timed out after {SUB_AGENT_TIMEOUT}s. The query may be too broad.",
+            citations=[],
+            tool_calls=[],
+        )
+    except Exception as e:
+        logger.error(f"Tool-call agent '{agent_id}' failed: {e}", exc_info=True)
+        return AgentResult(
+            agent_id=agent_id,
+            findings=f"Agent '{agent_id}' failed: {type(e).__name__}: {e}",
+            citations=[],
+            tool_calls=[],
+        )
+
+    return AgentResult(
+        agent_id=agent_id,
+        findings=findings if isinstance(findings, str) else str(findings),
+        citations=[],
+        tool_calls=[{"name": getattr(tool, "name", "tool"), "args": {arg: task}}],
+    )
+
+
 _ERROR_FINDING_MARKERS = (
     "Agent failed",
+    "' failed",  # "Agent '<id>' failed…" (retry-exhausted / tool_call failure)
+    "' timed out",  # "Agent '<id>' timed out…"
     "timed out after",
     "not available",
     "All connection attempts failed",
+)
+
+# "No results" style content from the retrieval tools — real (non-error) responses,
+# but unproductive, so the reflection gate can escalate them to a fuller re-route.
+_EMPTY_FINDING_MARKERS = (
+    "No relevant reports found",
+    "No reports found",
+    "No reports published in the last",
+    "No report found with ID",
+    "couldn't find anything",
+    "No user-guide page found",
+    "No results found",
 )
 
 
@@ -663,6 +804,15 @@ def _is_error_finding(findings: str) -> bool:
         return True
     head = findings[:200]
     return any(m in head for m in _ERROR_FINDING_MARKERS)
+
+
+def _is_unproductive(findings: str) -> bool:
+    """True if a result is an error OR an empty/'no results' response — i.e. carries
+    no usable content. Drives the reflection gate's re-plan decision."""
+    if _is_error_finding(findings):
+        return True
+    head = (findings or "")[:200]
+    return any(m in head for m in _EMPTY_FINDING_MARKERS)
 
 
 async def _make_error_result(agent_id: str, error_msg: str) -> AgentResult:

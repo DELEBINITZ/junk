@@ -24,6 +24,9 @@ data/
 *.db
 .qdrant/
 storage/
+# Downloaded third-party documentation (source for services/userguide-ingest).
+# Copyrighted (Fortinet) + large — keep out of the repo; ingest from a local path.
+pages/
 
 # OS / editor
 .DS_Store
