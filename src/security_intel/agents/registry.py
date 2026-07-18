@@ -39,7 +39,9 @@ class AgentSpec:
     display_name: str
     description: str
     capabilities: list[str]
-    system_prompt: str
+    # Optional — react agents auto-registered from config (e.g. MCP servers) leave this
+    # blank and get a generated prompt (see prompts/agent.render_agent_system_prompt).
+    system_prompt: str = ""
     tools: list[BaseTool] = field(default_factory=list)
     side_effecting_tools: set[str] = field(default_factory=set)
     min_role: str = "viewer"
@@ -84,10 +86,18 @@ class AgentRegistry:
                 logger.info(f"Built agent: {agent_id} (tool_call → {tool.name})")
                 continue
 
+            # Auto-generate a prompt for agents registered without one (e.g. MCP agents).
+            prompt = spec.system_prompt
+            if not prompt:
+                from security_intel.prompts.agent import render_agent_system_prompt
+                prompt = render_agent_system_prompt(
+                    spec.display_name, spec.description, spec.capabilities
+                )
+
             agent = create_react_agent(
                 model=llm,
                 tools=spec.tools,
-                prompt=spec.system_prompt,
+                prompt=prompt,
             )
             self._agents[agent_id] = agent
             logger.info(f"Built agent: {agent_id} (react, {len(spec.tools)} tools)")

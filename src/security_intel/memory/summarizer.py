@@ -17,11 +17,11 @@ from security_intel.memory.conversations import ConversationStore, ChatMessage, 
 KEEP_RECENT_MESSAGES = 4   # ~2 turns kept verbatim after summarizing
 SUMMARIZE_TRIGGER = 6      # fold once the tail reaches ~3 turns (folds ~2 msgs at a time)
 
-SUMMARIZE_PROMPT = """You are a conversation summarizer for a security intelligence platform.
+SUMMARIZE_PROMPT = """You are a conversation summarizer for an AI assistant.
 
 Given the previous summary and new conversation turns, produce an updated summary that:
 1. Preserves key facts, decisions, and findings mentioned
-2. Keeps entity names (assets, CVEs, IPs, domains) intact
+2. Keeps specific entity names (IDs, feature/page names, terms, assets) intact
 3. Notes what questions were asked and answered
 4. Stays under 500 words
 5. Is written in third person ("The user asked about...")

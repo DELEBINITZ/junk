@@ -42,15 +42,20 @@ class QueryEnricher:
     3. Returning multiple query variants for fan-out search
     """
 
-    def __init__(self, llm: ChatOpenAI):
+    def __init__(self, llm: ChatOpenAI, domain: str = "knowledge base"):
         self._llm = llm
+        # Human-readable label of the corpus this enricher expands for (e.g.
+        # "security reports corpus", "product user guide"). Keeps generated query
+        # variants / hypothetical passages on-domain instead of assuming security.
+        self._domain = domain or "knowledge base"
 
     async def classify_strategy(self, query: str) -> RetrievalStrategy:
         """Classify which retrieval strategy fits this query."""
         try:
             response = await asyncio.wait_for(
                 self._llm.ainvoke([
-                    HumanMessage(content=STRATEGY_CLASSIFIER_PROMPT.format(query=query))
+                    HumanMessage(content=STRATEGY_CLASSIFIER_PROMPT.format(
+                        query=query, domain=self._domain))
                 ]),
                 timeout=5,
             )
@@ -112,7 +117,8 @@ class QueryEnricher:
         try:
             response = await asyncio.wait_for(
                 self._llm.ainvoke([
-                    HumanMessage(content=MULTI_QUERY_PROMPT.format(query=query, n=n))
+                    HumanMessage(content=MULTI_QUERY_PROMPT.format(
+                        query=query, n=n, domain=self._domain))
                 ]),
                 timeout=8,
             )
@@ -128,7 +134,7 @@ class QueryEnricher:
         try:
             response = await asyncio.wait_for(
                 self._llm.ainvoke([
-                    HumanMessage(content=HYDE_PROMPT.format(query=query))
+                    HumanMessage(content=HYDE_PROMPT.format(query=query, domain=self._domain))
                 ]),
                 timeout=8,
             )
@@ -142,7 +148,7 @@ class QueryEnricher:
         try:
             response = await asyncio.wait_for(
                 self._llm.ainvoke([
-                    HumanMessage(content=STEP_BACK_PROMPT.format(query=query))
+                    HumanMessage(content=STEP_BACK_PROMPT.format(query=query, domain=self._domain))
                 ]),
                 timeout=5,
             )

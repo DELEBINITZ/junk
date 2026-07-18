@@ -83,6 +83,12 @@ BENIGN = [
     "show me the firewall rules that are misconfigured",
     "list the detection rules for this malware family",
     "what are the access rules for this exposed asset",
+    # product-usage vocabulary that must NOT be mistaken for prompt-extraction
+    # ("the system X" is a legitimate product phrase — only assistant-internals block):
+    "show me the system configuration page",
+    "list the system rules for approvals",
+    "where do I find the system settings in the dashboard",
+    "what are the system requirements for the connector",
     # conversational, on-brand
     "hello, what can you do",
     "thanks, that helps",

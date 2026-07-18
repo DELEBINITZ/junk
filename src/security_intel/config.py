@@ -11,6 +11,26 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Assistant identity (personality is otherwise DERIVED from the enabled agents).
+    # Leave blank to auto-derive a name/tagline from whichever agents are active —
+    # so a userguide-only deployment presents as a product guide, a reports+easm
+    # deployment as a security analyst, with no code change.
+    assistant_name: str = "Atlas"  # blank = auto-derive from enabled agents
+    # Atlas is THE agent; its capabilities (product guide today, more later) come from
+    # the enabled sub-agents. Keep the tagline capability-agnostic so it stays right as
+    # capabilities grow. Blank = auto-derive.
+    assistant_tagline: str = "your friendly FortiRecon assistant"
+
+    # Capability gating — which agents are active. Comma-separated allowlist of agent
+    # ids (e.g. "userguide" or "reports,userguide"). BLANK = every agent that is
+    # otherwise available (corpus ingested / MCP reachable). The whole system
+    # personality reshapes to match the enabled set.
+    #
+    # SHIP CONFIG (current): ship the user-guide agent ONLY, presented as "Atlas".
+    # To bring the security agents online later, widen this (e.g. "reports,userguide,easm")
+    # or set ENABLED_AGENTS="" in the environment to enable everything available.
+    enabled_agents: str = "userguide"
+
     # Auth
     api_keys: str = "dev-api-key-change-me"
     jwt_secret: str = "dev-insecure-change-me-please-32byte-minimum-secret"
@@ -23,7 +43,9 @@ class Settings(BaseSettings):
     llm_fast_model: str = "Qwen/Qwen2.5-7B-Instruct"
     llm_deep_model: str = "deepseek-ai/DeepSeek-V3"
     llm_temperature: float = 0.1
-    llm_max_tokens: int = 2048
+    # Output budget. Kept generous so multi-step how-to walkthroughs (which now draw on
+    # full user-guide pages) are not truncated mid-answer by the synthesizer/agent.
+    llm_max_tokens: int = 4096
 
     # Chat context
     history_window_messages: int = 20
@@ -60,6 +82,7 @@ class Settings(BaseSettings):
     # EASM MCP Server
     easm_mcp_url: str = ""
     easm_mcp_api_key: str = ""
+    easm_mcp_transport: str = "streamable_http"  # streamable_http | sse
 
     # Security
     guardrails_enabled: bool = True
@@ -84,6 +107,11 @@ class Settings(BaseSettings):
     @property
     def api_key_list(self) -> list[str]:
         return [k.strip() for k in self.api_keys.split(",") if k.strip()]
+
+    @property
+    def enabled_agents_list(self) -> list[str]:
+        """Allowlist of active agent ids; empty list = no explicit filter (all available)."""
+        return [a.strip() for a in self.enabled_agents.split(",") if a.strip()]
 
     @property
     def mcp_servers_config(self) -> dict:

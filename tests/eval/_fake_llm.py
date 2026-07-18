@@ -72,9 +72,10 @@ def build_decisions(cases: list[dict]) -> dict:
         if cls == "direct":
             d = {"action": "DIRECT", "response": "Happy to help with security intel and product how-to.",
                  "confidence": 0.95}
-        elif cls == "refuse":
-            d = {"action": "REFUSE", "response": "That's outside what I can help with here.",
-                 "confidence": 0.95}
+        elif cls in ("refuse", "clarify"):
+            # REFUSE was retired — an unroutable query now gracefully CLARIFYs
+            # (capability redirect), never a cold rejection.
+            d = {"action": "CLARIFY", "confidence": 0.3}
         elif cls == "complex":
             d = {"action": "COMPLEX", "confidence": 0.9}
         else:
@@ -89,10 +90,10 @@ def install_guardrail_stub() -> None:
     orchestrator lazily imports it — lets the eval run with no Presidio/spaCy."""
     mod = types.ModuleType("security_intel.security.guardrails")
 
-    async def input_guardrail_node(state, config, llm=None):
+    async def input_guardrail_node(state, config, llm=None, assistant_desc="", **_):
         return {"blocked": False, "block_reason": ""}
 
-    async def output_guardrail_node(state, config):
+    async def output_guardrail_node(state, config, domains="", **_):
         return {}
 
     mod.input_guardrail_node = input_guardrail_node
@@ -120,11 +121,12 @@ def register_light_agents(registry, settings) -> None:
         mode="tool_call", primary_tool="search_reports",
     ))
     registry.register(AgentSpec(
-        id="userguide", display_name="FortiRecon User Guide Agent",
-        description="Answers product how-to, navigation, and dashboard-walkthrough questions "
-                    "from the FortiRecon user guide.",
+        id="userguide", display_name="FortiRecon Product Guide",
+        description="Helps you use the FortiRecon platform: how-to, navigation, dashboards, "
+                    "features, and configuration, from the product documentation.",
         capabilities=["Explain dashboards/menus/features", "Step-by-step how-to",
                       "Navigation / where to find things"],
         system_prompt=USER_GUIDE_SYSTEM_PROMPT, tools=get_user_guide_tools(settings),
-        mode="tool_call", primary_tool="search_user_guide",
+        # react: matches main.py — the agent can chain search -> full-page fetch.
+        mode="react",
     ))

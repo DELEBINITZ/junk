@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Security Intelligence — Chat</title>
+<title>Assistant — Chat</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css" />
@@ -325,7 +325,7 @@
     <div id="composer">
       <div class="wrap">
         <div class="row">
-          <textarea id="input" rows="1" placeholder="Ask about security reports, threats, vulnerabilities..."></textarea>
+          <textarea id="input" rows="1" placeholder="Ask a question…"></textarea>
           <button id="stop-btn" title="Stop generation"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
           <button id="send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg></button>
         </div>
@@ -360,18 +360,46 @@ const PIPELINE_STAGES = [
   { id: "answer", label: "Answer" },
 ];
 
+// Derived assistant identity (name/tagline/domains/agents). Populated from
+// GET /v1/meta so the welcome screen follows whatever agents are enabled on the
+// backend, instead of hardcoding a security persona. Falls back gracefully.
+let META = null;
+async function loadMeta() {
+  try {
+    const r = await fetch(`${CONFIG.API_BASE}/v1/meta`, {
+      headers: { "X-API-Key": CONFIG.API_KEY, "Authorization": `Bearer ${CONFIG.JWT_TOKEN}` },
+    });
+    if (r.ok) {
+      META = await r.json();
+      if (META && META.name) document.title = `${META.name} — Chat`;
+    }
+  } catch (e) { /* keep static fallback */ }
+}
+
 function showWelcome() {
+  const name = (META && META.name) || "Assistant";
+  const tagline = (META && META.tagline)
+    || "I can help you find answers grounded in your organization's own data.";
+  const icon = (name.trim().charAt(0) || "A").toUpperCase();
+
+  let chips;
+  if (META && Array.isArray(META.agents) && META.agents.length) {
+    chips = META.agents.slice(0, 4).map((a) => {
+      const cap = (a.capabilities && a.capabilities[0]) || a.description || "";
+      return `<div class="suggestion" onclick="askSuggestion(this)">`
+        + `<strong>${escapeHtml(a.name || a.id)}</strong>${escapeHtml(cap)}</div>`;
+    }).join("");
+  } else {
+    chips = `<div class="suggestion" onclick="askSuggestion(this)">`
+      + `<strong>Get started</strong>What can you help me with?</div>`;
+  }
+
   messagesEl.innerHTML = `
     <div class="welcome">
-      <div class="welcome-icon">S</div>
-      <h1>Security Intelligence Assistant</h1>
-      <p>I can help you analyze security reports, review your attack surface, investigate threats, and explore vulnerability data — all grounded in your organization's own data.</p>
-      <div class="suggestions">
-        <div class="suggestion" onclick="askSuggestion(this)"><strong>Top threats</strong>Show me the top 10 threat actors targeting my region</div>
-        <div class="suggestion" onclick="askSuggestion(this)"><strong>Critical vulns</strong>What critical vulnerabilities were found this week?</div>
-        <div class="suggestion" onclick="askSuggestion(this)"><strong>Attack surface</strong>Summarize my external attack surface exposure</div>
-        <div class="suggestion" onclick="askSuggestion(this)"><strong>Recent reports</strong>What security reports were generated in the last 30 days?</div>
-      </div>
+      <div class="welcome-icon">${escapeHtml(icon)}</div>
+      <h1>${escapeHtml(name)}</h1>
+      <p>${escapeHtml(tagline)}</p>
+      <div class="suggestions">${chips}</div>
     </div>`;
 }
 
@@ -806,8 +834,13 @@ input.addEventListener("input", () => {
   input.style.height = Math.min(input.scrollHeight, 200) + "px";
 });
 
-// init
-showWelcome(); loadSessions(); input.focus();
+// init — load the derived identity first so the welcome screen reflects the
+// enabled agents, then render. Falls back to static copy if /v1/meta is unavailable.
+loadMeta().then(() => {
+  showWelcome();
+  if (META && META.domains) input.placeholder = `Ask about ${META.domains}…`;
+});
+loadSessions(); input.focus();
 </script>
 </body>
 </html>
