@@ -1,25 +1,15 @@
-"""Langfuse integration for LLM observability and agent tracing.
+"""Langfuse tracing for the LangGraph pipeline — optional observability.
 
-Traces every LLM call, tool invocation, and agent decision through Langfuse.
-Enable by setting LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY in env.
+Enable by setting LANGFUSE_HOST / LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY. If langfuse
+is missing or unconfigured, everything here degrades to a no-op and the app runs unchanged.
+
+Targets langfuse >= 3, where the CallbackHandler carries NO credentials and reads trace
+attributes (user / session / name / tags) from per-run METADATA keys. Credentials and the
+single shared client live in langfuse_client.py; this module only builds the callback
+handler and attaches it (plus trace metadata) to a RunnableConfig.
 """
 
 from __future__ import annotations
-
-import os
-import inspect
-
-# CallbackHandler moved across langfuse majors: langfuse 2.x exposes it at
-# `langfuse.callback`, langfuse >=3 at `langfuse.langchain`. Import defensively and
-# NEVER let an unavailable/incompatible langfuse (or a missing langchain integration)
-# crash app boot — tracing is optional observability, so degrade to "disabled".
-try:
-    from langfuse.callback import CallbackHandler as LangfuseCallbackHandler  # langfuse 2.x
-except Exception:  # noqa: BLE001
-    try:
-        from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler  # langfuse >=3
-    except Exception:  # noqa: BLE001
-        LangfuseCallbackHandler = None
 
 from langchain_core.runnables import RunnableConfig
 
@@ -29,119 +19,55 @@ from security_intel.observability.logging import get_logger
 
 logger = get_logger("tracing")
 
-if LangfuseCallbackHandler is None:
-    logger.warning(
-        "Langfuse CallbackHandler unavailable (langfuse not installed or version "
-        "mismatch) — tracing disabled; the app boots without it."
-    )
-
-_HANDLER_PARAMS = (
-    set(inspect.signature(LangfuseCallbackHandler.__init__).parameters.keys())
-    if LangfuseCallbackHandler is not None else set()
-)
-
-# langfuse 2.x takes credentials + trace attributes (user_id/session_id/trace_name) in
-# the CONSTRUCTOR. langfuse 3.x/4.x take only public_key and read those attributes from
-# per-run METADATA keys (langfuse_user_id / langfuse_session_id / langfuse_trace_name).
-# Detect which by signature so we adapt without pinning a version.
-_CTOR_TAKES_CREDS = "secret_key" in _HANDLER_PARAMS
+try:
+    from langfuse.langchain import CallbackHandler
+except Exception:  # noqa: BLE001 — langfuse optional / not installed
+    CallbackHandler = None
+    logger.warning("langfuse.langchain unavailable — tracing disabled; app boots without it.")
 
 
-def _make_handler(**kwargs) -> LangfuseCallbackHandler:
-    """Build handler with only params the installed version accepts."""
-    filtered = {k: v for k, v in kwargs.items() if k in _HANDLER_PARAMS and v is not None}
-    return LangfuseCallbackHandler(**filtered)
-
-
-def get_langfuse_handler(settings: Settings) -> LangfuseCallbackHandler | None:
-    """Create Langfuse callback handler if configured and available."""
-    if LangfuseCallbackHandler is None or not settings.langfuse_host or not settings.langfuse_public_key:
+def get_langfuse_handler(settings: Settings):
+    """Return one reusable Langfuse callback handler, or None if unavailable/unconfigured."""
+    if CallbackHandler is None or not settings.langfuse_host or not settings.langfuse_public_key:
         return None
-
-    os.environ.setdefault("LANGFUSE_HOST", settings.langfuse_host)
-    os.environ.setdefault("LANGFUSE_PUBLIC_KEY", settings.langfuse_public_key)
-    os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.langfuse_secret_key)
-
-    # langfuse 3.x/4.x: the CallbackHandler holds no credentials — it resolves its client
-    # via get_client(). Unless the shared client was constructed (which registers it), the
-    # handler silently "skips tracing (no client initialized)". Initialize the ONE shared
-    # client so tracing + prompt management resolve the identical instance. langfuse 2.x
-    # needs none (creds live on the handler).
-    if not _CTOR_TAKES_CREDS:
-        # Non-fatal: if this returns None we still build the handler (it can auto-resolve
-        # from the env vars set above); killing tracing over a client hiccup is worse.
-        init_langfuse_client(settings)
-
-    try:
-        handler = _make_handler(
-            public_key=settings.langfuse_public_key,
-            secret_key=settings.langfuse_secret_key,
-            host=settings.langfuse_host,
-            url=settings.langfuse_host,
-        )
-        logger.info(f"Langfuse tracing enabled: {settings.langfuse_host}")
-        return handler
-    except Exception as e:
-        logger.warning(f"Langfuse init failed: {e}")
+    # The handler resolves its client via get_client(); construct the shared client first
+    # or it silently "skips tracing — no client initialized".
+    if init_langfuse_client(settings) is None:
         return None
+    logger.info(f"Langfuse tracing enabled: {settings.langfuse_host}")
+    return CallbackHandler(public_key=settings.langfuse_public_key)
 
 
 def traced_config(
     base_config: RunnableConfig,
-    langfuse_handler: LangfuseCallbackHandler | None,
+    langfuse_handler,
     trace_name: str = "",
     user_id: str = "",
     session_id: str = "",
     metadata: dict | None = None,
     tags: list[str] | None = None,
 ) -> RunnableConfig:
-    """Enrich a RunnableConfig with Langfuse tracing callbacks + trace attributes.
+    """Attach the Langfuse handler + trace attributes to a RunnableConfig.
 
-    ``tags`` become filterable Langfuse tags (e.g. route type, enabled agents); ``metadata``
-    is arbitrary structured context shown on the trace. Both make traces searchable later.
+    langfuse reads trace grouping (user / session / name / tags) off these metadata keys.
+    Returns ``base_config`` unchanged when tracing is disabled.
     """
     if not langfuse_handler:
         return base_config
 
-    # Preserve every existing key (configurable, recursion_limit, tags, …); only augment
-    # callbacks + metadata. Rebuilding from scratch previously dropped fields.
-    new_config = dict(base_config)
-    callbacks = list(base_config.get("callbacks", []) or [])
-    meta = dict(base_config.get("metadata", {}) or {})
+    config = dict(base_config)  # preserve configurable / recursion_limit / etc.
+    config["callbacks"] = [*(base_config.get("callbacks") or []), langfuse_handler]
 
-    if _CTOR_TAKES_CREDS:
-        # langfuse 2.x — a fresh per-trace handler carries the attributes in its constructor.
-        try:
-            trace_handler = _make_handler(
-                public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
-                secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
-                host=os.environ.get("LANGFUSE_HOST", ""),
-                url=os.environ.get("LANGFUSE_HOST", ""),
-                trace_name=trace_name or "orchestrator",
-                user_id=user_id,
-                session_id=session_id,
-                tags=tags or [],
-                metadata=metadata or {},
-            )
-            callbacks.append(trace_handler)
-        except Exception as e:
-            logger.warning(f"Failed to create trace handler: {e}")
-            callbacks.append(langfuse_handler)
-    else:
-        # langfuse 3.x/4.x — reuse the shared handler; trace attributes travel as the
-        # metadata keys the handler reads off each run.
-        callbacks.append(langfuse_handler)
-        if trace_name:
-            meta["langfuse_trace_name"] = trace_name
-        if user_id:
-            meta["langfuse_user_id"] = user_id
-        if session_id:
-            meta["langfuse_session_id"] = session_id
-        if tags:
-            meta["langfuse_tags"] = list(tags)
-        if metadata:
-            meta.update(metadata)
-
-    new_config["callbacks"] = callbacks
-    new_config["metadata"] = meta
-    return new_config
+    meta = dict(base_config.get("metadata") or {})
+    if trace_name:
+        meta["langfuse_trace_name"] = trace_name
+    if user_id:
+        meta["langfuse_user_id"] = user_id
+    if session_id:
+        meta["langfuse_session_id"] = session_id
+    if tags:
+        meta["langfuse_tags"] = list(tags)
+    if metadata:
+        meta.update(metadata)
+    config["metadata"] = meta
+    return config
