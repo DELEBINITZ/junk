@@ -383,8 +383,8 @@ function showWelcome() {
   const icon = (name.trim().charAt(0) || "A").toUpperCase();
 
   let chips;
-  if (META && Array.isArray(META.agents) && META.agents.length) {
-    chips = META.agents.slice(0, 4).map((a) => {
+  if (META && Array.isArray(META.capabilities) && META.capabilities.length) {
+    chips = META.capabilities.slice(0, 4).map((a) => {
       const cap = (a.capabilities && a.capabilities[0]) || a.description || "";
       return `<div class="suggestion" onclick="askSuggestion(this)">`
         + `<strong>${escapeHtml(a.name || a.id)}</strong>${escapeHtml(cap)}</div>`;

@@ -1,0 +1,586 @@
+<title>FortiRecon Assistant — System Architecture Overview</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --accent:#0F6E66; --accent-deep:#0A4F49; --accent-soft:#E4F0EE;
+    --ink:#16222C; --body:#2C3A45; --muted:#5E6E79; --faint:#8A99A3;
+    --paper:#FBFAF7; --surface:#FFFFFF; --rule:#DBD9D2; --rule-strong:#B9BEB9;
+    --good:#2F7D50; --crit:#B24A40; --amber:#9A6B1E;
+    --f-serif:Georgia,"Iowan Old Style","Times New Roman",serif;
+    --f-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --f-mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --measure:74ch;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --accent:#3FB3A6; --accent-deep:#7FD3C9; --accent-soft:#12292A;
+      --ink:#EAF0F1; --body:#C4D0D6; --muted:#93A2AA; --faint:#6E7E86;
+      --paper:#0E151A; --surface:#151F26; --rule:#26333C; --rule-strong:#33434D;
+      --good:#4FB477; --crit:#DA6B60; --amber:#D3A24E;
+    }
+  }
+  :root[data-theme="light"]{
+    --accent:#0F6E66; --accent-deep:#0A4F49; --accent-soft:#E4F0EE;
+    --ink:#16222C; --body:#2C3A45; --muted:#5E6E79; --faint:#8A99A3;
+    --paper:#FBFAF7; --surface:#FFFFFF; --rule:#DBD9D2; --rule-strong:#B9BEB9;
+    --good:#2F7D50; --crit:#B24A40; --amber:#9A6B1E;
+  }
+  :root[data-theme="dark"]{
+    --accent:#3FB3A6; --accent-deep:#7FD3C9; --accent-soft:#12292A;
+    --ink:#EAF0F1; --body:#C4D0D6; --muted:#93A2AA; --faint:#6E7E86;
+    --paper:#0E151A; --surface:#151F26; --rule:#26333C; --rule-strong:#33434D;
+    --good:#4FB477; --crit:#DA6B60; --amber:#D3A24E;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--body);font-family:var(--f-sans);
+    font-size:16px;line-height:1.62;-webkit-font-smoothing:antialiased}
+  .doc{max-width:860px;margin:0 auto;padding:0 40px 80px}
+  p{max-width:var(--measure)}
+  h1,h2,h3,h4{font-family:var(--f-serif);color:var(--ink);letter-spacing:-.01em;text-wrap:balance}
+  a{color:var(--accent)}
+
+  .toolbar{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--paper) 88%,transparent);
+    backdrop-filter:blur(8px);border-bottom:1px solid var(--rule)}
+  .toolbar .in{max-width:860px;margin:0 auto;padding:10px 40px;display:flex;align-items:center;gap:14px}
+  .toolbar .id{font-family:var(--f-mono);font-size:12px;letter-spacing:.06em;color:var(--muted)}
+  .toolbar .id b{color:var(--ink)}
+  .toolbar .hint{margin-left:auto;font-family:var(--f-mono);font-size:11.5px;color:var(--faint)}
+  .toolbar .hint kbd{font-family:var(--f-mono);background:var(--surface);border:1px solid var(--rule);
+    border-bottom-width:2px;border-radius:4px;padding:1px 6px;color:var(--ink)}
+
+  .cover{padding:70px 0 50px;border-bottom:2px solid var(--accent)}
+  .cover .org{font-family:var(--f-mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--accent);margin-bottom:28px}
+  .cover .glyph{width:56px;height:56px;border-radius:12px;background:linear-gradient(140deg,var(--accent),var(--accent-deep));
+    color:#fff;display:grid;place-items:center;font-family:var(--f-serif);font-size:30px;font-weight:700;margin-bottom:24px}
+  .cover h1{font-size:clamp(36px,6vw,58px);line-height:1.04;margin:0}
+  .cover .subtitle{font-family:var(--f-serif);font-style:italic;font-size:clamp(18px,2.5vw,23px);color:var(--muted);margin:16px 0 0;max-width:62ch}
+  .meta{margin-top:42px;display:grid;grid-template-columns:repeat(4,auto);gap:24px 44px;justify-content:start}
+  @media(max-width:640px){.meta{grid-template-columns:repeat(2,auto)}}
+  .meta div span{display:block;font-family:var(--f-mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin-bottom:5px}
+  .meta div b{font-weight:600;color:var(--ink);font-size:14px}
+
+  .abstract{margin-top:42px;padding:26px 30px;background:var(--surface);border:1px solid var(--rule);border-left:4px solid var(--accent);border-radius:4px}
+  .abstract h2{font-size:15px;font-family:var(--f-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 12px}
+  .abstract p{margin:0 0 12px;color:var(--body)}
+  .abstract p:last-child{margin-bottom:0}
+
+  .toc{margin-top:42px}
+  .toc h2{font-size:14px;font-family:var(--f-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--rule);padding-bottom:8px;margin:0 0 12px}
+  .toc ol{list-style:none;margin:0;padding:0;columns:2;column-gap:44px}
+  @media(max-width:640px){.toc ol{columns:1}}
+  .toc li{break-inside:avoid;padding:5px 0;font-size:14.5px;display:flex;gap:12px}
+  .toc li .n{font-family:var(--f-mono);color:var(--accent);font-size:12.5px;min-width:26px}
+  .toc a{color:var(--body);text-decoration:none}
+  .toc a:hover{color:var(--accent)}
+
+  section{padding-top:50px;margin-top:8px}
+  .sechead{display:flex;align-items:baseline;gap:16px;border-bottom:1px solid var(--rule-strong);padding-bottom:12px;margin-bottom:22px}
+  .sechead .n{font-family:var(--f-mono);font-size:15px;color:var(--accent);font-weight:600}
+  .sechead h2{font-size:clamp(22px,3.2vw,29px);margin:0}
+  h3{font-size:18.5px;margin:28px 0 8px}
+  h4{font-size:15px;font-family:var(--f-sans);font-weight:700;color:var(--ink);margin:18px 0 6px}
+  p{margin:0 0 14px}
+  strong{color:var(--ink);font-weight:650}
+  em.term{font-style:normal;font-family:var(--f-mono);font-size:.9em;color:var(--accent-deep);background:var(--accent-soft);padding:1px 5px;border-radius:4px}
+
+  .callout{margin:22px 0;padding:16px 20px;border:1px solid var(--rule);border-radius:6px;background:var(--surface);break-inside:avoid}
+  .callout .k{font-family:var(--f-mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:600;display:block;margin-bottom:7px}
+  .callout.note .k{color:var(--amber)}
+  .callout p{margin:0;font-size:14.5px;color:var(--body)}
+
+  figure{margin:26px 0;break-inside:avoid}
+  figcaption{font-size:13px;color:var(--muted);margin-top:12px;font-style:italic;font-family:var(--f-serif)}
+  figcaption b{font-style:normal;font-family:var(--f-mono);color:var(--accent);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;margin-right:8px}
+  .diagram{border:1px solid var(--rule);border-radius:8px;padding:24px 20px;background:var(--surface);overflow-x:auto}
+  .flow{display:flex;flex-direction:column;align-items:center;gap:0;min-width:min-content}
+  .node{font-family:var(--f-mono);font-size:12.5px;color:var(--ink);background:var(--paper);border:1px solid var(--rule-strong);
+    border-radius:7px;padding:9px 14px;text-align:center;white-space:nowrap}
+  .node.hl{border-color:var(--accent);background:var(--accent-soft)}
+  .node.stop{border-color:var(--crit)}
+  .node.cap{border-style:dashed;border-color:var(--accent)}
+  .node.ends{background:linear-gradient(140deg,var(--accent),var(--accent-deep));color:#fff;border:none;letter-spacing:.06em}
+  .par{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+  .lane{font-family:var(--f-mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin:5px 0}
+  .conn{width:2px;height:20px;background:var(--rule-strong)}
+  .conn.d{background:repeating-linear-gradient(var(--rule-strong) 0 4px,transparent 4px 8px)}
+  .fork{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin:4px 0}
+  .fork .b{display:flex;flex-direction:column;align-items:center;gap:6px}
+  .fork .b .t{font-family:var(--f-mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--faint)}
+
+  /* tiered component diagram */
+  .tiers{display:flex;flex-direction:column;gap:14px;min-width:min-content}
+  .tier{border:1px solid var(--rule);border-radius:8px;padding:14px 16px 16px;background:var(--paper);position:relative}
+  .tier > .tlabel{font-family:var(--f-mono);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin-bottom:10px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+  .box{font-family:var(--f-mono);font-size:12px;color:var(--ink);background:var(--surface);border:1px solid var(--rule-strong);
+    border-radius:7px;padding:10px 14px;text-align:center;min-width:120px}
+  .box small{display:block;font-family:var(--f-sans);font-size:10.5px;color:var(--muted);margin-top:3px;white-space:normal;font-weight:400}
+  .box.app{border-color:var(--accent)}
+  .box.gpu{border-left:3px solid var(--amber)}
+  .box.data{border-left:3px solid var(--accent-deep)}
+  .vlink{text-align:center;color:var(--faint);font-family:var(--f-mono);font-size:11px;margin:-4px 0}
+
+  .tw{overflow-x:auto;margin:22px 0;border:1px solid var(--rule);border-radius:6px;break-inside:avoid}
+  table{border-collapse:collapse;width:100%;min-width:520px;background:var(--surface);font-size:14px}
+  th,td{text-align:left;padding:11px 15px;border-bottom:1px solid var(--rule);vertical-align:top}
+  thead th{font-family:var(--f-mono);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--paper)}
+  tr:last-child td{border-bottom:none}
+  td code,.mono{font-family:var(--f-mono);font-size:12.5px}
+  td .a{font-family:var(--f-mono);font-size:12.5px;color:var(--accent-deep)}
+
+  ul.clean{margin:14px 0;padding-left:0;list-style:none;display:grid;gap:10px}
+  ul.clean li{padding-left:24px;position:relative;max-width:var(--measure)}
+  ul.clean li::before{content:"—";position:absolute;left:0;color:var(--accent);font-weight:700}
+  ul.clean li b{color:var(--ink)}
+  ol.steps{margin:16px 0;padding-left:0;list-style:none;counter-reset:s;display:grid;gap:11px}
+  ol.steps li{counter-increment:s;padding-left:38px;position:relative;max-width:var(--measure)}
+  ol.steps li::before{content:counter(s);position:absolute;left:0;top:0;width:25px;height:25px;border-radius:50%;
+    background:var(--accent-soft);color:var(--accent-deep);font-family:var(--f-mono);font-size:12px;font-weight:700;display:grid;place-items:center}
+  ol.steps li b{color:var(--ink)}
+
+  .pill{display:inline-flex;align-items:center;font-family:var(--f-mono);font-size:10.5px;letter-spacing:.04em;
+    text-transform:uppercase;padding:2px 8px;border-radius:999px;border:1px solid currentColor;font-weight:600}
+  .pill.good{color:var(--good)} .pill.crit{color:var(--crit)} .pill.warn{color:var(--amber)} .pill.acc{color:var(--accent)}
+
+  .ba{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:22px 0;break-inside:avoid}
+  @media(max-width:640px){.ba{grid-template-columns:1fr}}
+  .ba .b{border:1px solid var(--rule);border-radius:6px;padding:18px;background:var(--surface)}
+  .ba .b.was{border-top:3px solid var(--crit)} .ba .b.now{border-top:3px solid var(--good)}
+  .ba h4{margin-top:8px}
+  .q{font-family:var(--f-mono);font-size:12px;line-height:1.5;color:var(--muted);margin-top:10px;padding:10px 12px;background:var(--paper);border-radius:5px;border:1px solid var(--rule)}
+
+  pre.code{overflow-x:auto;background:#0C1320;color:#D7E2EC;border-radius:8px;padding:15px 18px;margin:20px 0;
+    font-family:var(--f-mono);font-size:12.5px;line-height:1.55;border:1px solid #1c2836}
+  pre.code .k{color:#D3A24E} pre.code .s{color:#7fd6cd} pre.code .c{color:#6b8090}
+
+  .appendix{border-top:2px solid var(--accent);margin-top:56px;padding-top:8px}
+  dl.gloss{margin:18px 0}
+  dl.gloss dt{font-family:var(--f-mono);font-size:13px;color:var(--accent-deep);font-weight:600;margin-top:14px}
+  dl.gloss dd{margin:3px 0 0;color:var(--body);font-size:14px;max-width:var(--measure)}
+
+  footer{margin-top:52px;padding-top:20px;border-top:1px solid var(--rule);font-family:var(--f-mono);
+    font-size:11px;color:var(--faint);display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+
+  @page{size:A4;margin:18mm 15mm 20mm}
+  @media print{
+    :root,:root[data-theme]{--paper:#fff;--surface:#fff;--ink:#111;--body:#1c1c1c;--muted:#444;--faint:#666;--rule:#ccc;--rule-strong:#999;--accent-soft:#eef5f4;--accent:#0F6E66;--accent-deep:#0A4F49;--good:#2F7D50;--crit:#B24A40;--amber:#9A6B1E}
+    body{background:#fff;color:#1c1c1c;font-size:10.2pt;line-height:1.48}
+    .doc{max-width:none;padding:0}
+    .toolbar{display:none}
+    .cover{min-height:auto;padding:0 0 22pt}
+    section{page-break-before:always;padding-top:0}
+    .sechead h2,h3,h4{page-break-after:avoid}
+    figure,.tw,.callout,.ba,.abstract,.toc,pre.code,.diagram{page-break-inside:avoid}
+    a{color:#000;text-decoration:none}
+    pre.code{background:#f4f4f2;color:#111;border:1px solid #ccc}
+    pre.code .k{color:#8a5a12} pre.code .s{color:#0a5a52} pre.code .c{color:#666}
+    *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  }
+</style>
+
+<div class="toolbar">
+  <div class="in">
+    <span class="id"><b>FortiRecon Assistant</b> · System Architecture · v1.3</span>
+    <span class="hint">Save as PDF: <kbd>Cmd/Ctrl</kbd> + <kbd>P</kbd> → “Save as PDF”</span>
+  </div>
+</div>
+
+<div class="doc">
+
+  <!-- COVER -->
+  <header class="cover">
+    <div class="org">FortiRecon · Applied AI</div>
+    <div class="glyph">F</div>
+    <h1>FortiRecon Assistant — System Architecture</h1>
+    <div class="subtitle">A master orchestrator coordinating a team of named specialist agents (Atlas, Sentinel, …): how it works end to end, and how it scales.</div>
+    <div class="meta">
+      <div><span>Document</span><b>System Architecture</b></div>
+      <div><span>Version</span><b>1.3</b></div>
+      <div><span>Date</span><b>18 July 2026</b></div>
+      <div><span>Status</span><b>For Review</b></div>
+      <div><span>Prepared for</span><b>Senior Stakeholders</b></div>
+      <div><span>Classification</span><b>Internal</b></div>
+      <div><span>Runtime</span><b>Python · FastAPI · LangGraph</b></div>
+      <div><span>Owner</span><b>Applied AI Engineering</b></div>
+    </div>
+
+    <div class="abstract">
+      <h2>Executive summary</h2>
+      <p><strong>FortiRecon Assistant is a conversational AI platform that adapts its identity and abilities to whatever capabilities we enable.</strong> A master orchestrator coordinates a team of named specialist agents — <strong>Atlas</strong> (product guidance) today, <strong>Sentinel</strong> (security reports) and an external-attack-surface agent next — and answers the user in one consistent voice. Today only Atlas is enabled, so the assistant presents as a product guide; the same system, unchanged, becomes a security analyst the moment further specialists are switched on.</p>
+      <p>The platform is organised in three tiers: a <strong>stateless application service</strong> that holds the agent logic, a <strong>model-serving tier</strong> (language, embedding, and re-ranking models on GPUs) shared across the fleet, and a <strong>data tier</strong> (a vector database and PostgreSQL). This separation is the basis of its scalability — the application scales horizontally, while the expensive model tier scales independently and is used economically through a three-lane routing scheme that sends most work to a small, cheap model.</p>
+      <p>Two design decisions define the product. First, <strong>the assistant’s persona, scope, and boundaries are derived automatically from its enabled capabilities</strong> — one platform serves many products without a rebuild. Second, <strong>it never cold-rejects a valid request or leaves a user at a dead-end.</strong> A prior version rejected legitimate questions as “out of scope”; the architecture now makes that structurally impossible — anything it cannot do is met with a graceful, guiding response. This document covers the whole system: its components, a request’s journey through them, how the platform scales and deploys, and its security and operational posture.</p>
+    </div>
+
+    <nav class="toc">
+      <h2>Contents</h2>
+      <ol>
+        <li><span class="n">1</span><a href="#s1">Overview &amp; design principles</a></li>
+        <li><span class="n">2</span><a href="#s2">System architecture &amp; components</a></li>
+        <li><span class="n">3</span><a href="#s3">The request lifecycle</a></li>
+        <li><span class="n">4</span><a href="#s4">Agent orchestration</a></li>
+        <li><span class="n">5</span><a href="#s5">Derived identity &amp; capabilities</a></li>
+        <li><span class="n">6</span><a href="#s6">Request routing</a></li>
+        <li><span class="n">7</span><a href="#s7">Retrieval &amp; knowledge</a></li>
+        <li><span class="n">8</span><a href="#s8">Knowledge ingestion</a></li>
+        <li><span class="n">9</span><a href="#s9">Scalability &amp; performance</a></li>
+        <li><span class="n">10</span><a href="#s10">Deployment topology</a></li>
+        <li><span class="n">11</span><a href="#s11">Security, privacy &amp; isolation</a></li>
+        <li><span class="n">12</span><a href="#s12">Extensibility &amp; roadmap</a></li>
+        <li><span class="n">13</span><a href="#s13">Operational readiness</a></li>
+        <li><span class="n">A</span><a href="#sa">Appendix — glossary &amp; stack</a></li>
+      </ol>
+    </nav>
+  </header>
+
+  <!-- 1 -->
+  <section id="s1">
+    <div class="sechead"><span class="n">1</span><h2>Overview &amp; design principles</h2></div>
+    <p>FortiRecon Assistant follows the <strong>supervisor / orchestrator-workers</strong> pattern, a well-established design for reliable multi-agent systems. A single <strong>master orchestrator</strong> stays in conversation with the user and delegates bounded sub-tasks to a team of <strong>named specialist agents</strong> — Atlas, Sentinel, and others. The specialists never address the user directly and never call one another; the orchestrator alone decides what runs, coordinates it, and composes the final answer in one consistent voice (specialist names are internal — the user hears one assistant).</p>
+    <p>Control flow is <strong>deterministic</strong>, expressed as a directed graph (LangGraph). This is deliberate: a language model decides <em>what</em> to do at each decision point, but the graph decides <em>where control can go</em>. That separation makes the system debuggable, testable, and safe to operate — behaviour is auditable rather than emergent.</p>
+    <div class="callout"><span class="k">Why it matters</span><p>Deterministic orchestration turns “an AI that usually does the right thing” into a system with guarantees: every request passes the same safety gate, every answer passes the same privacy filter, and every failure has a defined fallback.</p></div>
+    <h3>The two defining properties</h3>
+    <div class="tw"><table>
+      <thead><tr><th style="width:32%">Property</th><th>What it means</th><th>Business value</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Derived identity</strong></td><td>The assistant’s name, scope, and boundaries are generated from the capabilities that are switched on — not hardcoded.</td><td>One platform serves many products/audiences; a new offering is a configuration change, not a new build.</td></tr>
+        <tr><td><strong>No cold rejection</strong></td><td>Scope is judged only against live capabilities; an attempt-first router plus a graceful fallback guarantee no valid turn dead-ends.</td><td>Higher task completion and user trust; fewer “the bot couldn’t help” escalations.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <!-- 2 -->
+  <section id="s2">
+    <div class="sechead"><span class="n">2</span><h2>System architecture &amp; components</h2></div>
+    <p>The platform is a set of independently-scalable tiers. The application service is <strong>stateless</strong> — it keeps no conversation in memory; all durable state lives in the data tier — which is what lets it run as many identical replicas behind a load balancer. The model-serving and data tiers are shared services that every replica calls.</p>
+
+    <figure>
+      <div class="diagram"><div class="tiers">
+        <div class="tier"><div class="tlabel">Clients</div><div class="row">
+          <div class="box">Web chat UI<small>streams tokens over SSE</small></div>
+          <div class="box">API consumers<small>programmatic access</small></div>
+        </div></div>
+        <div class="vlink">│ HTTPS · API key + JWT</div>
+        <div class="tier" style="border-color:var(--accent)"><div class="tlabel">Application tier — stateless, N replicas (FastAPI)</div><div class="row">
+          <div class="box app">API &amp; Auth<small>key + JWT → org identity</small></div>
+          <div class="box app">Orchestrator<small>LangGraph state machine</small></div>
+          <div class="box app">Guardrails<small>injection screen · PII redaction</small></div>
+        </div></div>
+        <div class="vlink">│ &nbsp; shared backends &nbsp; │</div>
+        <div class="row" style="align-items:stretch">
+          <div class="tier" style="flex:1"><div class="tlabel">Model-serving tier — GPU</div><div class="row">
+            <div class="box gpu">LLM · 3 lanes<small>7B fast · 72B standard · deep</small></div>
+            <div class="box gpu">Embeddings<small>TEI</small></div>
+            <div class="box gpu">Re-ranker<small>TEI cross-encoder</small></div>
+          </div></div>
+          <div class="tier" style="flex:1"><div class="tlabel">Data tier — stateful</div><div class="row">
+            <div class="box data">Qdrant<small>vector store (org-scoped)</small></div>
+            <div class="box data">PostgreSQL<small>chats + durable graph state</small></div>
+          </div></div>
+        </div>
+        <div class="vlink">╌╌ out of band ╌╌</div>
+        <div class="tier"><div class="tlabel">Supporting services</div><div class="row">
+          <div class="box cap">MCP capability servers<small>external tools, per capability</small></div>
+          <div class="box">Ingestion service<small>offline · docs → Qdrant</small></div>
+          <div class="box">Observability<small>tracing &amp; metrics</small></div>
+        </div></div>
+      </div></div>
+      <figcaption><b>Figure 1</b> Component topology. The application tier is stateless and horizontally scalable; the model and data tiers are shared, independently-scaled backends. Ingestion runs offline, off the request path.</figcaption>
+    </figure>
+
+    <div class="tw"><table>
+      <thead><tr><th style="width:30%">Component</th><th>Role</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Application service</strong></td><td>FastAPI process hosting the API, authentication, the orchestrator graph, and guardrails. Fully async; no in-memory session state.</td></tr>
+        <tr><td><strong>LLM (three lanes)</strong></td><td>An OpenAI-compatible model server (e.g. Qwen on vLLM/SGLang). A small fast model handles routing, planning, and summarising; a large standard model composes answers; a deep lane handles the hardest multi-step analysis.</td></tr>
+        <tr><td><strong>Embeddings &amp; re-ranker</strong></td><td>Text-Embeddings-Inference (TEI) services turn text into vectors and re-score retrieved passages. Ingestion and query use the <em>same</em> embedding model, so they always agree.</td></tr>
+        <tr><td><strong>Qdrant</strong></td><td>Vector database holding the searchable knowledge. Every query is filtered to the requesting organisation.</td></tr>
+        <tr><td><strong>PostgreSQL</strong></td><td>Two roles: the conversation store (chat history + rolling summaries) and durable orchestrator state (LangGraph checkpoints), each behind an async connection pool.</td></tr>
+        <tr><td><strong>MCP servers</strong></td><td>External capabilities connected over the Model Context Protocol; discovered and wired in at start-up from configuration.</td></tr>
+        <tr><td><strong>Ingestion service</strong></td><td>A standalone, offline job that keeps the knowledge base current. Never on the live request path.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="s3">
+    <div class="sechead"><span class="n">3</span><h2>The request lifecycle</h2></div>
+    <p>A single question travels a well-defined path across the tiers. Understanding this journey is the clearest way to see how the pieces fit.</p>
+    <ol class="steps">
+      <li><b>Authenticate.</b> The request carries a gateway API key and a signed identity token (JWT). The service verifies both and derives the caller’s organisation, user, and roles. Identity is established before anything else runs.</li>
+      <li><b>Screen &amp; classify — in parallel.</b> Two fast-lane model calls run concurrently: an attack screen and an intent classification. Running them together removes a round-trip of latency.</li>
+      <li><b>Route.</b> The results join at a routing decision: answer directly, use one capability, plan across several, gracefully clarify, or — only for a genuine attack — stop.</li>
+      <li><b>Retrieve &amp; reason.</b> Chosen capabilities run (in parallel where independent), retrieving org-scoped passages from the vector store and reasoning over them.</li>
+      <li><b>Reflect.</b> If nothing useful came back, the orchestrator re-plans once or degrades gracefully — it never dead-ends.</li>
+      <li><b>Compose &amp; stream.</b> The standard-lane model composes one grounded, cited answer, streamed token-by-token to the user.</li>
+      <li><b>Guard &amp; persist.</b> The answer is redacted for personal data and checked for any instruction leak, then the turn is saved and the conversation summary updated for future context.</li>
+    </ol>
+    <div class="callout"><span class="k">Latency by design</span><p>Most requests never pay for a planning step (the router writes the task inline), the two pre-routing calls overlap, and independent capabilities run concurrently — so the common case is fast, and only genuinely complex questions incur the full pipeline.</p></div>
+  </section>
+
+  <!-- 4 -->
+  <section id="s4">
+    <div class="sechead"><span class="n">4</span><h2>Agent orchestration</h2></div>
+    <p>The orchestrator is the deterministic graph at the heart of the application tier. Every message follows the same structure; all three answer paths converge on one privacy filter before reaching the user.</p>
+    <figure>
+      <div class="diagram"><div class="flow">
+        <div class="node ends">START</div><div class="conn"></div>
+        <div class="lane">run concurrently, then join</div>
+        <div class="par"><div class="node stop">security&nbsp;gate</div><div class="node">classify&nbsp;intent</div></div>
+        <div class="conn"></div>
+        <div class="node hl">route — decide</div>
+        <div class="conn d"></div>
+        <div class="fork">
+          <div class="b"><span class="t">attack</span><div class="node stop">blocked → END</div></div>
+          <div class="b"><span class="t">direct</span><div class="node">chitchat</div></div>
+          <div class="b"><span class="t">complex</span><div class="node">plan</div></div>
+          <div class="b"><span class="t">simple</span><div class="node">dispatch</div></div>
+          <div class="b"><span class="t">unclear</span><div class="node cap">capability&nbsp;redirect</div></div>
+        </div>
+        <div class="conn d"></div>
+        <div class="node">dispatch — parallel capability batches</div>
+        <div class="lane">reflection gate</div>
+        <div class="fork">
+          <div class="b"><span class="t">productive</span><div class="node">synthesize</div></div>
+          <div class="b"><span class="t">empty · many</span><div class="node">replan&nbsp;(once)</div></div>
+          <div class="b"><span class="t">empty · one</span><div class="node cap">capability&nbsp;redirect</div></div>
+        </div>
+        <div class="conn"></div>
+        <div class="node hl">output guardrail — PII + leak backstop</div>
+        <div class="conn"></div>
+        <div class="node">persist &amp; summarize</div>
+        <div class="conn"></div>
+        <div class="node ends">END</div>
+      </div></div>
+      <figcaption><b>Figure 2</b> The orchestration graph. Solid lines are always taken; dashed lines are conditional routes decided from merged state.</figcaption>
+    </figure>
+    <p>Sub-agents run in one of two modes: a <strong>single-call</strong> mode for pure retrieval (one search, no loop — cheapest), or a <strong>reasoning</strong> mode where the agent chains tools, for example searching and then fetching a full documentation page so a step-by-step walkthrough arrives complete. The product-guide capability runs in reasoning mode.</p>
+  </section>
+
+  <!-- 5 -->
+  <section id="s5">
+    <div class="sechead"><span class="n">5</span><h2>Derived identity &amp; capabilities</h2></div>
+    <p>An assistant’s personality is normally written into its prompts. Ours is not. At start-up the system inspects which capabilities registered and builds a single <em class="term">SystemProfile</em> — a name, a one-line role, a description of what it can help with, and the domains it covers. Every persona-bearing instruction (the router, conversational replies, the answer composer, the security classifier) is a template filled from that profile.</p>
+    <p>The consequence is direct: <strong>change the enabled capabilities and the whole personality re-forms</strong> — name, scope, and boundaries — with no change to code or prompts.</p>
+    <div class="callout"><span class="k">The master and its named specialists</span><p>The user-facing assistant is the <strong>master</strong> (“FortiRecon Assistant”). Under it sits a team of <strong>named specialist agents</strong> — <strong>Atlas</strong> answers product-guide questions from the documentation, <strong>Sentinel</strong> answers from the security-reports corpus, and further agents (e.g. external attack surface) plug in the same way. These names are <em>internal</em>: the master coordinates them and answers in one voice, so a user always hears a single assistant, not a hand-off between bots. Enable more specialists and the master’s advertised scope grows; its identity is derived from whichever are switched on.</p></div>
+    <div class="tw"><table>
+      <thead><tr><th style="width:24%">Specialist</th><th style="width:32%">Capability area</th><th>Backing source</th></tr></thead>
+      <tbody>
+        <tr><td class="a">Atlas <span style="color:var(--good)">· enabled</span></td><td>FortiRecon product guidance</td><td>Product documentation (vector store)</td></tr>
+        <tr><td class="a">Sentinel <span style="color:var(--faint)">· planned</span></td><td>Security reports &amp; threat intelligence</td><td>Reports corpus (vector store)</td></tr>
+        <tr><td class="a">EASM agent <span style="color:var(--faint)">· future</span></td><td>External attack surface</td><td>EASM data via an external (MCP) service</td></tr>
+      </tbody>
+    </table></div>
+    <pre class="code"><span class="c"># one configuration value reshapes the whole system — no code change</span>
+<span class="k">ENABLED_AGENTS</span>=userguide                 <span class="c"># ship today: only the Atlas specialist</span>
+<span class="k">ENABLED_AGENTS</span>=reports,easm,userguide    <span class="c"># later: add Sentinel + the EASM agent</span></pre>
+  </section>
+
+  <!-- 6 -->
+  <section id="s6">
+    <div class="sechead"><span class="n">6</span><h2>Request routing</h2></div>
+    <p>Routing is cost-aware and, by design, <strong>incapable of rejecting a request for being off-topic</strong>. A fast classifier assigns every message one of four intents; only a genuine attack — handled separately — can stop a turn.</p>
+    <div class="tw"><table>
+      <thead><tr><th style="width:20%">Intent</th><th>When</th><th>Handling</th></tr></thead>
+      <tbody>
+        <tr><td><span class="pill acc">Direct</span></td><td>Answerable without a capability — greeting, “who are you”, thanks.</td><td>A brief conversational reply.</td></tr>
+        <tr><td><span class="pill acc">Simple</span></td><td>One capability plausibly fits.</td><td>Task written inline; the planner is skipped.</td></tr>
+        <tr><td><span class="pill acc">Complex</span></td><td>Needs several capabilities or cross-referencing.</td><td>A planner decomposes it into a task graph.</td></tr>
+        <tr><td><span class="pill warn">Clarify</span></td><td>Nothing clearly fits, or the request is too vague.</td><td>A warm capability redirect — <strong>not</strong> a refusal.</td></tr>
+      </tbody>
+    </table></div>
+    <h3>Safety and scope are separate concerns</h3>
+    <ul class="clean">
+      <li><b>Safety</b> — prompt injection, jailbreak, and extraction attempts are the <em>only</em> hard stops, isolated in the security gate.</li>
+      <li><b>Scope</b> — never a rejection. The router has no “refuse” action; anything unclear becomes a guiding redirect.</li>
+      <li><b>A deterministic safeguard</b> guarantees a non-empty system can never dead-end: with one capability enabled, an unclear question is <em>attempted</em> against it; with several, it becomes a clarify redirect.</li>
+    </ul>
+    <h3>The reliability improvement</h3>
+    <div class="ba">
+      <div class="b was"><span class="pill crit">Previously</span><h4>Cold rejection</h4><p style="font-size:14px;margin:0;color:var(--muted)">A hardcoded refusal path and a fixed security persona judged valid product questions “out of scope.”</p><div class="q">“How do I export my findings?”<br>→ “That’s outside what I can help with.”</div></div>
+      <div class="b now"><span class="pill good">Now</span><h4>Attempt, then guide</h4><p style="font-size:14px;margin:0;color:var(--muted)">The question is tried against the enabled capability; any miss degrades to a helpful redirect.</p><div class="q">“How do I export my findings?”<br>→ searches the guide → answers, or offers what it can do.</div></div>
+    </div>
+  </section>
+
+  <!-- 7 -->
+  <section id="s7">
+    <div class="sechead"><span class="n">7</span><h2>Retrieval &amp; knowledge</h2></div>
+    <p>The assistant answers from source material, not from memory. A specialist retrieves relevant passages from the vector store and reasons over them, fetching a full page when a walkthrough needs the complete section — so answers arrive whole, not as truncated fragments.</p>
+    <figure>
+      <div class="diagram"><div class="flow" style="flex-direction:row;flex-wrap:wrap;gap:0;justify-content:center">
+        <div class="node">question</div><div class="conn" style="width:22px;height:2px"></div>
+        <div class="node">enrich</div><div class="conn" style="width:22px;height:2px"></div>
+        <div class="node">embed</div><div class="conn" style="width:22px;height:2px"></div>
+        <div class="node">vector search</div><div class="conn" style="width:22px;height:2px"></div>
+        <div class="node">fuse &amp; re-rank</div><div class="conn" style="width:22px;height:2px"></div>
+        <div class="node hl">grounded answer</div>
+      </div></div>
+      <figcaption><b>Figure 3</b> Retrieval-augmented generation. Each stage lifts precision or recall before the model composes an answer it can cite.</figcaption>
+    </figure>
+    <ul class="clean">
+      <li><b>Domain-aware enrichment</b> — a query is expanded along the right axis for its corpus; a documentation question is not reformulated as if it were a threat query.</li>
+      <li><b>Fusion &amp; re-ranking</b> — results from several query variants are merged (Reciprocal Rank Fusion) and re-scored by a cross-encoder, lifting the most relevant passages to the top.</li>
+      <li><b>Grounded citation</b> — passages carry their title, section heading, and navigation path, so the assistant can tell a user exactly where to go in the product. Internal relevance scores never leave the retrieval layer, and no internal identifiers reach the user’s answer — a page reference is passed to the model internally only so it can fetch a full page when a walkthrough needs one.</li>
+    </ul>
+  </section>
+
+  <!-- 8 -->
+  <section id="s8">
+    <div class="sechead"><span class="n">8</span><h2>Knowledge ingestion</h2></div>
+    <p>Answer quality depends on the knowledge base being correct and current. A dedicated ingestion service converts the product documentation into embedded, searchable passages — using the <em>same</em> embedding model the application queries with, so the two always agree. Its defining property: it is <strong>safe to re-run at any time</strong>, and after every run the database is an exact mirror of the source.</p>
+    <div class="tw"><table>
+      <thead><tr><th style="width:32%">Guarantee</th><th>How it is achieved</th></tr></thead>
+      <tbody>
+        <tr><td><strong>No duplicates</strong></td><td>Each page and chunk has a stable, unique identifier, so re-ingesting overwrites in place rather than creating a second copy.</td></tr>
+        <tr><td><strong>No collisions</strong></td><td>Identifiers use the full document path, so similarly-named pages in different sections never overwrite one another.</td></tr>
+        <tr><td><strong>No stale content</strong></td><td>When a page is shortened, its leftover fragments are pruned; edited content never lingers.</td></tr>
+        <tr><td><strong>Removed pages disappear</strong></td><td>After a full run, pages deleted or renamed in the source are removed, so restructured docs never surface outdated answers.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout"><span class="k">Net effect</span><p>On any re-run: new pages created, changed pages overwritten, removed pages deleted — with zero duplicates and zero stale content. The job is guarded so a failed run can never wipe the corpus.</p></div>
+  </section>
+
+  <!-- 9 -->
+  <section id="s9">
+    <div class="sechead"><span class="n">9</span><h2>Scalability &amp; performance</h2></div>
+    <p>The architecture is built so that load can be met by adding hardware to the right tier, not by re-engineering. Four properties carry the scaling story.</p>
+
+    <h3>1 · A stateless application tier scales horizontally</h3>
+    <p>The application service keeps no conversation in memory — every durable fact lives in PostgreSQL (history and orchestrator checkpoints) and Qdrant. Any replica can serve any request, so capacity for more concurrent chats is simply more identical replicas behind a load balancer. Because the service is fully asynchronous, a single replica handles many in-flight requests while they wait on model and database calls.</p>
+
+    <h3>2 · Three model lanes make inference affordable</h3>
+    <p>Model inference is the dominant cost and the main throughput constraint. The platform addresses this directly by routing each step to the cheapest model that can do it.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Lane</th><th>Model class</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td class="a">Fast</td><td>Small (≈7B)</td><td>Routing, planning, summarising — the high-volume, low-difficulty steps.</td></tr>
+        <tr><td class="a">Standard</td><td>Large (≈72B)</td><td>Composing the final grounded answer.</td></tr>
+        <tr><td class="a">Deep</td><td>Strongest</td><td>The hardest multi-step analysis — opt-in, and quota-capped.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The effect is that the expensive large model is reserved for answer composition, while the frequent bookkeeping steps run on a small, cheap model. Lanes scale as separate model deployments, so each is sized to its own demand.</p>
+
+    <h3>3 · Work is parallelised within a request</h3>
+    <ul class="clean">
+      <li>The two pre-routing model calls (attack screen and intent) run concurrently.</li>
+      <li>Independent capabilities dispatch in parallel batches, so a multi-part question is answered in the time of its slowest part, not the sum.</li>
+      <li>Roughly four in five requests skip the planning step entirely — the router writes the capability’s task inline.</li>
+    </ul>
+
+    <h3>4 · Backends scale independently</h3>
+    <p>Qdrant (sharded, replicated, with vector quantisation to cut memory) and PostgreSQL (connection-pooled, with a high-availability configuration for production) each scale on their own axis, decoupled from the application fleet and from each other. Knowledge ingestion runs offline, so refreshing the corpus never competes with live traffic.</p>
+    <div class="callout note"><span class="k">Under load</span><p>Timeouts, fail-open safety, and defined fallbacks at every node mean a traffic spike <em>degrades gracefully</em> rather than failing. Admission control (bounded concurrency returning a clean “busy” signal instead of a brownout) and per-tenant fairness quotas are the recommended next hardening step for high scale.</p></div>
+
+    <h3>5 · Cost &amp; capacity</h3>
+    <p>Cost is dominated by GPU model serving, and the three-lane scheme is the primary lever against it — the majority of calls run on the small model, and the large model is reserved for composing answers. Latency follows the same shape: a simple question returns quickly (no planning step), while a genuinely complex, multi-capability question incurs the full pipeline. Formal capacity, latency, and throughput benchmarks against production hardware are a defined pre-launch activity; they size each model lane to a measured demand model rather than an estimate.</p>
+  </section>
+
+  <!-- 10 -->
+  <section id="s10">
+    <div class="sechead"><span class="n">10</span><h2>Deployment topology</h2></div>
+    <p>The application is a standard container with no special runtime requirements, which keeps deployment cloud-agnostic and the operating model simple. It runs at three scales.</p>
+    <div class="tw"><table>
+      <thead><tr><th style="width:22%">Scale</th><th>Shape</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Single box</strong></td><td>One host running the app plus its backends via containers (Docker Compose).</td><td>Development, demos, small pilots.</td></tr>
+        <tr><td><strong>Managed services</strong></td><td>The container behind a load balancer; managed database and vector store; GPU model endpoints.</td><td>Production for a single product like the current Atlas.</td></tr>
+        <tr><td><strong>Kubernetes</strong></td><td>App as an auto-scaling Deployment (≥2 replicas); model lanes on GPU node pools scaled on queue depth; Qdrant and PostgreSQL as highly-available stateful sets.</td><td>Multi-tenant, high-volume operation.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The dividing line is deliberate: the <strong>stateless application tier scales elastically</strong> (add replicas), while the <strong>stateful and GPU tiers are provisioned to a measured capacity model</strong>. Today Atlas ships as a single product deployment with one capability enabled; broadening it is configuration, and scaling it is provisioning — neither is a redesign.</p>
+    <p><strong>Availability &amp; durability.</strong> In the scaled configurations the stateful tiers run highly available — Qdrant sharded and replicated, PostgreSQL in a primary/replica arrangement — with regular backups of both the conversation/state database and the vector store, so the loss of a node degrades service rather than interrupting it, and the knowledge base can be rebuilt from source by re-running ingestion (§8).</p>
+  </section>
+
+  <!-- 11 -->
+  <section id="s11">
+    <div class="sechead"><span class="n">11</span><h2>Security, privacy &amp; isolation</h2></div>
+    <p>Defence is layered and, importantly, <strong>aware of the assistant’s own identity</strong>, so it protects this deployment rather than a fixed persona.</p>
+    <h4>Authentication</h4>
+    <p>Every request carries two credentials: a gateway API key and a signed identity token (JWT). The service verifies both and reads the organisation, user, and roles from the token’s claims. In production, missing or invalid credentials are rejected outright.</p>
+    <h4>Attack defence (input)</h4>
+    <p>A fast pattern layer plus an always-on classifier detect attempts to manipulate the assistant — overriding its instructions, extracting its configuration, or jailbreaking it. The classifier judges attacks <em>on the assistant only</em>; an unusual or off-topic but harmless question is never treated as a threat.</p>
+    <p>If the classifier step is slow to respond, the system prioritises availability and lets the request proceed rather than blocking the user — a deliberate trade-off. The residual exposure is limited: the fast pattern layer is <em>not</em> subject to that timeout and still runs, and the output filter (below) always runs regardless. The enterprise hardening on the roadmap tightens this further.</p>
+    <h4>Privacy (output)</h4>
+    <p>Every answer — from a capability, a conversational reply, or a redirect — passes a filter that removes personal data (PII: names, contact, financial and health identifiers) and blocks any leak of the system’s own instructions. Redaction also applies to the live token stream, so nothing sensitive appears even momentarily.</p>
+    <h4>Data residency</h4>
+    <p>The language, embedding, and re-ranking models are <strong>self-hosted on our own infrastructure</strong> (OpenAI-compatible — e.g. Qwen served on vLLM/SGLang). Customer questions and retrieved content are processed <strong>inside our perimeter and are not sent to any third-party AI provider</strong> — a deliberate choice for a security product handling sensitive data. A managed external model is a supported configuration option, but is not used for sensitive deployments.</p>
+    <h4>External capabilities</h4>
+    <p>Connecting a capability served by an <em>external</em> tool server (over MCP) introduces a trust boundary: the relevant query context may leave our perimeter to reach it. Such servers are vetted before enablement, calls carry a short-lived, organisation-scoped credential, and any state-changing external action is designed to require explicit human approval. The capability shipping today (the product guide) is in-perimeter retrieval only, so no such boundary is crossed in the current deployment.</p>
+    <h4>Tenant isolation</h4>
+    <p>Isolation is enforced by <strong>explicit organisation scoping on every query</strong>: identity establishes the organisation, and every vector search and database read is filtered to it — a tenant can only see content marked public or tagged to it, and deleted content is never returned. Database-enforced row-level security is the recommended additional layer for production hardening.</p>
+    <div class="callout note"><span class="k">Note on current vs. hardened state</span><p>The controls above are implemented today. Enterprise-grade additions on the roadmap — database row-level security, external identity (OIDC), rate limiting, and human approval gates for any state-changing action — are provisioned for but not all wired in the current single-capability deployment.</p></div>
+  </section>
+
+  <!-- 12 -->
+  <section id="s12">
+    <div class="sechead"><span class="n">12</span><h2>Extensibility &amp; roadmap</h2></div>
+    <p>Adding a capability requires <strong>no changes to the orchestrator, router, planner, or persona</strong>. A capability registers itself, and everything downstream — routing, planning, the advertised personality, the metadata endpoint, and the user interface — adapts automatically.</p>
+    <ul class="clean">
+      <li><b>An in-house capability</b> is a small module plus one registration line.</li>
+      <li><b>An external capability</b> served over the Model Context Protocol is <em>configuration only</em>: declare its address and description, and it is discovered and wired in at start-up.</li>
+    </ul>
+    <pre class="code"><span class="c"># adding a third-party “Brand Protection” capability — no code change</span>
+<span class="k">MCP_SERVERS</span>={<span class="s">"brand"</span>: {<span class="s">"url"</span>:<span class="s">"https://brand-mcp/mcp"</span>,
+  <span class="s">"display_name"</span>:<span class="s">"Brand Protection"</span>,
+  <span class="s">"description"</span>:<span class="s">"Monitors brand abuse, phishing, typosquatting."</span>}}</pre>
+    <h3>Roadmap</h3>
+    <ul class="clean">
+      <li><b>Near term</b> — enable the Sentinel (reports) and external-attack-surface specialists behind the same FortiRecon Assistant front end.</li>
+      <li><b>Answer-quality assurance</b> — an automated “judge” pass that critiques answer <em>quality</em>, not merely whether content was found.</li>
+      <li><b>Enterprise hardening</b> — database row-level security, external identity (OIDC), rate limiting, and approval gates for state-changing actions.</li>
+      <li><b>Routing at scale</b> — the current design serves roughly fifteen to twenty capabilities on one router; beyond that, an embedding-based capability index takes over.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="s13">
+    <div class="sechead"><span class="n">13</span><h2>Operational readiness</h2></div>
+    <div class="tw"><table>
+      <thead><tr><th style="width:28%">Concern</th><th>Provision</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Reliability</strong></td><td>Every model-calling step has a timeout, and every node has a defined fallback — the system degrades gracefully rather than hanging or failing.</td></tr>
+        <tr><td><strong>Responsiveness</strong></td><td>Answers stream token-by-token; most requests skip the planning step; independent work runs in parallel.</td></tr>
+        <tr><td><strong>Continuity</strong></td><td>Multi-turn memory via a rolling summary plus a recent-message window; orchestrator state is checkpointed durably in PostgreSQL, so long runs are resumable.</td></tr>
+        <tr><td><strong>Observability</strong></td><td>Structured tracing across the pipeline; a metadata endpoint exposes the live identity for any client.</td></tr>
+        <tr><td><strong>Verification</strong></td><td>An automated routing test-suite asserts which capabilities run for representative queries, guarding against regressions.</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout note"><span class="k">Known limits — stated plainly</span><p>Routing on a single prompt scales to roughly twenty capabilities; the reflection loop recovers from <em>empty</em> results but does not yet judge answer <em>quality</em>. Both are on the roadmap and neither affects the current single-capability deployment.</p></div>
+  </section>
+
+  <!-- APPENDIX -->
+  <section id="sa" class="appendix">
+    <div class="sechead"><span class="n">A</span><h2>Appendix — glossary &amp; stack</h2></div>
+    <h3>Glossary</h3>
+    <dl class="gloss">
+      <dt>Orchestrator / supervisor</dt><dd>The single agent that talks to the user and coordinates the specialist capabilities.</dd>
+      <dt>Capability (sub-agent)</dt><dd>A specialist that performs a bounded task — e.g. searching the product documentation.</dd>
+      <dt>Stateless service</dt><dd>An application process that stores no session in memory, so any copy can serve any request — the basis of horizontal scaling.</dd>
+      <dt>Lane</dt><dd>A model tier chosen for a step by cost/difficulty — fast, standard, or deep.</dd>
+      <dt>Derived identity</dt><dd>The assistant’s name, scope, and boundaries, generated at start-up from the enabled capabilities.</dd>
+      <dt>RAG (retrieval-augmented generation)</dt><dd>Answering from retrieved source passages rather than the model’s memory, so answers are grounded and citable.</dd>
+      <dt>Guardrail</dt><dd>An automated safety/privacy check on inputs and outputs.</dd>
+      <dt>PII</dt><dd>Personally identifiable information — names, contact details, and financial or health identifiers that must be redacted.</dd>
+      <dt>MCP (Model Context Protocol)</dt><dd>An open standard for connecting external tools/capabilities to an assistant.</dd>
+      <dt>Checkpoint</dt><dd>A durable snapshot of orchestrator state, so a run can resume after interruption.</dd>
+    </dl>
+    <h3>Technology stack</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Layer</th><th>Technology</th></tr></thead>
+      <tbody>
+        <tr><td>Application</td><td>Python · FastAPI (async) · LangGraph deterministic orchestration</td></tr>
+        <tr><td>Language models</td><td>Self-hostable, OpenAI-compatible — e.g. Qwen on vLLM / SGLang (three lanes)</td></tr>
+        <tr><td>Retrieval</td><td>Qdrant vector database · TEI embeddings &amp; cross-encoder re-ranker</td></tr>
+        <tr><td>Privacy</td><td>Presidio-based PII detection &amp; redaction</td></tr>
+        <tr><td>State &amp; memory</td><td>PostgreSQL — conversation store + durable graph checkpoints (org-scoped queries)</td></tr>
+        <tr><td>Extensibility</td><td>Model Context Protocol for external capabilities</td></tr>
+        <tr><td>Observability</td><td>Structured tracing (Langfuse-compatible) &amp; metrics</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <footer>
+    <span>FORTIRECON ASSISTANT · SYSTEM ARCHITECTURE · v1.3 · 18 JULY 2026</span>
+    <span>INTERNAL · FOR REVIEW</span>
+  </footer>
+</div>
