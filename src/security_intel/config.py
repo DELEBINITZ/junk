@@ -15,11 +15,12 @@ class Settings(BaseSettings):
     # Leave blank to auto-derive a name/tagline from whichever agents are active —
     # so a userguide-only deployment presents as a product guide, a reports+easm
     # deployment as a security analyst, with no code change.
-    assistant_name: str = "Atlas"  # blank = auto-derive from enabled agents
-    # Atlas is THE agent; its capabilities (product guide today, more later) come from
-    # the enabled sub-agents. Keep the tagline capability-agnostic so it stays right as
-    # capabilities grow. Blank = auto-derive.
-    assistant_tagline: str = "your friendly FortiRecon assistant"
+    # The MASTER/orchestrator's user-facing identity. This is NOT a specialist agent —
+    # the specialists (Atlas = product guide, Sentinel = reports, …) are internal, and
+    # the master answers in one consistent voice. Blank = auto-derive a neutral name.
+    assistant_name: str = "FortiRecon Assistant"
+    # Capability-agnostic so it stays right as specialists are added. Blank = auto-derive.
+    assistant_tagline: str = "a knowledgeable assistant for the FortiRecon platform"
 
     # Capability gating — which agents are active. Comma-separated allowlist of agent
     # ids (e.g. "userguide" or "reports,userguide"). BLANK = every agent that is

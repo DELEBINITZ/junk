@@ -113,7 +113,7 @@ def register_light_agents(registry, settings) -> None:
     from security_intel.prompts.userguide import USER_GUIDE_SYSTEM_PROMPT
 
     registry.register(AgentSpec(
-        id="reports", display_name="Security Reports Agent",
+        id="reports", display_name="Sentinel", domain_label="security reports & threat intelligence",
         description="Searches security reports corpus (threat intel, AI-generated reports).",
         capabilities=["Semantic search over security reports", "Filter by threat type/TLP",
                       "Get report metadata"],
@@ -121,7 +121,7 @@ def register_light_agents(registry, settings) -> None:
         mode="tool_call", primary_tool="search_reports",
     ))
     registry.register(AgentSpec(
-        id="userguide", display_name="FortiRecon Product Guide",
+        id="userguide", display_name="Atlas", domain_label="FortiRecon product guidance",
         description="Helps you use the FortiRecon platform: how-to, navigation, dashboards, "
                     "features, and configuration, from the product documentation.",
         capabilities=["Explain dashboards/menus/features", "Step-by-step how-to",

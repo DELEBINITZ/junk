@@ -97,8 +97,11 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
         reports_tools = get_reports_tools(settings, enricher=_enricher("security reports corpus"))
         registry.register(
             AgentSpec(
+                # Sentinel: the reports specialist (internal name). domain_label is the
+                # user-facing capability area the master advertises.
                 id="reports",
-                display_name="Security Reports Agent",
+                display_name="Sentinel",
+                domain_label="security reports & threat intelligence",
                 description="Searches security reports corpus (threat intel, ai generated reports and more). ",
                 capabilities=[
                     "Semantic search over security reports",
@@ -131,11 +134,12 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
         )
         registry.register(
             AgentSpec(
-                # id stays "userguide" (internal capability key, tied to the docs corpus).
-                # display_name is a CAPABILITY of Atlas, phrased as such — Atlas is the
-                # agent; helping with the product/user guide is one thing it can do.
+                # id stays "userguide" (internal capability key, tied to the docs corpus);
+                # display_name is the specialist's INTERNAL name; domain_label is what the
+                # master advertises to users. Atlas answers product/user-guide questions.
                 id="userguide",
-                display_name="FortiRecon Product Guide",
+                display_name="Atlas",
+                domain_label="FortiRecon product guidance",
                 description=(
                     "Helps you use the FortiRecon platform: step-by-step how-to, navigation, "
                     "dashboards, features, and configuration — answered from the product "
@@ -176,6 +180,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
                 AgentSpec(
                     id="easm",
                     display_name="EASM Agent",
+                    domain_label="external attack surface",
                     description="Queries external attack surface (assets, exposures, changes, rescans). "
                     "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
                     capabilities=[
@@ -224,6 +229,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
             AgentSpec(
                 id=agent_id,
                 display_name=display_name,
+                domain_label=server_cfg.get("domain_label", ""),
                 description=description,
                 capabilities=capabilities,
                 tools=tools,

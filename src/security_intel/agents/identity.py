@@ -28,7 +28,7 @@ def _strip_agent_suffix(display_name: str) -> str:
 class SystemProfile:
     """The assistant's derived identity, threaded into every persona-bearing prompt.
 
-    - name:     what the assistant calls itself ("FortiRecon User Guide Assistant").
+    - name:     the MASTER's user-facing name ("FortiRecon Assistant") — never a specialist's.
     - tagline:  one-line role, spoken in first person context ("a friendly guide …").
     - scope:    multi-line bullets of what it can actually help with (from the agents).
     - domains:  short comma list of capability labels, used in scope/boundary sentences.
@@ -59,13 +59,17 @@ def build_system_profile(registry, settings) -> SystemProfile:
     specs = [registry.get_spec(a) for a in registry.agent_ids]
     specs = [s for s in specs if s]
 
-    labels = [_strip_agent_suffix(s.display_name) for s in specs]
+    # User-facing capability AREA per specialist (NOT the internal agent name). The
+    # master advertises what it can do, not who does it — specialist names are internal.
+    def _domain(s) -> str:
+        return s.domain_label or _strip_agent_suffix(s.display_name)
+
+    labels = [_domain(s) for s in specs]
 
     scope_lines = []
     for s in specs:
         desc = " ".join((s.description or "").split())  # collapse whitespace/newlines
-        label = _strip_agent_suffix(s.display_name)
-        scope_lines.append(f"- {label}: {desc}" if desc else f"- {label}")
+        scope_lines.append(f"- {_domain(s)}: {desc}" if desc else f"- {_domain(s)}")
     scope = "\n".join(scope_lines) if scope_lines else (
         "- (No capabilities are currently enabled.)"
     )
@@ -73,25 +77,19 @@ def build_system_profile(registry, settings) -> SystemProfile:
     domains = ", ".join(labels) if labels else "your configured capabilities"
     single = len(specs) == 1
 
-    # --- Name ---
+    # --- Master name --- NEVER derived from a specialist's name (they are internal).
     if settings.assistant_name:
         name = settings.assistant_name
-    elif single:
-        name = f"{labels[0]} Assistant"
-    elif labels:
-        name = "Intelligence Assistant"
     else:
         name = "Assistant"
 
     # --- Tagline ---
     if settings.assistant_tagline:
         tagline = settings.assistant_tagline
-    elif single:
-        tagline = f"a friendly, knowledgeable assistant for {labels[0]}"
     elif labels:
-        tagline = f"a friendly, knowledgeable assistant that helps with {domains}"
+        tagline = f"a knowledgeable assistant that helps with {domains}"
     else:
-        tagline = "a friendly, knowledgeable assistant"
+        tagline = "a knowledgeable assistant"
 
     return SystemProfile(
         name=name,

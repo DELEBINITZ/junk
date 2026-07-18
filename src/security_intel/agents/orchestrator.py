@@ -129,8 +129,10 @@ def build_orchestrator(
         for aid in registry.agent_ids:
             spec = registry.get_spec(aid)
             if spec:
+                # Advertise the capability AREA, not the internal specialist name.
+                label = spec.domain_label or spec.display_name
                 caps = "; ".join(spec.capabilities[:3]) if spec.capabilities else spec.description
-                lines.append(f"- {spec.display_name}: {caps}")
+                lines.append(f"- {label}: {caps}")
         return "\n".join(lines) if lines else f"- {profile.domains}"
 
     capability_block = _capability_block()

@@ -59,14 +59,17 @@ async def meta(request: Request):
     if not profile:
         return {"name": "Assistant", "tagline": "", "domains": "", "agents": []}
 
-    agents = []
+    # User-facing capability areas the master advertises. Specialist names (Atlas,
+    # Sentinel, …) are INTERNAL and deliberately not surfaced here — the master is one
+    # voice. `id` is kept for clients that need a stable key.
+    capabilities = []
     if registry:
         for aid in registry.agent_ids:
             spec = registry.get_spec(aid)
             if spec:
-                agents.append({
+                capabilities.append({
                     "id": aid,
-                    "name": spec.display_name,
+                    "name": spec.domain_label or spec.display_name,
                     "description": " ".join((spec.description or "").split()),
                     "capabilities": spec.capabilities,
                 })
@@ -76,7 +79,7 @@ async def meta(request: Request):
         "tagline": profile.tagline,
         "domains": profile.domains,
         "scope": profile.scope,
-        "agents": agents,
+        "capabilities": capabilities,
     }
 
 

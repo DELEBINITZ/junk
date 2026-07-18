@@ -36,9 +36,14 @@ class AgentSpec:
     """
 
     id: str
-    display_name: str
+    display_name: str  # the specialist's INTERNAL name (e.g. "Atlas", "Sentinel")
     description: str
     capabilities: list[str]
+    # User-facing capability AREA the master advertises (e.g. "FortiRecon product
+    # guidance"). Kept separate from display_name because specialist names are internal
+    # — the master speaks in one voice about capabilities, not agent names. Blank falls
+    # back to display_name.
+    domain_label: str = ""
     # Optional — react agents auto-registered from config (e.g. MCP servers) leave this
     # blank and get a generated prompt (see prompts/agent.render_agent_system_prompt).
     system_prompt: str = ""
