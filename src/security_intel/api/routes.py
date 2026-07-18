@@ -26,6 +26,32 @@ logger = get_logger("api")
 router = APIRouter(prefix="/v1")
 
 
+def _trace_enrichment(request: Request, sc: SecurityContext, session_id: str,
+                      trace_id: str, message: str, route: str) -> dict:
+    """Shared Langfuse trace attributes so every chat trace is filterable + self-explaining.
+
+    metadata -> structured context on the trace; tags -> Langfuse's filterable chips.
+    Keep both call sites (POST /chat and the SSE stream) identical so traces are uniform.
+    """
+    st = request.app.state.settings
+    agents = st.enabled_agents_list
+    return dict(
+        user_id=sc.user_id,
+        session_id=session_id,
+        metadata={
+            "org_id": sc.org_id,
+            "trace_id": trace_id,           # correlate the Langfuse trace with app logs
+            "roles": list(sc.roles),
+            "environment": st.environment,
+            "release": st.app_version,
+            "route": route,
+            "query_chars": len(message or ""),
+            "enabled_agents": agents,
+        },
+        tags=[route, f"env:{st.environment}", *[f"agent:{a}" for a in agents]],
+    )
+
+
 @router.get("/metrics")
 async def metrics_endpoint():
     """Prometheus scrape endpoint — latency/token/cost histograms, per-agent and
@@ -156,9 +182,7 @@ async def chat(
         config = traced_config(
             config, langfuse,
             trace_name="chat",
-            user_id=sc.user_id,
-            session_id=session_id,
-            metadata={"org_id": sc.org_id, "trace_id": trace_id},
+            **_trace_enrichment(request, sc, session_id, trace_id, body.message, "chat"),
         )
 
     input_state = {
@@ -227,6 +251,8 @@ async def chat_stream(
     """SSE streaming endpoint. Streams events from LangGraph's astream_events."""
     orchestrator = request.app.state.orchestrator
     sid = session_id or f"sess_{uuid4().hex[:12]}"
+    trace_id = new_trace_id()
+    set_trace_context(trace_id=trace_id, org_id=sc.org_id)
 
     config = RunnableConfig(
         configurable={
@@ -244,9 +270,7 @@ async def chat_stream(
         config = traced_config(
             config, langfuse,
             trace_name="chat_stream",
-            user_id=sc.user_id,
-            session_id=sid,
-            metadata={"org_id": sc.org_id},
+            **_trace_enrichment(request, sc, sid, trace_id, message, "chat_stream"),
         )
 
     input_state = {

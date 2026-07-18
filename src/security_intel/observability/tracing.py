@@ -69,14 +69,19 @@ def get_langfuse_handler(settings: Settings) -> LangfuseCallbackHandler | None:
         try:
             from langfuse import Langfuse
 
+            # `environment` + `release` populate Langfuse's built-in filters (filter traces
+            # by staging/prod, correlate a regression to a release) — cheap, high-value.
             Langfuse(
                 public_key=settings.langfuse_public_key,
                 secret_key=settings.langfuse_secret_key,
                 host=settings.langfuse_host,
+                environment=getattr(settings, "environment", "") or None,
+                release=getattr(settings, "app_version", "") or None,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Langfuse client init failed: {e}")
-            return None
+            # Non-fatal: fall through and still build the handler. It can auto-resolve a
+            # client from the env vars set above; killing tracing over this is worse.
+            logger.warning(f"Langfuse client init warning (continuing): {e}")
 
     try:
         handler = _make_handler(
@@ -99,10 +104,12 @@ def traced_config(
     user_id: str = "",
     session_id: str = "",
     metadata: dict | None = None,
+    tags: list[str] | None = None,
 ) -> RunnableConfig:
-    """Enrich a RunnableConfig with Langfuse tracing callbacks.
+    """Enrich a RunnableConfig with Langfuse tracing callbacks + trace attributes.
 
-    Creates a fresh handler per trace so each request gets its own trace in Langfuse.
+    ``tags`` become filterable Langfuse tags (e.g. route type, enabled agents); ``metadata``
+    is arbitrary structured context shown on the trace. Both make traces searchable later.
     """
     if not langfuse_handler:
         return base_config
@@ -124,6 +131,7 @@ def traced_config(
                 trace_name=trace_name or "orchestrator",
                 user_id=user_id,
                 session_id=session_id,
+                tags=tags or [],
                 metadata=metadata or {},
             )
             callbacks.append(trace_handler)
@@ -140,6 +148,8 @@ def traced_config(
             meta["langfuse_user_id"] = user_id
         if session_id:
             meta["langfuse_session_id"] = session_id
+        if tags:
+            meta["langfuse_tags"] = list(tags)
         if metadata:
             meta.update(metadata)
 
