@@ -24,6 +24,7 @@ except Exception:  # noqa: BLE001
 from langchain_core.runnables import RunnableConfig
 
 from security_intel.config import Settings
+from security_intel.observability.langfuse_client import init_langfuse_client
 from security_intel.observability.logging import get_logger
 
 logger = get_logger("tracing")
@@ -62,26 +63,14 @@ def get_langfuse_handler(settings: Settings) -> LangfuseCallbackHandler | None:
     os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.langfuse_secret_key)
 
     # langfuse 3.x/4.x: the CallbackHandler holds no credentials — it resolves its client
-    # via get_client(public_key=…). Unless a Langfuse client for that key was constructed
-    # (which registers it), the handler silently "skips tracing (no client initialized)".
-    # So construct the client here. langfuse 2.x needs none (creds live on the handler).
+    # via get_client(). Unless the shared client was constructed (which registers it), the
+    # handler silently "skips tracing (no client initialized)". Initialize the ONE shared
+    # client so tracing + prompt management resolve the identical instance. langfuse 2.x
+    # needs none (creds live on the handler).
     if not _CTOR_TAKES_CREDS:
-        try:
-            from langfuse import Langfuse
-
-            # `environment` + `release` populate Langfuse's built-in filters (filter traces
-            # by staging/prod, correlate a regression to a release) — cheap, high-value.
-            Langfuse(
-                public_key=settings.langfuse_public_key,
-                secret_key=settings.langfuse_secret_key,
-                host=settings.langfuse_host,
-                environment=getattr(settings, "environment", "") or None,
-                release=getattr(settings, "app_version", "") or None,
-            )
-        except Exception as e:  # noqa: BLE001
-            # Non-fatal: fall through and still build the handler. It can auto-resolve a
-            # client from the env vars set above; killing tracing over this is worse.
-            logger.warning(f"Langfuse client init warning (continuing): {e}")
+        # Non-fatal: if this returns None we still build the handler (it can auto-resolve
+        # from the env vars set above); killing tracing over a client hiccup is worse.
+        init_langfuse_client(settings)
 
     try:
         handler = _make_handler(
