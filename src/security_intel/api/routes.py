@@ -237,6 +237,18 @@ async def chat_stream(
         }
     )
 
+    # Langfuse tracing — the UI uses THIS streaming endpoint, so without this wrap no
+    # chat produced a trace (the POST /chat path had it; the stream path did not).
+    langfuse = getattr(request.app.state, "langfuse_handler", None)
+    if langfuse:
+        config = traced_config(
+            config, langfuse,
+            trace_name="chat_stream",
+            user_id=sc.user_id,
+            session_id=sid,
+            metadata={"org_id": sc.org_id},
+        )
+
     input_state = {
         "messages": [HumanMessage(content=message)],
         "history": [],

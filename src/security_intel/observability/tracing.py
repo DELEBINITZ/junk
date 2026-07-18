@@ -39,6 +39,12 @@ _HANDLER_PARAMS = (
     if LangfuseCallbackHandler is not None else set()
 )
 
+# langfuse 2.x takes credentials + trace attributes (user_id/session_id/trace_name) in
+# the CONSTRUCTOR. langfuse 3.x/4.x take only public_key and read those attributes from
+# per-run METADATA keys (langfuse_user_id / langfuse_session_id / langfuse_trace_name).
+# Detect which by signature so we adapt without pinning a version.
+_CTOR_TAKES_CREDS = "secret_key" in _HANDLER_PARAMS
+
 
 def _make_handler(**kwargs) -> LangfuseCallbackHandler:
     """Build handler with only params the installed version accepts."""
@@ -54,6 +60,23 @@ def get_langfuse_handler(settings: Settings) -> LangfuseCallbackHandler | None:
     os.environ.setdefault("LANGFUSE_HOST", settings.langfuse_host)
     os.environ.setdefault("LANGFUSE_PUBLIC_KEY", settings.langfuse_public_key)
     os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.langfuse_secret_key)
+
+    # langfuse 3.x/4.x: the CallbackHandler holds no credentials — it resolves its client
+    # via get_client(public_key=…). Unless a Langfuse client for that key was constructed
+    # (which registers it), the handler silently "skips tracing (no client initialized)".
+    # So construct the client here. langfuse 2.x needs none (creds live on the handler).
+    if not _CTOR_TAKES_CREDS:
+        try:
+            from langfuse import Langfuse
+
+            Langfuse(
+                public_key=settings.langfuse_public_key,
+                secret_key=settings.langfuse_secret_key,
+                host=settings.langfuse_host,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Langfuse client init failed: {e}")
+            return None
 
     try:
         handler = _make_handler(
@@ -84,26 +107,42 @@ def traced_config(
     if not langfuse_handler:
         return base_config
 
+    # Preserve every existing key (configurable, recursion_limit, tags, …); only augment
+    # callbacks + metadata. Rebuilding from scratch previously dropped fields.
+    new_config = dict(base_config)
     callbacks = list(base_config.get("callbacks", []) or [])
+    meta = dict(base_config.get("metadata", {}) or {})
 
-    try:
-        trace_handler = _make_handler(
-            public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
-            secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
-            host=os.environ.get("LANGFUSE_HOST", ""),
-            url=os.environ.get("LANGFUSE_HOST", ""),
-            trace_name=trace_name or "orchestrator",
-            user_id=user_id,
-            session_id=session_id,
-            metadata=metadata or {},
-        )
-        callbacks.append(trace_handler)
-    except Exception as e:
-        logger.warning(f"Failed to create trace handler: {e}")
+    if _CTOR_TAKES_CREDS:
+        # langfuse 2.x — a fresh per-trace handler carries the attributes in its constructor.
+        try:
+            trace_handler = _make_handler(
+                public_key=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
+                secret_key=os.environ.get("LANGFUSE_SECRET_KEY", ""),
+                host=os.environ.get("LANGFUSE_HOST", ""),
+                url=os.environ.get("LANGFUSE_HOST", ""),
+                trace_name=trace_name or "orchestrator",
+                user_id=user_id,
+                session_id=session_id,
+                metadata=metadata or {},
+            )
+            callbacks.append(trace_handler)
+        except Exception as e:
+            logger.warning(f"Failed to create trace handler: {e}")
+            callbacks.append(langfuse_handler)
+    else:
+        # langfuse 3.x/4.x — reuse the shared handler; trace attributes travel as the
+        # metadata keys the handler reads off each run.
         callbacks.append(langfuse_handler)
+        if trace_name:
+            meta["langfuse_trace_name"] = trace_name
+        if user_id:
+            meta["langfuse_user_id"] = user_id
+        if session_id:
+            meta["langfuse_session_id"] = session_id
+        if metadata:
+            meta.update(metadata)
 
-    return RunnableConfig(
-        configurable=base_config.get("configurable", {}),
-        callbacks=callbacks,
-        recursion_limit=base_config.get("recursion_limit"),
-    )
+    new_config["callbacks"] = callbacks
+    new_config["metadata"] = meta
+    return new_config

@@ -86,6 +86,14 @@ COLLECTION_NAME = os.getenv("USER_GUIDE_COLLECTION", "user_guide_kb")  # MUST eq
 SOURCE = os.getenv("GUIDE_SOURCE", "fortirecon_user_guide")
 GUIDE_VERSION = os.getenv("GUIDE_VERSION", "26.2.a")
 GUIDE_PRODUCT = os.getenv("GUIDE_PRODUCT", "FortiRecon")
+# Canonical doc URL is reconstructed from each page's own <meta data-pageid> (present
+# in every MadCap offline export) + the title slug — so offline pages get an exact,
+# citable docs.fortinet.com link with ZERO manual mapping. The numeric pageid is
+# authoritative on the live site (the slug is cosmetic; a wrong slug still resolves).
+DOCS_URL_TEMPLATE = os.getenv(
+    "DOCS_URL_TEMPLATE",
+    "https://docs.fortinet.com/document/{product}/{version}/user-guide/{pageid}/{slug}",
+)
 DELETE_FIRST = os.getenv("REINDEX_DELETE_FIRST", "0") == "1"
 # Full-sync: after a COMPLETE --html-dir ingest, delete pages that vanished from the
 # source (removed or renamed) so the collection always matches the current docs. On by
@@ -243,12 +251,44 @@ def _extract_canonical_url(soup: BeautifulSoup) -> str:
     return ""
 
 
+def _slugify(text: str) -> str:
+    """Title -> URL slug ('Adding watermarks' -> 'adding-watermarks')."""
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+def _extract_pageid(soup: BeautifulSoup) -> str:
+    """Numeric page id from the MadCap export's <meta data-pageid="630160" ...>.
+
+    This id is exactly the number in the live URL (.../user-guide/630160/...), so it
+    lets an OFFLINE page (which ships no canonical <link>) still be cited with its real
+    docs URL — no hand-maintained filename->URL table.
+    """
+    m = soup.find("meta", attrs={"data-pageid": True})
+    return (m.get("data-pageid") or "").strip() if m else ""
+
+
+def _canonical_url_from_pageid(pageid: str, title: str) -> str:
+    """Build the live docs URL from the page id + title slug (empty if no pageid)."""
+    if not pageid:
+        return ""
+    return DOCS_URL_TEMPLATE.format(
+        product=re.sub(r"\s+", "", GUIDE_PRODUCT).lower(),
+        version=GUIDE_VERSION,
+        pageid=pageid,
+        slug=_slugify(title) or "page",
+    )
+
+
 # Leaf block tags whose text is emitted as ONE atomic block. Deliberately does NOT
 # include container tags (td/tr/div): descending into a container AND matching its
 # child <p> double-counts the same text — the source of the duplicate chunks seen
 # on the Fortinet pages (their module lists are 2-column tables of <td><p>…).
 _LEAF_BLOCKS = ("p", "li", "pre", "blockquote", "figcaption", "dt", "dd")
-_HEADINGS = ("h1", "h2", "h3", "h4")
+# MadCap Flare (the Fortinet offline export) uses h5/h6 for procedure lead-ins
+# ("To create a digital watermark:", "To edit…"). Excluding them silently DROPPED
+# that text (h5/h6 are neither a recursed wrapper nor a leaf block). Include them so
+# the lead-in survives AND becomes the chunk's heading (feeds the embed prefix).
+_HEADINGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 
 
 def _table_rows(table) -> list[str]:
@@ -385,6 +425,7 @@ def parse_html(html: str, fallback_url: str = "") -> dict | None:
     # Resolve URL + hierarchy from the FULL document BEFORE stripping chrome — the
     # nav tree (ul.toc) is chrome we otherwise remove.
     url = _extract_canonical_url(soup) or fallback_url
+    pageid = _extract_pageid(soup)  # read before chrome strip (meta lives in <head>)
     pre_title = _extract_title(soup, soup)
     section_path = _breadcrumb_from_toc(soup, url, pre_title)
 
@@ -399,7 +440,13 @@ def parse_html(html: str, fallback_url: str = "") -> dict | None:
     if not section_path or section_path[-1] != title:
         if title not in section_path:
             section_path = [*section_path, title] if section_path else [title]
-    return {"title": title, "url": url, "sections": sections, "section_path": section_path}
+    return {
+        "title": title,
+        "url": url,
+        "pageid": pageid,
+        "sections": sections,
+        "section_path": section_path,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +549,12 @@ def _breadcrumb_from_path(rel_id: str, title: str) -> list[str]:
 def build_points(page: dict, fallback_id: str) -> list[models.PointStruct]:
     title = page["title"]
     url = page.get("url", "")
-    doc_id = _doc_id(url, fallback_id)
+    doc_id = _doc_id(url, fallback_id)  # identity: unchanged (empty url -> folder id)
+    # User-facing citation link. Offline pages have no canonical <link>, so synthesize
+    # the live docs URL from the page's own <meta data-pageid> + title slug. This is
+    # citation-only — it deliberately does NOT feed doc_id, so re-ingest stays an
+    # in-place update with no id churn.
+    citation_url = url or _canonical_url_from_pageid(page.get("pageid", ""), title)
     section_path = page.get("section_path") or [title]
     # No real hierarchy from the page (offline export: no ToC/URL) -> rebuild it from
     # the file's folder path so breadcrumbs and "where do I go" answers still work.
@@ -547,7 +599,7 @@ def build_points(page: dict, fallback_id: str) -> list[models.PointStruct]:
                     "source": SOURCE,
                     "title": title,
                     "heading": heading,
-                    "url": url,
+                    "url": citation_url,
                     "section": f"chunk {idx}",
                     # section hierarchy from the nav tree — user-facing nav path +
                     # filterable ancestry (e.g. show me EASM pages).
@@ -562,7 +614,7 @@ def build_points(page: dict, fallback_id: str) -> list[models.PointStruct]:
                         "chunk_index": idx,
                         "total_chunks": total,
                         "heading": heading,
-                        "url": url,
+                        "url": citation_url,
                         "breadcrumb": breadcrumb,
                         "section_path": section_path,
                         "product": GUIDE_PRODUCT,

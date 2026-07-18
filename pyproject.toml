@@ -15,6 +15,9 @@ dependencies = [
     "langchain-core>=0.3",
     "langchain-openai>=0.3",
     "langchain-mcp-adapters>=0.3,<0.4",
+    # langfuse>=3's langchain callback integration imports the `langchain` umbrella for a
+    # version check; without it the CallbackHandler import fails and tracing silently disables.
+    "langchain>=0.3",
     # LangGraph checkpointing
     "langgraph-checkpoint-postgres>=2.0",
     # API
