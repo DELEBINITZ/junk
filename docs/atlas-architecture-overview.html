@@ -207,7 +207,7 @@
 
     <div class="abstract">
       <h2>Executive summary</h2>
-      <p><strong>FortiRecon Assistant is a conversational AI platform that adapts its identity and abilities to whatever capabilities we enable.</strong> A master orchestrator coordinates a team of named specialist agents — <strong>Atlas</strong> (product guidance) today, <strong>Sentinel</strong> (security reports) and an external-attack-surface agent next — and answers the user in one consistent voice. Today only Atlas is enabled, so the assistant presents as a product guide; the same system, unchanged, becomes a security analyst the moment further specialists are switched on.</p>
+      <p><strong>FortiRecon Assistant is a conversational AI platform that adapts its identity and abilities to whatever capabilities we enable.</strong> A master orchestrator coordinates a team of named specialist agents — <strong>Atlas</strong> (product guidance) today, <strong>Sentinel</strong> (security reports) and <strong>Aura</strong> (external attack surface) next — and answers the user in one consistent voice. Today only Atlas is enabled, so the assistant presents as a product guide; the same system, unchanged, becomes a security analyst the moment further specialists are switched on.</p>
       <p>The platform is organised in three tiers: a <strong>stateless application service</strong> that holds the agent logic, a <strong>model-serving tier</strong> (language, embedding, and re-ranking models on GPUs) shared across the fleet, and a <strong>data tier</strong> (a vector database and PostgreSQL). This separation is the basis of its scalability — the application scales horizontally, while the expensive model tier scales independently and is used economically through a three-lane routing scheme that sends most work to a small, cheap model.</p>
       <p>Two design decisions define the product. First, <strong>the assistant’s persona, scope, and boundaries are derived automatically from its enabled capabilities</strong> — one platform serves many products without a rebuild. Second, <strong>it never cold-rejects a valid request or leaves a user at a dead-end.</strong> A prior version rejected legitimate questions as “out of scope”; the architecture now makes that structurally impossible — anything it cannot do is met with a graceful, guiding response. This document covers the whole system: its components, a request’s journey through them, how the platform scales and deploys, and its security and operational posture.</p>
     </div>
@@ -368,12 +368,12 @@
       <tbody>
         <tr><td class="a">Atlas <span style="color:var(--good)">· enabled</span></td><td>FortiRecon product guidance</td><td>Product documentation (vector store)</td></tr>
         <tr><td class="a">Sentinel <span style="color:var(--faint)">· planned</span></td><td>Security reports &amp; threat intelligence</td><td>Reports corpus (vector store)</td></tr>
-        <tr><td class="a">EASM agent <span style="color:var(--faint)">· future</span></td><td>External attack surface</td><td>EASM data via an external (MCP) service</td></tr>
+        <tr><td class="a">Aura <span style="color:var(--faint)">· future</span></td><td>External attack surface</td><td>EASM data via an external (MCP) service</td></tr>
       </tbody>
     </table></div>
     <pre class="code"><span class="c"># one configuration value reshapes the whole system — no code change</span>
-<span class="k">ENABLED_AGENTS</span>=userguide                 <span class="c"># ship today: only the Atlas specialist</span>
-<span class="k">ENABLED_AGENTS</span>=reports,easm,userguide    <span class="c"># later: add Sentinel + the EASM agent</span></pre>
+<span class="k">ENABLED_AGENTS</span>=atlas                     <span class="c"># ship today: only the Atlas specialist</span>
+<span class="k">ENABLED_AGENTS</span>=sentinel,aura,atlas       <span class="c"># later: add Sentinel + Aura</span></pre>
   </section>
 
   <!-- 6 -->
@@ -525,7 +525,7 @@
   <span class="s">"description"</span>:<span class="s">"Monitors brand abuse, phishing, typosquatting."</span>}}</pre>
     <h3>Roadmap</h3>
     <ul class="clean">
-      <li><b>Near term</b> — enable the Sentinel (reports) and external-attack-surface specialists behind the same FortiRecon Assistant front end.</li>
+      <li><b>Near term</b> — enable the Sentinel (reports) and Aura (external attack surface) specialists behind the same FortiRecon Assistant front end.</li>
       <li><b>Answer-quality assurance</b> — an automated “judge” pass that critiques answer <em>quality</em>, not merely whether content was found.</li>
       <li><b>Enterprise hardening</b> — database row-level security, external identity (OIDC), rate limiting, and approval gates for state-changing actions.</li>
       <li><b>Routing at scale</b> — the current design serves roughly fifteen to twenty capabilities on one router; beyond that, an embedding-based capability index takes over.</li>

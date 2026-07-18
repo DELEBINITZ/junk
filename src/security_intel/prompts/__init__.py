@@ -1,12 +1,12 @@
 """Centralized prompt templates, organized by agent / pipeline component.
 
 Import prompts from here instead of inlining them in logic, e.g.:
-    from security_intel.prompts.reports import REPORTS_SYSTEM_PROMPT
+    from security_intel.prompts.sentinel import SENTINEL_SYSTEM_PROMPT
     from security_intel.prompts import SYNTHESIS_PROMPT
 """
 
-from security_intel.prompts.reports import REPORTS_SYSTEM_PROMPT
-from security_intel.prompts.easm import EASM_SYSTEM_PROMPT
+from security_intel.prompts.sentinel import SENTINEL_SYSTEM_PROMPT
+from security_intel.prompts.aura import AURA_SYSTEM_PROMPT
 from security_intel.prompts.orchestrator import (
     PERSONA_TEMPLATE,
     ROUTER_PROMPT,
@@ -24,8 +24,8 @@ from security_intel.prompts.enrichment import (
 from security_intel.prompts.planner import PLANNER_SYSTEM_TEMPLATE
 
 __all__ = [
-    "REPORTS_SYSTEM_PROMPT",
-    "EASM_SYSTEM_PROMPT",
+    "SENTINEL_SYSTEM_PROMPT",
+    "AURA_SYSTEM_PROMPT",
     "PERSONA_TEMPLATE",
     "render_persona",
     "ROUTER_PROMPT",

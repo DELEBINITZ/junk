@@ -19,11 +19,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from security_intel.agents.easm.tools import get_easm_tools
+from security_intel.agents.aura.tools import get_easm_tools
 from security_intel.agents.orchestrator import build_orchestrator
 from security_intel.agents.registry import AgentRegistry, AgentSpec
-from security_intel.agents.reports.tools import get_reports_tools
-from security_intel.agents.userguide.tools import get_user_guide_tools
+from security_intel.agents.sentinel.tools import get_reports_tools
+from security_intel.agents.atlas.tools import get_user_guide_tools
 from security_intel.api.routes import router
 from security_intel.config import Settings
 from security_intel.db.migrations import run_migrations
@@ -35,9 +35,9 @@ from security_intel.memory.summarizer import RollingSummarizer
 from security_intel.observability.logging import get_logger, setup_logging
 from security_intel.observability.middleware import TracingMiddleware
 from security_intel.observability.tracing import get_langfuse_handler
-from security_intel.prompts.easm import EASM_SYSTEM_PROMPT
-from security_intel.prompts.reports import REPORTS_SYSTEM_PROMPT
-from security_intel.prompts.userguide import USER_GUIDE_SYSTEM_PROMPT
+from security_intel.prompts.aura import AURA_SYSTEM_PROMPT
+from security_intel.prompts.sentinel import SENTINEL_SYSTEM_PROMPT
+from security_intel.prompts.atlas import ATLAS_SYSTEM_PROMPT
 from security_intel.tools.mcp_loader import load_mcp_tools_for_agent, mcp_agent_ids
 from security_intel.tools.query_enrichment import QueryEnricher
 
@@ -45,7 +45,7 @@ from security_intel.tools.query_enrichment import QueryEnricher
 async def _user_guide_corpus_ready(settings: Settings) -> bool:
     """True when the user-guide collection exists and holds at least one point.
 
-    Gates registration of the User Guide agent so it is never exposed against an
+    Gates registration of the Atlas agent so it is never exposed against an
     empty/absent corpus (which would let the planner route to a dead end). Any
     connection/error is treated as "not ready" — fail closed, log, skip the agent.
     """
@@ -76,7 +76,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
     # Capability gating — the supported way to run "only some agents" WITHOUT editing
     # code. ENABLED_AGENTS is an allowlist of agent ids; blank means "every agent that
     # is otherwise available". The orchestrator then DERIVES its whole persona from
-    # whatever ends up registered (see agents/identity.py), so a userguide-only
+    # whatever ends up registered (see agents/identity.py), so an atlas-only
     # deployment presents as a product guide, not a security tool.
     allowlist = set(settings.enabled_agents_list)
     if allowlist:
@@ -92,14 +92,21 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
             return QueryEnricher(lane_router.fast, domain=domain)
         return None
 
-    # Reports Agent
-    if _enabled("reports"):
+    # MCP server ids consumed by an explicit registration below (e.g. the "easm"
+    # server is owned by the Aura agent). The generic MCP auto-register loop skips
+    # these so a renamed agent (id != server id) is not double-registered.
+    consumed_mcp_ids: set[str] = set()
+
+    # Sentinel — the security reports specialist agent.
+    # AGENT layer = "sentinel"; capability layer (search_reports, reports_kb) stays
+    # capability-named so Sentinel can gain further capabilities without a rename.
+    if _enabled("sentinel"):
         reports_tools = get_reports_tools(settings, enricher=_enricher("security reports corpus"))
         registry.register(
             AgentSpec(
-                # Sentinel: the reports specialist (internal name). domain_label is the
+                # id is the AGENT identity (routing key). domain_label is the
                 # user-facing capability area the master advertises.
-                id="reports",
+                id="sentinel",
                 display_name="Sentinel",
                 domain_label="security reports & threat intelligence",
                 description="Searches security reports corpus (threat intel, ai generated reports and more). ",
@@ -108,7 +115,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
                     "Filter by threat type, TLP level, report type",
                     "Get report metadata and details",
                 ],
-                system_prompt=REPORTS_SYSTEM_PROMPT,
+                system_prompt=SENTINEL_SYSTEM_PROMPT,
                 tools=reports_tools,
                 # tool_call: single-pass semantic search, no ReAct loop (cheaper/faster).
                 # TRADEOFF: this narrows the reports agent to search_reports at runtime —
@@ -120,24 +127,26 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
             )
         )
     else:
-        logger.info("Reports agent disabled by ENABLED_AGENTS allowlist.")
+        logger.info("Sentinel agent disabled by ENABLED_AGENTS allowlist.")
 
-    # User Guide Agent — answers product how-to / dashboard-walkthrough / navigation
-    # questions from the FortiRecon documentation corpus (Qdrant: user_guide_collection).
-    # Registered only when that collection has been ingested (services/userguide-ingest),
-    # so we never route users to an empty docs corpus.
-    if not _enabled("userguide"):
-        logger.info("User Guide agent disabled by ENABLED_AGENTS allowlist.")
+    # Atlas — the FortiRecon product-guidance agent. Its current capability answers
+    # product how-to / dashboard-walkthrough / navigation questions from the FortiRecon
+    # documentation corpus (Qdrant: user_guide_collection). AGENT layer = "atlas";
+    # the docs corpus/tools stay capability-named (user_guide) so Atlas can gain more
+    # capabilities later. Registered only when that collection has been ingested
+    # (services/userguide-ingest), so we never route users to an empty docs corpus.
+    if not _enabled("atlas"):
+        logger.info("Atlas agent disabled by ENABLED_AGENTS allowlist.")
     elif await _user_guide_corpus_ready(settings):
         user_guide_tools = get_user_guide_tools(
             settings, enricher=_enricher("product user guide / documentation")
         )
         registry.register(
             AgentSpec(
-                # id stays "userguide" (internal capability key, tied to the docs corpus);
-                # display_name is the specialist's INTERNAL name; domain_label is what the
-                # master advertises to users. Atlas answers product/user-guide questions.
-                id="userguide",
+                # id is the AGENT identity / routing key ("atlas"). domain_label is the
+                # user-facing capability area the master advertises. The docs corpus and
+                # its tools stay capability-named (user_guide), decoupled from the agent id.
+                id="atlas",
                 display_name="Atlas",
                 domain_label="FortiRecon product guidance",
                 description=(
@@ -151,7 +160,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
                     "Give step-by-step how-to and configuration instructions",
                     "Walk through navigation and where to find things in the product",
                 ],
-                system_prompt=USER_GUIDE_SYSTEM_PROMPT,
+                system_prompt=ATLAS_SYSTEM_PROMPT,
                 tools=user_guide_tools,
                 # react: the agent REASONS over retrieval — it can run search_user_guide,
                 # then follow up with get_user_guide_page(<doc_id>) to pull a full page for
@@ -162,24 +171,29 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
         )
     else:
         logger.warning(
-            "User Guide agent not registered — collection "
+            "Atlas agent not registered — collection "
             f"'{settings.user_guide_collection}' is empty or unavailable. "
             "Run the services/userguide-ingest service to ingest the FortiRecon user guide."
         )
 
-    # EASM Agent — only registered when a real MCP server provides tools.
-    # No stubs: without tools the agent is omitted rather than serving fake data.
-    if not _enabled("easm"):
-        logger.info("EASM agent disabled by ENABLED_AGENTS allowlist.")
+    # Aura — the external attack surface (EASM) agent. AGENT layer = "aura"; the
+    # capability layer (the "easm" MCP server + its tools) stays capability-named.
+    # Only registered when a real MCP server provides tools. No stubs: without tools
+    # the agent is omitted rather than serving fake data.
+    if not _enabled("aura"):
+        logger.info("Aura agent disabled by ENABLED_AGENTS allowlist.")
     else:
+        # Aura owns the "easm" MCP server, so the generic auto-register loop below
+        # must not also register it under the server id.
+        consumed_mcp_ids.add("easm")
         easm_tools = await get_easm_tools(settings)
         if not easm_tools:
-            logger.warning("EASM agent not registered — no MCP tools available.")
+            logger.warning("Aura agent not registered — no EASM MCP tools available.")
         else:
             registry.register(
                 AgentSpec(
-                    id="easm",
-                    display_name="EASM Agent",
+                    id="aura",
+                    display_name="Aura",
                     domain_label="external attack surface",
                     description="Queries external attack surface (assets, exposures, changes, rescans). "
                     "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
@@ -189,7 +203,7 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
                         "Track attack surface changes over time",
                         "Trigger asset rescans (requires approval)",
                     ],
-                    system_prompt=EASM_SYSTEM_PROMPT,
+                    system_prompt=AURA_SYSTEM_PROMPT,
                     tools=easm_tools,
                     side_effecting_tools={"trigger_rescan"},
                 )
@@ -207,8 +221,8 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
     #                           "description": "Monitors brand abuse, phishing, typosquatting.",
     #                           "capabilities": ["Detect impersonation", "Track phishing domains"]}}'
     for agent_id in mcp_agent_ids(settings):
-        if agent_id in registry.specs:
-            continue  # already registered explicitly above (e.g. easm)
+        if agent_id in registry.specs or agent_id in consumed_mcp_ids:
+            continue  # already handled explicitly above (e.g. the "easm" server -> Aura)
         if not _enabled(agent_id):
             logger.info(f"MCP agent '{agent_id}' disabled by ENABLED_AGENTS allowlist.")
             continue

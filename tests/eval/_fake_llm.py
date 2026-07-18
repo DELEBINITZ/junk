@@ -104,29 +104,29 @@ def install_guardrail_stub() -> None:
 
 
 def register_light_agents(registry, settings) -> None:
-    """Register reports + userguide directly (same modes/tools as main) without
-    importing the full FastAPI app stack. EASM is omitted (needs an MCP server)."""
+    """Register sentinel + atlas directly (same modes/tools as main) without
+    importing the full FastAPI app stack. Aura (EASM) is omitted (needs an MCP server)."""
     from security_intel.agents.registry import AgentSpec
-    from security_intel.agents.reports.tools import get_reports_tools
-    from security_intel.agents.userguide.tools import get_user_guide_tools
-    from security_intel.prompts.reports import REPORTS_SYSTEM_PROMPT
-    from security_intel.prompts.userguide import USER_GUIDE_SYSTEM_PROMPT
+    from security_intel.agents.sentinel.tools import get_reports_tools
+    from security_intel.agents.atlas.tools import get_user_guide_tools
+    from security_intel.prompts.sentinel import SENTINEL_SYSTEM_PROMPT
+    from security_intel.prompts.atlas import ATLAS_SYSTEM_PROMPT
 
     registry.register(AgentSpec(
-        id="reports", display_name="Sentinel", domain_label="security reports & threat intelligence",
+        id="sentinel", display_name="Sentinel", domain_label="security reports & threat intelligence",
         description="Searches security reports corpus (threat intel, AI-generated reports).",
         capabilities=["Semantic search over security reports", "Filter by threat type/TLP",
                       "Get report metadata"],
-        system_prompt=REPORTS_SYSTEM_PROMPT, tools=get_reports_tools(settings),
+        system_prompt=SENTINEL_SYSTEM_PROMPT, tools=get_reports_tools(settings),
         mode="tool_call", primary_tool="search_reports",
     ))
     registry.register(AgentSpec(
-        id="userguide", display_name="Atlas", domain_label="FortiRecon product guidance",
+        id="atlas", display_name="Atlas", domain_label="FortiRecon product guidance",
         description="Helps you use the FortiRecon platform: how-to, navigation, dashboards, "
                     "features, and configuration, from the product documentation.",
         capabilities=["Explain dashboards/menus/features", "Step-by-step how-to",
                       "Navigation / where to find things"],
-        system_prompt=USER_GUIDE_SYSTEM_PROMPT, tools=get_user_guide_tools(settings),
+        system_prompt=ATLAS_SYSTEM_PROMPT, tools=get_user_guide_tools(settings),
         # react: matches main.py — the agent can chain search -> full-page fetch.
         mode="react",
     ))

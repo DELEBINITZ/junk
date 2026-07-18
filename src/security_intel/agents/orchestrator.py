@@ -541,6 +541,20 @@ def build_orchestrator(
 
         synthesis_goal = plan.get("synthesis_goal", "Combine into clear answer.") if plan else ""
 
+        # Code-side JOIN: for multi-agent answers, compute cross-source entity overlaps
+        # (e.g. a CVE found by BOTH Aura's asset scan and Sentinel's reports) here, in
+        # code, and hand the result to the LLM as ground truth. The model narrates a
+        # pre-computed intersection instead of inferring it — this is the fix for
+        # multi-agent join hallucination. Single-agent answers get an empty block.
+        join_block = ""
+        if len(real_results) >= 2:
+            from security_intel.agents.synthesis_join import cross_reference
+
+            crossref = cross_reference(real_results)
+            if crossref.any_entities:
+                join_block = f"\n{crossref.render_facts()}\n"
+                all_citations.extend(crossref.citations())
+
         context_summary = _summarize_context(state.get("history", []), state.get("summary", ""))
         context_block = f"\nPrior conversation context:\n{context_summary}\n" if context_summary else ""
 
@@ -548,6 +562,7 @@ def build_orchestrator(
             f"User question: {user_query}\n"
             f"{context_block}"
             f"Synthesis goal: {synthesis_goal}\n"
+            f"{join_block}"
             f"Agent findings:{findings_text}"
         )
 
@@ -563,6 +578,18 @@ def build_orchestrator(
                 timeout=SYNTHESIS_TIMEOUT,
             )
             answer = response.content
+            # Post-validate: a CVE asserted in the answer that appears in NO agent
+            # finding is a hallucination — never silently pass it to the user in a
+            # security product. Log at ERROR (alertable); Phase 4 wires this to metrics.
+            if len(real_results) >= 2:
+                from security_intel.observability.eval_scoring import unsupported_cves
+
+                bad = unsupported_cves(answer, [r["findings"] for r in real_results])
+                if bad:
+                    logger.error(
+                        f"Synthesis asserted CVE(s) with no source support: {bad} "
+                        f"(query={user_query!r}) — possible join hallucination"
+                    )
         except asyncio.TimeoutError:
             logger.error("Synthesis timed out")
             answer = SYNTH_FALLBACK_MSG
@@ -980,7 +1007,7 @@ def _extract_plan(messages: list, valid_agents: list[str]) -> ExecutionPlan:
                         synthesis_goal=args.get("synthesis_goal", "Combine findings."),
                     )
 
-    fallback_agent = valid_agents[0] if valid_agents else "reports"
+    fallback_agent = valid_agents[0] if valid_agents else "sentinel"
     return ExecutionPlan(
         steps=[PlanStep(agent=fallback_agent, task="Answer the user's question", depends_on=[])],
         synthesis_goal="Return findings directly.",
@@ -989,7 +1016,7 @@ def _extract_plan(messages: list, valid_agents: list[str]) -> ExecutionPlan:
 
 def _default_plan(query: str, valid_agents: list[str]) -> ExecutionPlan:
     """Fallback plan when planner fails."""
-    agent = valid_agents[0] if valid_agents else "reports"
+    agent = valid_agents[0] if valid_agents else "sentinel"
     return ExecutionPlan(
         steps=[PlanStep(agent=agent, task=query, depends_on=[])],
         synthesis_goal="Return findings directly.",

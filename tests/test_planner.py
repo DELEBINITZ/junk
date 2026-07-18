@@ -15,7 +15,7 @@ def test_planner_builds():
 
 
 def test_planner_system_prompt_contains_agents():
-    """System prompt should describe available agents."""
-    assert "reports" in PLANNER_SYSTEM_PROMPT
-    assert "easm" in PLANNER_SYSTEM_PROMPT
+    """System prompt should describe available agents (by their agent ids)."""
+    assert "sentinel" in PLANNER_SYSTEM_PROMPT
+    assert "aura" in PLANNER_SYSTEM_PROMPT
     assert "create_execution_plan" in PLANNER_SYSTEM_PROMPT

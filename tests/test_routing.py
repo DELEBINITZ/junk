@@ -18,9 +18,6 @@ sys.path.insert(0, str(Path(__file__).parent / "eval"))
 
 from _fake_llm import FakeRoutingLLM, install_guardrail_stub  # noqa: E402
 
-# Stub Presidio guardrails BEFORE the orchestrator lazily imports them.
-install_guardrail_stub()
-
 from langchain_core.runnables import RunnableConfig  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
 
@@ -28,6 +25,26 @@ from security_intel.agents.orchestrator import build_orchestrator  # noqa: E402
 from security_intel.agents.registry import AgentRegistry, AgentSpec  # noqa: E402
 from security_intel.config import Settings  # noqa: E402
 from security_intel.llm.provider import Lane, LaneRouter  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _stub_guardrails():
+    """Stub Presidio guardrails for the duration of EACH test (the orchestrator
+    imports them lazily at node-execution time, so no import-time stub is needed).
+
+    Scoped as a fixture — NOT a module-level import side effect — so the stub is
+    installed before the test runs and the REAL module is restored after. This stops
+    the stub from leaking into sys.modules session-wide and breaking unrelated test
+    files (e.g. test_security_redteam, which imports the real guardrails module)."""
+    saved = sys.modules.get("security_intel.security.guardrails")
+    install_guardrail_stub()
+    try:
+        yield
+    finally:
+        if saved is not None:
+            sys.modules["security_intel.security.guardrails"] = saved
+        else:
+            sys.modules.pop("security_intel.security.guardrails", None)
 
 
 @tool
@@ -50,12 +67,12 @@ def _build_orch(decisions: dict):
 
     reg = AgentRegistry()
     reg.register(AgentSpec(
-        id="reports", display_name="Reports", description="security reports",
+        id="sentinel", display_name="Sentinel", description="security reports",
         capabilities=["search"], system_prompt="p", tools=[search_reports],
         mode="tool_call", primary_tool="search_reports",
     ))
     reg.register(AgentSpec(
-        id="userguide", display_name="User Guide", description="product how-to",
+        id="atlas", display_name="Atlas", description="product how-to",
         capabilities=["how-to"], system_prompt="p", tools=[search_user_guide],
         mode="tool_call", primary_tool="search_user_guide",
     ))
@@ -72,7 +89,7 @@ def _build_orch_single(decisions: dict):
 
     reg = AgentRegistry()
     reg.register(AgentSpec(
-        id="userguide", display_name="User Guide", description="product how-to",
+        id="atlas", display_name="Atlas", description="product how-to",
         capabilities=["how-to"], system_prompt="p", tools=[search_user_guide],
         mode="tool_call", primary_tool="search_user_guide",
     ))
@@ -109,25 +126,25 @@ async def test_single_agent_clarify_attempts_sole_agent():
     # The Atlas fix: with exactly one enabled agent, even a low-confidence CLARIFY must
     # ATTEMPT that agent rather than reject the user as "out of scope".
     orch = _build_orch_single({"is this covered?": {"action": "CLARIFY", "confidence": 0.2}})
-    assert await _agents_that_ran(orch, "is this covered?") == ["userguide"]
+    assert await _agents_that_ran(orch, "is this covered?") == ["atlas"]
 
 
 async def test_single_agent_low_conf_simple_still_attempts():
     # A low-confidence SIMPLE with no named agent, single deployment -> attempt the sole agent.
     orch = _build_orch_single({"maybe docs?": {"action": "SIMPLE", "agent": "", "task": "", "confidence": 0.2}})
-    assert await _agents_that_ran(orch, "maybe docs?") == ["userguide"]
+    assert await _agents_that_ran(orch, "maybe docs?") == ["atlas"]
 
 
-async def test_simple_routes_to_reports():
-    orch = _build_orch({"cve details": {"action": "SIMPLE", "agent": "reports",
+async def test_simple_routes_to_sentinel():
+    orch = _build_orch({"cve details": {"action": "SIMPLE", "agent": "sentinel",
                                         "task": "cve details", "confidence": 0.9}})
-    assert await _agents_that_ran(orch, "cve details") == ["reports"]
+    assert await _agents_that_ran(orch, "cve details") == ["sentinel"]
 
 
-async def test_simple_routes_to_userguide():
-    orch = _build_orch({"how do I use the dashboard": {"action": "SIMPLE", "agent": "userguide",
+async def test_simple_routes_to_atlas():
+    orch = _build_orch({"how do I use the dashboard": {"action": "SIMPLE", "agent": "atlas",
                                                        "task": "dashboard", "confidence": 0.9}})
-    assert await _agents_that_ran(orch, "how do I use the dashboard") == ["userguide"]
+    assert await _agents_that_ran(orch, "how do I use the dashboard") == ["atlas"]
 
 
 async def test_unknown_agent_falls_through(monkeypatch):

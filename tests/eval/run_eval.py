@@ -35,6 +35,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 GOLDEN = Path(__file__).parent / "golden_queries.json"
 FAKE = "--fake-llm" in sys.argv
 AS_JSON = "--json" in sys.argv
+# --score (real-LLM only): additionally score each answer's groundedness and flag
+# hallucinated CVE ids (answer CVE not present in any agent's findings). Off by
+# default so the routing gate and the fake-llm CI path are unaffected.
+SCORE = "--score" in sys.argv
 
 # In fake mode, the guardrails module must be stubbed BEFORE the orchestrator lazily
 # imports it — so do it here, before any security_intel.* graph import.
@@ -70,14 +74,27 @@ async def _build(cases: list[dict]):
     return orch, set(registry.agent_ids)
 
 
-async def _run_case(orch, query: str, idx: int) -> list[str]:
+async def _run_case(orch, query: str, idx: int) -> dict:
     from langchain_core.runnables import RunnableConfig
 
     cfg = RunnableConfig(
         configurable={"org_id": "eval", "thread_id": f"eval-{idx}", "user_id": "eval"}
     )
-    state = await orch.ainvoke({"user_query": query, "messages": []}, config=cfg)
-    return sorted({r["agent_id"] for r in state.get("agent_results", [])})
+    return await orch.ainvoke({"user_query": query, "messages": []}, config=cfg)
+
+
+def _score_state(state: dict):
+    """Groundedness + hallucinated-CVE scoring for a completed run (real-LLM only).
+
+    Grounds the synthesized answer against what the agents actually retrieved
+    (`agent_results[].findings`). Returns an AnswerScore or None if no answer."""
+    from security_intel.observability.eval_scoring import score_answer
+
+    answer = state.get("final_answer", "") or ""
+    if not answer:
+        return None
+    sources = [{"text": r.get("findings", "")} for r in state.get("agent_results", [])]
+    return score_answer(answer, sources)
 
 
 async def main() -> int:
@@ -85,7 +102,7 @@ async def main() -> int:
     orch, available = await _build(cases)
 
     rows = []
-    passed = total = skipped = errored = 0
+    passed = total = skipped = errored = flagged = 0
     for i, case in enumerate(cases):
         exp = sorted(case.get("expect_agents", []))
         missing = [a for a in exp if a not in available]
@@ -95,7 +112,8 @@ async def main() -> int:
                          "status": "SKIP", "reason": f"agent(s) not registered: {missing}"})
             continue
         try:
-            got = await _run_case(orch, case["query"], i)
+            state = await _run_case(orch, case["query"], i)
+            got = sorted({r["agent_id"] for r in state.get("agent_results", [])})
         except Exception as e:  # noqa: BLE001
             errored += 1
             total += 1
@@ -105,13 +123,23 @@ async def main() -> int:
         ok = got == exp
         total += 1
         passed += int(ok)
-        rows.append({"query": case["query"], "expected": exp, "got": got,
-                     "status": "PASS" if ok else "FAIL", "class": case.get("class")})
+        row = {"query": case["query"], "expected": exp, "got": got,
+               "status": "PASS" if ok else "FAIL", "class": case.get("class")}
+        if SCORE and not FAKE:
+            score = _score_state(state)
+            if score is not None:
+                row["score"] = score.as_dict()
+                if not score.ok:
+                    flagged += 1
+                    row["score_flags"] = score.flags
+        rows.append(row)
 
     accuracy = (passed / total * 100) if total else 0.0
     summary = {"mode": "fake-llm" if FAKE else "real-llm", "passed": passed, "total": total,
                "accuracy_pct": round(accuracy, 1), "skipped": skipped, "errored": errored,
                "available_agents": sorted(available)}
+    if SCORE and not FAKE:
+        summary["answer_flags"] = flagged
 
     if AS_JSON:
         print(json.dumps({"summary": summary, "rows": rows}, indent=2))
@@ -126,11 +154,22 @@ async def main() -> int:
             print(f"{r['status']:7} {exp:26} {got:26} {r['query'][:44]}")
             if r.get("reason"):
                 print(f"        └─ {r['reason']}")
+            if r.get("score"):
+                sc = r["score"]
+                tag = "⚠ " + ";".join(r["score_flags"]) if r.get("score_flags") else "ok"
+                print(f"        └─ groundedness={sc['groundedness']} "
+                      f"cite={sc['citation_coverage']} [{tag}]")
         print("-" * 100)
         print(f"Routing accuracy: {passed}/{total} = {accuracy:.0f}%   "
               f"(skipped {skipped}, errored {errored})")
+        if SCORE and not FAKE:
+            print(f"Answer quality: {flagged} answer(s) flagged "
+                  "(unsupported CVE / low groundedness)")
 
-    return 0 if (passed == total and errored == 0) else 1
+    # Gate: routing must be perfect AND (when scoring) no answer may carry a hard flag.
+    routing_ok = passed == total and errored == 0
+    answers_ok = (not SCORE) or FAKE or flagged == 0
+    return 0 if (routing_ok and answers_ok) else 1
 
 
 if __name__ == "__main__":

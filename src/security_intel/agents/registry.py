@@ -36,7 +36,7 @@ class AgentSpec:
     """
 
     id: str
-    display_name: str  # the specialist's INTERNAL name (e.g. "Atlas", "Sentinel")
+    display_name: str  # the specialist's INTERNAL name (e.g. "Atlas", "Sentinel", "Aura")
     description: str
     capabilities: list[str]
     # User-facing capability AREA the master advertises (e.g. "FortiRecon product

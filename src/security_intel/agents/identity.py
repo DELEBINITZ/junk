@@ -17,7 +17,11 @@ from dataclasses import dataclass
 
 
 def _strip_agent_suffix(display_name: str) -> str:
-    """'FortiRecon User Guide Agent' -> 'FortiRecon User Guide' (label, not a role)."""
+    """'Brand Protection Agent' -> 'Brand Protection' (label, not a role).
+
+    Mainly for auto-generated MCP display names; the core specialists (Atlas,
+    Sentinel, Aura) don't carry an "Agent" suffix.
+    """
     name = (display_name or "").strip()
     if name.lower().endswith("agent"):
         name = name[: -len("agent")].strip()

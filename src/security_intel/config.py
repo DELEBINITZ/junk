@@ -13,24 +13,24 @@ class Settings(BaseSettings):
 
     # Assistant identity (personality is otherwise DERIVED from the enabled agents).
     # Leave blank to auto-derive a name/tagline from whichever agents are active —
-    # so a userguide-only deployment presents as a product guide, a reports+easm
+    # so an atlas-only deployment presents as a product guide, a sentinel+aura
     # deployment as a security analyst, with no code change.
     # The MASTER/orchestrator's user-facing identity. This is NOT a specialist agent —
-    # the specialists (Atlas = product guide, Sentinel = reports, …) are internal, and
-    # the master answers in one consistent voice. Blank = auto-derive a neutral name.
+    # the specialists (Atlas = product guide, Sentinel = reports, Aura = EASM) are
+    # internal, and the master answers in one consistent voice. Blank = auto-derive.
     assistant_name: str = "FortiRecon Assistant"
     # Capability-agnostic so it stays right as specialists are added. Blank = auto-derive.
     assistant_tagline: str = "a knowledgeable assistant for the FortiRecon platform"
 
     # Capability gating — which agents are active. Comma-separated allowlist of agent
-    # ids (e.g. "userguide" or "reports,userguide"). BLANK = every agent that is
+    # ids (e.g. "atlas" or "sentinel,atlas"). BLANK = every agent that is
     # otherwise available (corpus ingested / MCP reachable). The whole system
     # personality reshapes to match the enabled set.
     #
-    # SHIP CONFIG (current): ship the user-guide agent ONLY, presented as "Atlas".
-    # To bring the security agents online later, widen this (e.g. "reports,userguide,easm")
+    # SHIP CONFIG (current): ship the Atlas agent ONLY (product guidance capability).
+    # To bring the security agents online later, widen this (e.g. "sentinel,atlas,aura")
     # or set ENABLED_AGENTS="" in the environment to enable everything available.
-    enabled_agents: str = "userguide"
+    enabled_agents: str = "atlas"
 
     # Auth
     api_keys: str = "dev-api-key-change-me"
@@ -73,8 +73,10 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     qdrant_collection: str = "reports_kb"
-    # Product user-guide / documentation corpus (separate collection so doc how-to
-    # pages never pollute threat-report retrieval). Ingested by scripts/index_user_guide.py.
+    # Atlas capability corpus: product user-guide / documentation (separate collection so
+    # doc how-to pages never pollute threat-report retrieval). Capability-named (not
+    # "atlas_kb") so Atlas can gain further capabilities without renaming this corpus.
+    # Ingested by services/userguide-ingest/index_user_guide.py.
     user_guide_collection: str = "user_guide_kb"
 
     # Postgres (checkpointing + sessions)

@@ -1,9 +1,11 @@
 """API routes — all LangGraph-powered. No direct LLM calls here."""
 
+import time
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, PlainTextResponse
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 
@@ -15,9 +17,53 @@ from security_intel.api.streaming import stream_agent_events
 from security_intel.security.rbac import SecurityContext
 from security_intel.observability.logging import get_logger, new_trace_id, set_trace_context
 from security_intel.observability.tracing import traced_config
+from security_intel.observability.metrics import (
+    REGISTRY, RequestMetrics, record_request, attribute_cost,
+)
+from security_intel.observability.eval_scoring import score_answer
 
 logger = get_logger("api")
 router = APIRouter(prefix="/v1")
+
+
+@router.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus scrape endpoint — latency/token/cost histograms, per-agent and
+    per-tenant counters, routing-action and answer-flag counts."""
+    return PlainTextResponse(
+        REGISTRY.render_prometheus(), media_type="text/plain; version=0.0.4; charset=utf-8"
+    )
+
+
+def _routing_action(result: dict, agents_used: list[str]) -> str:
+    """Coarse routing label for the metrics counter."""
+    if agents_used:
+        return "COMPLEX" if result.get("is_complex") else "SIMPLE"
+    if result.get("is_chitchat") or result.get("direct_response"):
+        return "DIRECT"
+    if result.get("needs_clarification"):
+        return "CLARIFY"
+    return "OTHER"
+
+
+def _emit_chat_metrics(result, agents_used, org_id, latency_ms, usage_cb):
+    """Emit SLO metrics + sample answer quality online. Never raises (best-effort)."""
+    final = result.get("final_answer", "") or ""
+    findings = [{"text": r.get("findings", "")} for r in result.get("agent_results", [])]
+    # Online answer-quality sampling: only when there were findings to ground against
+    # (a DIRECT greeting has no sources, so grounding it is meaningless).
+    flags = score_answer(final, findings).flags if (agents_used and final) else []
+    usage = getattr(usage_cb, "usage_metadata", {}) or {}
+    m = RequestMetrics(
+        tenant=org_id or "unknown",
+        latency_ms=latency_ms,
+        agents_used=agents_used,
+        routing_action=_routing_action(result, agents_used),
+        cost=attribute_cost(usage),
+        answer_flags=flags,
+        outcome="ok" if final else "empty",
+    )
+    record_request(m)
 
 
 @router.get("/health")
@@ -60,7 +106,7 @@ async def meta(request: Request):
         return {"name": "Assistant", "tagline": "", "domains": "", "agents": []}
 
     # User-facing capability areas the master advertises. Specialist names (Atlas,
-    # Sentinel, …) are INTERNAL and deliberately not surfaced here — the master is one
+    # Sentinel, Aura, …) are INTERNAL and deliberately not surfaced here — the master is one
     # voice. `id` is kept for clients that need a stable key.
     capabilities = []
     if registry:
@@ -140,9 +186,24 @@ async def chat(
         "query_len": len(body.message), "session_id": session_id,
     }})
 
+    # Attach a per-request token-usage accumulator so cost can be attributed per
+    # model without threading usage through every node.
+    usage_cb = UsageMetadataCallbackHandler()
+    _cbs = config.get("callbacks") or []
+    if not isinstance(_cbs, list):
+        _cbs = [_cbs]
+    config["callbacks"] = [*_cbs, usage_cb]
+
+    _t0 = time.perf_counter()
     result = await orchestrator.ainvoke(input_state, config=config)
+    _latency_ms = (time.perf_counter() - _t0) * 1000
 
     agents_used = [r["agent_id"] for r in result.get("agent_results", [])]
+
+    try:
+        _emit_chat_metrics(result, agents_used, sc.org_id, _latency_ms, usage_cb)
+    except Exception as e:  # noqa: BLE001 — metrics must never break the response
+        logger.warning(f"chat metrics emit failed (non-fatal): {e}")
 
     return ChatResponse(
         answer=result.get("final_answer", ""),
