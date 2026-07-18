@@ -8,7 +8,7 @@ from security_intel.tools.userguide_search import (
 
 
 def get_user_guide_tools(settings: Settings, enricher=None) -> list[BaseTool]:
-    """Build all tools for the User Guide agent.
+    """Build the user_guide capability tools for the Atlas agent.
 
     Args:
         settings: App configuration.

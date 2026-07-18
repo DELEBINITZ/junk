@@ -20,7 +20,7 @@ import httpx
 from langchain_core.tools import tool
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import (
-    Filter, FieldCondition, MatchValue, MatchAny, DatetimeRange, OrderBy,
+    Filter, FieldCondition, MatchValue, MatchAny, DatetimeRange, OrderBy, MinShould,
 )
 
 from security_intel.config import Settings
@@ -90,17 +90,36 @@ def _get_http_client() -> httpx.AsyncClient:
 
 
 def _build_access_filter(org_id: str, extra_must: list | None = None) -> Filter:
-    """Standard tenant access filter used across all tools."""
+    """Standard tenant access filter used across all tools.
+
+    Tenant-isolation invariant: a point is visible to ``org_id`` ONLY if it is not
+    deleted AND (its ``customer_tags`` include ``org_id`` OR it is ``public``).
+
+    The org/public OR-group is expressed with ``min_should(min_count=1)`` — NOT a
+    bare ``should``. This makes the OR-group a HARD requirement, independent of
+    Qdrant's default should-matching semantics. A bare ``should`` that a Qdrant
+    version/config treats as *optional* would return every non-deleted point to
+    every org — a cross-tenant leak. ``min_count=1`` forecloses that failure mode:
+    a point that is neither tagged for this org nor public can never match.
+
+    NOTE: requires a Qdrant server that honors ``min_should`` (server >= 1.1).
+    tests/test_tenant_isolation.py locks the filter STRUCTURE; the integration test
+    there proves the runtime behavior against a live Qdrant — run it before trusting
+    isolation in a new environment.
+    """
     must = [FieldCondition(key="is_deleted", match=MatchValue(value=False))]
     if extra_must:
         must.extend(extra_must)
 
     return Filter(
         must=must,
-        should=[
-            FieldCondition(key="customer_tags", match=MatchAny(any=[org_id])),
-            FieldCondition(key="public", match=MatchValue(value=True)),
-        ],
+        min_should=MinShould(
+            conditions=[
+                FieldCondition(key="customer_tags", match=MatchAny(any=[org_id])),
+                FieldCondition(key="public", match=MatchValue(value=True)),
+            ],
+            min_count=1,
+        ),
     )
 
 

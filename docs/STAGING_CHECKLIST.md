@@ -1,4 +1,4 @@
-# Staging validation checklist — User Guide agent + orchestrator hardening
+# Staging validation checklist — Atlas agent + orchestrator hardening
 
 Everything below was implemented and verified locally EXCEPT the LLM-in-loop
 behavior (no vLLM/Qwen locally) and retrieval at the real embedding dim (local
@@ -35,8 +35,8 @@ docker run --rm \
 
 ## 2. BLOCKER — ingest before app start
 
-The User Guide agent registers only when `user_guide_kb` is non-empty. Ingest first,
-then (re)start the app. Confirm startup log: `Registered agent: userguide (…, mode=tool_call)`.
+The Atlas agent registers only when `user_guide_kb` is non-empty. Ingest first,
+then (re)start the app. Confirm startup log: `Registered agent: atlas (…, mode=tool_call)`.
 
 ## 3. Run the routing eval (real LLM) — the accuracy number
 
@@ -63,9 +63,9 @@ Grep app logs while running the eval:
 | Query | Expect |
 |---|---|
 | "hi" | DIRECT, no agent |
-| "walk me through the EASM dashboard" | userguide answer with nav path (`Attack Surface Management > EASM > EASM Dashboard`) |
-| "what do we know about CVE-2024-3400?" | reports answer |
-| "compare our exposed assets against recent threats" | planner → easm + reports (needs EASM MCP configured) |
+| "walk me through the EASM dashboard" | Atlas answer with nav path (`Attack Surface Management > EASM > EASM Dashboard`) |
+| "what do we know about CVE-2024-3400?" | Sentinel answer |
+| "compare our exposed assets against recent threats" | planner → aura + sentinel (needs EASM MCP configured) |
 | "write me a python script" | REFUSE |
 
 Also confirm: streaming works, PII redaction runs (Presidio warmed), and no internal
@@ -86,9 +86,9 @@ uv run pytest tests/ -v                          # full suite (needs Presidio + 
 
 ## Open decision
 
-- `reports` is `mode="tool_call"` → only `search_reports` runs; the by-ID
+- `sentinel` is `mode="tool_call"` → only `search_reports` runs; the by-ID
   (`summarize report <id>`) and filter (`TLP:RED`) paths are NOT exercised. If those
-  queries matter, set `mode="react"` on the reports `AgentSpec` in
+  queries matter, set `mode="react"` on the sentinel `AgentSpec` in
   `main._register_agents` (one line) and re-test.
 
 ## Not blockers, but track

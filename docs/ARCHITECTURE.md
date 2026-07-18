@@ -12,9 +12,9 @@ The specialists are internal (`display_name` in the registry); the user hears on
 
 | Specialist | Capability area (`domain_label`) | Backing | Status |
 |-----------|----------------------------------|---------|--------|
-| **Atlas** (`id=userguide`) | FortiRecon product guidance | docs corpus (Qdrant) | enabled |
-| **Sentinel** (`id=reports`) | Security reports & threat intel | reports corpus (Qdrant) | planned |
-| **EASM agent** (`id=easm`) | External attack surface | EASM data via MCP | future |
+| **Atlas** (`id=atlas`) | FortiRecon product guidance | docs corpus (Qdrant) | enabled |
+| **Sentinel** (`id=sentinel`) | Security reports & threat intel | reports corpus (Qdrant) | planned |
+| **Aura** (`id=aura`) | External attack surface | EASM data via MCP | future |
 
 Two properties define this system and are the through-line of the rest of this doc:
 
@@ -90,11 +90,11 @@ actually registered:
 Every persona-bearing prompt (`prompts/orchestrator.py`, `prompts/planner.py`, the
 security classifier) is a **template** parameterized on this profile. Nothing says
 "security assistant" or "user guide" unless the enabled specialists make it so. Enable
-`reports`+`easm` and the master describes itself as covering security reports and attack
+`sentinel`+`aura` and the master describes itself as covering security reports and attack
 surface; ship only Atlas and it's a friendly product assistant — same code, same prompts.
 
 > **The master vs its specialists.** "FortiRecon Assistant" is the *master* the user
-> talks to. Atlas (`id=userguide`), Sentinel (`id=reports`), and the EASM agent are
+> talks to. Atlas (`id=atlas`), Sentinel (`id=sentinel`), and Aura are
 > *internal named specialists*. Their names never reach the user (one voice); the
 > user-facing scope comes from each specialist's `domain_label`. Add a specialist and
 > the master's advertised scope grows; the master's own name never changes.
@@ -109,12 +109,12 @@ is never registered, so it never appears in the catalog, the persona, or the rou
 the system reshapes end-to-end.
 
 ```
-ENABLED_AGENTS=userguide                 # ship config: only the Atlas specialist
-ENABLED_AGENTS=reports,easm,userguide    # bring the security capabilities online
+ENABLED_AGENTS=atlas                     # ship config: only the Atlas specialist
+ENABLED_AGENTS=sentinel,aura,atlas       # bring the security capabilities online
 ENABLED_AGENTS=                          # everything that is available
 ```
 
-Availability is still gated on reality: `userguide` registers only when its Qdrant
+Availability is still gated on reality: `atlas` registers only when its Qdrant
 corpus is populated; MCP agents register only when their server returns tools.
 
 ---
@@ -173,12 +173,12 @@ Each `AgentSpec` declares how it runs (`registry.build_agents` wires it):
 
 Current wiring:
 
-- **`userguide`** (the Product Guide capability) — **`react`**: it reasons over
+- **`atlas`** (the Product Guide capability) — **`react`**: it reasons over
   retrieval, chaining `search_user_guide` → `get_user_guide_page(<page id>)` to pull a
   full page for complete walkthroughs. An agent with no system prompt (e.g. an MCP
   agent) gets one auto-generated from its name + description + capabilities.
-- **`reports`** — `tool_call` → `search_reports` (when enabled).
-- **`easm`** — `react` (asset queries, rescans with approval), backed by an MCP server.
+- **`sentinel`** — `tool_call` → `search_reports` (when enabled).
+- **`aura`** — `react` (asset queries, rescans with approval), backed by an MCP server.
 
 ---
 

@@ -2,7 +2,7 @@
 
 Standalone, independently-deployable service that parses the FortiRecon product
 user guide (HTML), embeds it, and upserts it into a **dedicated Qdrant collection**
-(`user_guide_kb`) that the platform's **User Guide agent** retrieves from.
+(`user_guide_kb`) that the platform's **Atlas agent** retrieves from.
 
 It is intentionally decoupled from the main `security_intel` app: no shared code,
 its own `pyproject.toml` and `Dockerfile`. The only contract with the platform is
@@ -66,5 +66,5 @@ docker run --rm --env-file services/userguide-ingest/.env \
 ```
 
 Run it as a Kubernetes `Job` / CronJob or an ECS scheduled task — it exits when done.
-After a successful run, the platform auto-registers the User Guide agent on next
+After a successful run, the platform auto-registers the Atlas agent on next
 startup (it checks the collection is non-empty before exposing the agent).

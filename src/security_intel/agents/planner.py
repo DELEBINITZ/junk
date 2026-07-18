@@ -9,11 +9,11 @@ PLANNER_SYSTEM_PROMPT = """You are the Strategic Planner for a security intellig
 Your job: Given a user question, decide which specialist agents to invoke and create an execution plan.
 
 Available agents:
-- reports: Searches security reports corpus (threat intel, CVEs, scan findings, remediation guidance). Use for questions about known threats, vulnerabilities, past findings, compliance status.
-- easm: Queries external attack surface (assets, exposures, changes, rescans). Use for questions about exposed infrastructure, asset inventory, misconfigurations, surface changes.
+- sentinel: Searches security reports corpus (threat intel, CVEs, scan findings, remediation guidance). Use for questions about known threats, vulnerabilities, past findings, compliance status.
+- aura: Queries external attack surface (assets, exposures, changes, rescans). Use for questions about exposed infrastructure, asset inventory, misconfigurations, surface changes.
 
 Process:
-1. First, use describe_reports_agent and/or describe_easm_agent to understand capabilities.
+1. First, use describe_sentinel_agent and/or describe_aura_agent to understand capabilities.
 2. Analyze the user question to determine which agents are needed.
 3. Call create_execution_plan with your decision.
 
@@ -28,10 +28,10 @@ ALWAYS end by calling create_execution_plan. Never answer the user question dire
 
 
 @tool
-def describe_reports_agent() -> str:
-    """Get description of what the Reports Agent can do and when to use it."""
+def describe_sentinel_agent() -> str:
+    """Get description of what the Sentinel (reports) agent can do and when to use it."""
     return (
-        "Reports Agent capabilities:\n"
+        "Sentinel (reports) agent capabilities:\n"
         "- Semantic search over security reports corpus (threat intel, vulnerability assessments, scan results)\n"
         "- Get report metadata (title, date, severity, summary)\n"
         "- Covers: CVEs, threat actor TTPs, remediation steps, compliance findings, scan results\n"
@@ -43,10 +43,10 @@ def describe_reports_agent() -> str:
 
 
 @tool
-def describe_easm_agent() -> str:
-    """Get description of what the EASM Agent can do and when to use it."""
+def describe_aura_agent() -> str:
+    """Get description of what the Aura (EASM) agent can do and when to use it."""
     return (
-        "EASM Agent capabilities:\n"
+        "Aura (EASM) agent capabilities:\n"
         "- Query external assets (domains, IPs, services, ports)\n"
         "- Get current exposures and findings (misconfigurations, expired certs, open panels)\n"
         "- Check attack surface changes over time (new/removed/modified assets)\n"
@@ -63,7 +63,7 @@ def create_execution_plan(steps: list[dict], synthesis_goal: str) -> str:
 
     Args:
         steps: List of plan steps. Each step is a dict with:
-            - agent: 'reports' or 'easm'
+            - agent: 'sentinel' or 'aura'
             - task: The specific sub-question for that agent (self-contained)
             - depends_on: List of step indices (0-based) that must complete first (usually empty)
         synthesis_goal: How the synthesizer should combine the findings into a final answer.
@@ -78,7 +78,7 @@ def create_execution_plan(steps: list[dict], synthesis_goal: str) -> str:
 
 def build_planner(llm: ChatOpenAI) -> CompiledStateGraph:
     """Build the Strategic Planner as a ReAct agent with meta-tools."""
-    planner_tools = [describe_reports_agent, describe_easm_agent, create_execution_plan]
+    planner_tools = [describe_sentinel_agent, describe_aura_agent, create_execution_plan]
     return create_react_agent(
         model=llm,
         tools=planner_tools,

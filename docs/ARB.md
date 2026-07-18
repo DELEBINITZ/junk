@@ -1,4 +1,4 @@
-# Architecture Review — User Guide Agent & Multi-Agent Routing Hardening
+# Architecture Review — Atlas & Multi-Agent Routing Hardening
 
 | | |
 |---|---|
@@ -43,7 +43,7 @@ tradeoff.
 
 ## 3. Scope
 
-**In scope:** doc ingestion + retrieval, the user-guide agent, routing/dispatch
+**In scope:** doc ingestion + retrieval, the Atlas agent, routing/dispatch
 hardening, execution-model efficiency, recovery on failure, routing evaluation.
 
 **Out of scope:** the answer-LLM itself, EASM/BP agents (future), UI, auth changes.
@@ -69,7 +69,7 @@ hardening, execution-model efficiency, recovery on failure, routing evaluation.
     (`ul.toc`), stored as `breadcrumb`/`section_path` and prepended to the embedded
     text — hierarchical queries match, and the agent can give real nav directions
     (e.g. *"Attack Surface Management > EASM > EASM Dashboard"*).
-- **`userguide` agent** — `search_user_guide` + `get_user_guide_page` tools;
+- **`atlas` agent** — `search_user_guide` + `get_user_guide_page` tools;
   registered only when the collection is non-empty (fail-closed).
 
 ### B. Orchestrator hardening
@@ -84,7 +84,7 @@ hardening, execution-model efficiency, recovery on failure, routing evaluation.
   the request, so adding an agent expands scope without prompt edits.
 - **Per-agent execution modes** — `tool_call` (single deterministic search, **no
   ReAct loop**) vs `react` (full tool-reasoning loop). Pure-retrieval agents skip an
-  entire LLM round-trip. Current: `reports`, `userguide` = `tool_call`; `easm` =
+  entire LLM round-trip. Current: `sentinel`, `atlas` = `tool_call`; `aura` =
   `react`.
 - **Reflection loop** — if no agent returns productive content, the turn escalates to
   the planner **once** (capped) to recover a mis-routed query.
@@ -163,7 +163,7 @@ validation gate** (`docs/STAGING_CHECKLIST.md`), not open code risks.
 |---|---|---|
 | Embedding-dim mismatch (local 384 vs prod 2560) → silent empty retrieval | High | **Blocker:** re-ingest in staging at `EMBEDDING_DIM=2560`; verify collection size |
 | Structured output unsupported on the serving backend | Medium | Automatic text-parse fallback; log-monitored |
-| `reports=tool_call` drops by-ID/filter query paths | Medium | **Open decision (below)**; one-line flip to `react` |
+| `sentinel=tool_call` drops by-ID/filter query paths | Medium | **Open decision (below)**; one-line flip to `react` |
 | Cross-domain queries mis-routed to a single agent | Medium | Reflection loop + eval golden cases; see roadmap for one-sided-reflection |
 | Per-query LLM cost/latency (4–6 calls on complex path) | Medium | FAST-lane router, SIMPLE bypass, `tool_call` mode, parallel dispatch; measure under load |
 | Flat routing prompt scales to ~15–20 agents | Low (3 today) | Hierarchical/embedding agent selection when needed |
@@ -174,7 +174,7 @@ validation gate** (`docs/STAGING_CHECKLIST.md`), not open code risks.
 
 1. Deploy `services/userguide-ingest`; **ingest the full guide at dim 2560** before
    app start (agent gates on a non-empty collection).
-2. Deploy the app; confirm `userguide` registers.
+2. Deploy the app; confirm `atlas` registers.
 3. Run `tests/eval/run_eval.py` (real LLM) → routing accuracy number.
 4. Full-turn smoke + reflection check (`docs/STAGING_CHECKLIST.md`).
 5. Run `pytest tests/`.
@@ -185,7 +185,7 @@ validation gate** (`docs/STAGING_CHECKLIST.md`), not open code risks.
 
 ## 10. Open decisions for the ARB
 
-1. **`reports` execution mode.** `tool_call` is cheaper but narrows the reports agent
+1. **`sentinel` execution mode.** `tool_call` is cheaper but narrows the Sentinel agent
    to semantic search at runtime — the by-ID (`summarize report <id>`) and filter
    (`TLP:RED`) tool paths are not exercised. **Recommendation:** keep `tool_call` if
    those query types are rare; else flip to `react` (one line). *Requires a call.*
@@ -220,8 +220,8 @@ hierarchical or embedding-based agent selection.
 ## 12. Appendix — change surface
 
 - **New service:** `services/userguide-ingest/` (script, Dockerfile, pyproject, env, README)
-- **New agent:** `src/security_intel/agents/userguide/`, `tools/userguide_search.py`,
-  `prompts/userguide.py`
+- **New agent:** `src/security_intel/agents/atlas/`, `tools/userguide_search.py`,
+  `prompts/atlas.py`
 - **Orchestrator/registry:** structured router, catalog, execution modes, reflection,
   bug fix
 - **Config:** `USER_GUIDE_COLLECTION`

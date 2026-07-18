@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FortiRecon user-guide ingestion service — parses the product documentation
 (HTML), embeds it with the SAME TEI model the app queries with, and upserts it
-into a DEDICATED Qdrant collection (``user_guide_kb``) that the User Guide agent
+into a DEDICATED Qdrant collection (``user_guide_kb``) that the Atlas agent
 retrieves from.
 
 WHY A SEPARATE COLLECTION (not reports_kb):
