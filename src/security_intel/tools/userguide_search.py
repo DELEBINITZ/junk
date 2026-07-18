@@ -37,16 +37,25 @@ def _format_doc_passages(passages: list[dict]) -> str:
     """
     parts = []
     for i, p in enumerate(passages, 1):
-        snippet = p.get("text", "")[:700]
+        # Docs answers need whole procedures, not teasers — keep a generous span so
+        # multi-step how-tos arrive intact (the agent can still get_user_guide_page
+        # for the complete page when a walkthrough needs the full section order).
+        snippet = p.get("text", "")[:1400]
         title = p.get("title", "Untitled")
         heading = p.get("heading", "")
         url = p.get("url", "")
         breadcrumb = p.get("breadcrumb", "")
+        doc_id = p.get("doc_id", "")
         # Lead with the nav location so the agent can tell the user WHERE this lives
         # ("Attack Surface Management > EASM > EASM Dashboard") for walkthroughs.
         header = f"[{i}] {breadcrumb}" if breadcrumb else f"[{i}] {title}"
         if heading and heading != title and heading not in breadcrumb:
             header += f" — {heading}"
+        # Surface the page id so the react agent can call get_user_guide_page(<id>)
+        # VERBATIM to pull the full page for a complete walkthrough. Without this the
+        # search->full-page chain is broken (the agent would have to guess the id).
+        if doc_id:
+            header += f"  (page id: {doc_id})"
         parts.append(f"{header}\n    {snippet}" + (f"\n    (source: {url})" if url else ""))
     return "\n\n---\n\n".join(parts)
 
@@ -76,7 +85,7 @@ def build_search_user_guide_tool(settings: Settings, enricher=None):
     collection = settings.user_guide_collection
 
     @tool
-    async def search_user_guide(query: str, top_k: int = 6) -> str:
+    async def search_user_guide(query: str, top_k: int = 8) -> str:
         """Search the FortiRecon product user guide (documentation).
 
         Use for "how do I…", "where do I find…", "walk me through…", dashboard and
@@ -85,7 +94,7 @@ def build_search_user_guide_tool(settings: Settings, enricher=None):
 
         Args:
             query: Natural-language question about using the FortiRecon product.
-            top_k: Number of passages to return (1-20, default 6).
+            top_k: Number of passages to return (1-20, default 8).
         """
         from langgraph.config import get_config
 
@@ -159,8 +168,12 @@ def build_get_user_guide_page_tool(settings: Settings):
     async def get_user_guide_page(doc_id: str, max_chars: int = 8000) -> str:
         """Get the full content of one FortiRecon user-guide page by its page id.
 
+        Use this AFTER search_user_guide when a walkthrough needs the complete page.
+        Pass the exact "(page id: …)" token shown in the search result header, verbatim.
+
         Args:
-            doc_id: The page identifier returned/implied by search results.
+            doc_id: The page id — the exact value from a search result's "(page id: …)"
+                token. Do not invent or reformat it.
             max_chars: Max characters of combined content to return (default 8000).
         """
         from langgraph.config import get_config

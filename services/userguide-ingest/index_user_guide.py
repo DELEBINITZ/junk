@@ -28,8 +28,19 @@ EMBEDDING: passages are embedded with a small "<title> / <heading>" context pref
 (asymmetric augmentation — improves doc recall). Queries are embedded raw by the
 app. Both hit the SAME TEI server, so dims and space agree.
 
-Idempotent: point id = uuid5("<doc_id>_chunk_<idx>"). Set REINDEX_DELETE_FIRST=1
-to purge a page's stale chunks before re-indexing (when it shrinks).
+Idempotent + self-syncing (safe to re-run any time):
+  - point id = uuid5("<doc_id>_chunk_<idx>") -> a chunk is overwritten in place, never
+    duplicated.
+  - doc_id = the file's path RELATIVE to the ingest root (offline export) or the URL
+    slug (scraped) -> unique per page (same-named files in different folders don't
+    collide) and stable across runs.
+  - per re-run each page is UPSERTED then PRUNED -> a shrunk/edited page leaves no stale
+    chunks behind.
+  - after a full --html-dir run, sync_removed() deletes pages that vanished from the
+    source (deleted/renamed) so the collection always mirrors the current docs.
+So: new pages created, changed pages overwritten, removed pages deleted, zero dupes.
+REINDEX_DELETE_FIRST=1 forces a hard per-page purge; PRUNE_REMOVED=0 disables the
+removed-page sync (use when ingesting only a PARTIAL subset of the guide).
 
 This is a STANDALONE, independently-deployable service (its own pyproject.toml +
 Dockerfile under services/userguide-ingest/). It imports NOTHING from the main app;
@@ -45,7 +56,7 @@ Run (scrape/crawl from the live docs, best-effort):
         --crawl --max-pages 400
 
 Env: QDRANT_URL, QDRANT_API_KEY, TEI_EMBED_URL, EMBEDDING_DIM, USER_GUIDE_COLLECTION,
-     GUIDE_SOURCE, GUIDE_VERSION, GUIDE_PRODUCT, REINDEX_DELETE_FIRST,
+     GUIDE_SOURCE, GUIDE_VERSION, GUIDE_PRODUCT, REINDEX_DELETE_FIRST, PRUNE_REMOVED,
      CHUNK_MAX_WORDS, CHUNK_OVERLAP, CRAWL_DELAY, EMBED_TIMEOUT
 """
 
@@ -76,6 +87,11 @@ SOURCE = os.getenv("GUIDE_SOURCE", "fortirecon_user_guide")
 GUIDE_VERSION = os.getenv("GUIDE_VERSION", "26.2.a")
 GUIDE_PRODUCT = os.getenv("GUIDE_PRODUCT", "FortiRecon")
 DELETE_FIRST = os.getenv("REINDEX_DELETE_FIRST", "0") == "1"
+# Full-sync: after a COMPLETE --html-dir ingest, delete pages that vanished from the
+# source (removed or renamed) so the collection always matches the current docs. On by
+# default for --html-dir (a full snapshot); set PRUNE_REMOVED=0 to ingest a partial set
+# without deleting the rest.
+PRUNE_REMOVED = os.getenv("PRUNE_REMOVED", "1") != "0"
 
 CHUNK_MAX_WORDS = int(os.getenv("CHUNK_MAX_WORDS", "350"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
@@ -94,10 +110,16 @@ _http = httpx.Client(
 # Containers we strip before extracting text — chrome, not content.
 _STRIP_TAGS = ("script", "style", "noscript", "nav", "header", "footer", "aside", "form", "svg")
 # Priority-ordered candidate selectors for the real article body across doc themes.
+# MadCap Flare offline exports (the Fortinet user-guide HTML download) put the article
+# in #mc-main-content / .body-container — listed explicitly so extraction isn't
+# accidental and survives theme tweaks.
 _CONTENT_SELECTORS = (
     "main",
     "article",
     "[role=main]",
+    "#mc-main-content",
+    "div.mc-main-content",
+    "div.body-container",
     "div.content-container",
     "div#content",
     "div.content",
@@ -440,8 +462,15 @@ def ensure_collection() -> None:
 # 6. Page id + point building.
 # ---------------------------------------------------------------------------
 def _doc_id(url: str, fallback: str) -> str:
-    """Stable per-page id. Prefer the user-guide path tail from the URL
-    (e.g. .../user-guide/897693/introduction -> '897693-introduction')."""
+    """Stable, UNIQUE per-page id (re-runs overwrite the same page, never duplicate).
+
+    Prefer the user-guide path tail from the URL (scraped pages have a canonical URL,
+    e.g. .../user-guide/897693/introduction -> '897693-introduction'). Offline HTML
+    exports have NO canonical URL, so ``fallback`` MUST be the file's path RELATIVE to
+    the ingest root (e.g. '0800_ASM/0000_EASM'), not just the bare filename — otherwise
+    same-named pages in different module folders ('0000_Dashboard' under EASM vs IASM)
+    collide onto ONE doc_id and overwrite each other. The full relative path keeps
+    each page unique AND stable across re-runs (files don't move)."""
     if url:
         path = urlparse(url).path
         m = re.search(r"/user-guide/(.+?)/?$", path)
@@ -452,11 +481,35 @@ def _doc_id(url: str, fallback: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "-", fallback).strip("-").lower() or "page"
 
 
+def _breadcrumb_from_path(rel_id: str, title: str) -> list[str]:
+    """Nav hierarchy from the file's folder path when the HTML carries none.
+
+    Offline exports have no ToC/URL, so the module structure lives only in the
+    directory layout ('0800_ASM/0000_EASM.htm'). Turn the folders into a breadcrumb
+    ('ASM > EASM'), stripping the leading sort-order prefixes ('0800_', '0000_') and
+    underscores, so navigation answers and hierarchical retrieval still work.
+    """
+    parts = [p for p in rel_id.replace("\\", "/").split("/") if p]
+    labels: list[str] = []
+    for folder in parts[:-1]:  # folders only; the leaf file is represented by `title`
+        lbl = re.sub(r"^[\d]+[_\-\s]*", "", folder).replace("_", " ").strip()
+        if lbl:
+            labels.append(lbl)
+    labels.append(title)
+    return labels or [title]
+
+
 def build_points(page: dict, fallback_id: str) -> list[models.PointStruct]:
     title = page["title"]
     url = page.get("url", "")
     doc_id = _doc_id(url, fallback_id)
     section_path = page.get("section_path") or [title]
+    # No real hierarchy from the page (offline export: no ToC/URL) -> rebuild it from
+    # the file's folder path so breadcrumbs and "where do I go" answers still work.
+    # Gated on `not url`: only offline files have a path fallback_id; a crawled page's
+    # fallback_id is its URL (which must NOT be split into a breadcrumb).
+    if len(section_path) <= 1 and not url and ("/" in fallback_id or "\\" in fallback_id):
+        section_path = _breadcrumb_from_path(fallback_id, title)
     breadcrumb = " > ".join(section_path)
 
     # Flatten sections into (heading, chunk) pairs — pack whole blocks per section
@@ -521,8 +574,34 @@ def build_points(page: dict, fallback_id: str) -> list[models.PointStruct]:
     return points
 
 
+def _existing_point_ids(doc_id: str) -> set[str]:
+    """Every point id currently stored for this page (paginated scroll, ids only)."""
+    ids: set[str] = set()
+    offset = None
+    flt = models.Filter(
+        must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))]
+    )
+    while True:
+        pts, offset = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=flt,
+            with_payload=False,
+            with_vectors=False,
+            limit=256,
+            offset=offset,
+        )
+        ids.update(str(p.id) for p in pts)
+        if offset is None:
+            break
+    return ids
+
+
 def index_page(page: dict, fallback_id: str) -> int:
     doc_id = _doc_id(page.get("url", ""), fallback_id)
+
+    # Hard-purge override: wipe the page entirely before rebuilding (use for a schema
+    # change or a full clean reindex). Normal updates don't need it — the prune below
+    # keeps re-runs idempotent on their own.
     if DELETE_FIRST:
         client.delete(
             collection_name=COLLECTION_NAME,
@@ -532,15 +611,95 @@ def index_page(page: dict, fallback_id: str) -> int:
                 )
             ),
         )
+
     try:
         points = build_points(page, fallback_id)
     except Exception as e:  # noqa: BLE001 — skip the page on embed failure
         print(f"  ! skip page {doc_id}: {e}")
         return 0
-    if points:
-        client.upsert(collection_name=COLLECTION_NAME, points=points)
-        print(f"  upserted {len(points)} chunks for '{page['title']}' [{doc_id}]")
+    if not points:
+        return 0
+
+    # Idempotent update, no duplicates, no stale orphans:
+    # 1) UPSERT the current chunks — point ids are uuid5("{doc_id}_chunk_{idx}"), so an
+    #    existing chunk is overwritten in place (never a second copy), a genuinely new
+    #    chunk/page is created.
+    # 2) PRUNE any chunk left over from a PREVIOUS, LONGER version of this page (idx >=
+    #    the new chunk count). Without this, a shrunk page keeps stale chunks that would
+    #    surface outdated answers. Upsert BEFORE prune -> no moment where the page is empty;
+    #    diff on ids -> only true orphans are deleted.
+    new_ids = {str(p.id) for p in points}
+    client.upsert(collection_name=COLLECTION_NAME, points=points)
+
+    if not DELETE_FIRST:
+        stale = _existing_point_ids(doc_id) - new_ids
+        if stale:
+            client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=models.PointIdsList(points=list(stale)),
+            )
+            print(f"  pruned {len(stale)} stale chunk(s) from a prior version of [{doc_id}]")
+
+    print(f"  upserted {len(points)} chunks for '{page['title']}' [{doc_id}]")
     return len(points)
+
+
+def sync_removed(seen_doc_ids: set[str]) -> int:
+    """Delete pages that vanished from the source since the last run (removed/renamed).
+
+    Turns a full --html-dir ingest into a true SYNC: after ingesting the whole export,
+    any page still in Qdrant whose doc_id we did NOT just ingest is stale (the source
+    file was deleted, or renamed/moved -> new doc_id) and is removed, so restructured
+    docs never leave orphaned pages that surface as outdated answers. Scoped to THIS
+    guide's ``source``.
+
+    Guarded: never prunes on an empty run (a failed ingest must not wipe the corpus),
+    and ``seen`` tracks every ATTEMPTED page (even one whose embed failed this run), so
+    a transient failure never deletes a still-present page.
+    """
+    if not seen_doc_ids:
+        print("Sync: skipped — 0 pages ingested this run (refusing to prune).")
+        return 0
+
+    source_match = models.FieldCondition(key="source", match=models.MatchValue(value=SOURCE))
+    existing: set[str] = set()
+    offset = None
+    while True:
+        pts, offset = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=models.Filter(must=[source_match]),
+            with_payload=["doc_id"],
+            with_vectors=False,
+            limit=512,
+            offset=offset,
+        )
+        for p in pts:
+            d = (p.payload or {}).get("doc_id")
+            if d:
+                existing.add(d)
+        if offset is None:
+            break
+
+    stale = existing - seen_doc_ids
+    if not stale:
+        print(f"Sync: collection matches source ({len(seen_doc_ids)} pages) — nothing to remove.")
+        return 0
+
+    client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    source_match,
+                    models.FieldCondition(key="doc_id", match=models.MatchAny(any=list(stale))),
+                ]
+            )
+        ),
+    )
+    sample = sorted(stale)[:8]
+    print(f"Sync: removed {len(stale)} page(s) no longer in the source: {sample}"
+          f"{' …' if len(stale) > 8 else ''}")
+    return len(stale)
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +719,10 @@ def iter_local(html_dir: str):
             continue
         page = parse_html(html)
         if page:
-            yield page, f.stem
+            # Pass the path RELATIVE to the ingest root (not just f.stem) as the id
+            # fallback — this is what makes doc_id unique for same-named pages in
+            # different folders, and feeds the folder-derived breadcrumb.
+            yield page, str(f.relative_to(root).with_suffix(""))
 
 
 def _same_guide(url: str, root_url: str) -> bool:
@@ -639,10 +801,21 @@ def main() -> None:
         source = [(page, args.url)] if page else []
 
     pages = chunks = 0
+    seen: set[str] = set()
     for page, fallback_id in source:
         pages += 1
+        # Track every ATTEMPTED page (before embedding) so a transient embed failure
+        # doesn't make sync_removed treat a still-present page as deleted.
+        seen.add(_doc_id(page.get("url", ""), fallback_id))
         chunks += index_page(page, fallback_id)
     print(f"Done. {pages} page(s) -> {chunks} chunks in '{COLLECTION_NAME}'.")
+
+    # Full-sync: on a complete --html-dir snapshot, remove pages that no longer exist
+    # in the source (deleted/renamed) so the collection stays a mirror of the docs.
+    if args.html_dir and PRUNE_REMOVED:
+        sync_removed(seen)
+    elif not args.html_dir and PRUNE_REMOVED:
+        print("Sync: skipped for crawl/url mode (partial snapshot — set --html-dir for full sync).")
 
 
 if __name__ == "__main__":

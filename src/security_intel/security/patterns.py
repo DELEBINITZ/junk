@@ -35,10 +35,15 @@ INJECTION_PATTERNS = [
     r"base64\s+decode",
     r"execute\s+(this|following)\s+(code|script|command)",
     # --- System prompt / guardrail extraction ---
-    # Tied to the ASSISTANT (your ... / the system ...) so generic security talk
-    # like "show me the firewall rules" / "list the detection rules" is NOT flagged.
-    r"(reveal|show|tell|give|print|repeat|expose|share|disclose|list|display|output|dump)\s+(me\s+|us\s+)?(your(\s+system)?|the\s+system)\s+(prompt|instructions?|guard\s*rails?|rules?|configuration|config|directives?|policies|policy)",
-    r"what\s+(are|were|is)\s+(your(\s+system)?|the\s+system)\s+(instructions?|rules?|guard\s*rails?|prompt|directives?)",
+    # Object must be tied to the ASSISTANT so generic product talk is NOT flagged.
+    # "your"/"your system" clearly targets the assistant -> full object list.
+    r"(reveal|show|tell|give|print|repeat|expose|share|disclose|list|display|output|dump)\s+(me\s+|us\s+)?your(\s+system)?\s+(prompt|instructions?|guard\s*rails?|rules?|configuration|config|directives?|policies|policy)",
+    # "the system" is AMBIGUOUS (a product legitimately has "the system configuration",
+    # "the system rules"), so restrict it to objects that are unambiguously the
+    # assistant's own internals — avoids cold-blocking benign product questions.
+    r"(reveal|show|tell|give|print|repeat|expose|share|disclose|list|display|output|dump)\s+(me\s+|us\s+)?the\s+system\s+(prompt|instructions?|guard\s*rails?|directives?)",
+    r"what\s+(are|were|is)\s+your(\s+system)?\s+(instructions?|rules?|guard\s*rails?|prompt|directives?|configuration|config)",
+    r"what\s+(are|were|is)\s+the\s+system\s+(instructions?|guard\s*rails?|prompt|directives?)",
     r"(repeat|print|output|echo|say)\s+(the\s+)?(text|words|everything|prompt)\s+(above|before|verbatim)",
     r"your\s+(initial|original|first|underlying|exact)\s+(prompt|instructions?|message|directive)",
 ]
@@ -60,14 +65,25 @@ OBFUSCATION_RE = re.compile("|".join(OBFUSCATION_PATTERNS), re.IGNORECASE)
 
 # Distinctive phrases that only appear if the model regurgitated its own system
 # prompt / guardrails. Backstop against prompt-extraction that slipped through.
+# Kept domain-neutral where possible so the backstop follows the DERIVED persona
+# (see agents/identity.py + prompts/orchestrator.py) rather than a fixed identity.
 PROMPT_LEAK_MARKERS = (
+    # legacy security-persona anchors (still valid targets to catch)
     "you are an expert security intelligence assistant",
+    "you are the security intelligence assistant synthesizing",
+    # stable structural anchors present in the current dynamic templates. These lines
+    # are LITERAL in the templates (they don't vary with the agent set), so they anchor
+    # the backstop to the derived persona even when only its top block is regurgitated.
     "you are the intelligent gateway",
     "you are the strategic planner",
-    "you are the security intelligence assistant synthesizing",
+    "you assist only within your capabilities",
+    "you are synthesizing your agents",
+    "your personality:",
+    "what you can help with:",
     "respond with exactly one json object",
     "boundaries (non-negotiable)",
     "disclosure rules (important)",
+    "disclosure & security boundaries",
     "available agents:",
     'action": "simple"',
     'action": "complex"',

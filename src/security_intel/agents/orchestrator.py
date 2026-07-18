@@ -24,17 +24,19 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, Field
 
+from security_intel.agents.identity import SystemProfile, build_system_profile
 from security_intel.agents.registry import AgentRegistry
 from security_intel.llm.provider import LaneRouter
 from security_intel.memory.conversations import ChatSession, ConversationStore
 from security_intel.memory.summarizer import RollingSummarizer
 from security_intel.observability.logging import get_logger, set_trace_context
 from security_intel.prompts.orchestrator import (
+    CAPABILITY_REDIRECT_PROMPT,
     CHITCHAT_PROMPT,
-    ORCHESTRATOR_PERSONA,
     ROUTER_PROMPT,
     SYNTH_FALLBACK_MSG,
     SYNTHESIS_PROMPT,
+    render_persona,
 )
 from security_intel.state.schemas import AgentResult, ExecutionPlan, OrchestratorState, PlanStep
 
@@ -46,12 +48,13 @@ class RouterDecision(BaseModel):
     the router can't emit malformed JSON. Falls back to text parsing if the model
     backend doesn't support structured output (see _route_query)."""
 
-    action: Literal["DIRECT", "SIMPLE", "COMPLEX", "REFUSE"] = Field(
-        description="DIRECT=answer without agents; SIMPLE=one agent; COMPLEX=planner; REFUSE=out of scope"
+    action: Literal["DIRECT", "SIMPLE", "COMPLEX", "CLARIFY"] = Field(
+        description="DIRECT=answer without agents; SIMPLE=one agent; COMPLEX=planner; "
+        "CLARIFY=can't tell which agent / too vague -> graceful capability redirect (NOT a refusal)"
     )
     agent: str = Field(default="", description="For SIMPLE: the agent id to invoke")
     task: str = Field(default="", description="For SIMPLE: a self-contained task for that agent")
-    response: str = Field(default="", description="For DIRECT/REFUSE: the brief reply text")
+    response: str = Field(default="", description="For DIRECT: the brief reply text")
     confidence: float = Field(
         default=0.8, ge=0.0, le=1.0, description="Confidence in this routing decision (0-1)"
     )
@@ -101,15 +104,43 @@ def build_orchestrator(
     summarizer: RollingSummarizer | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     query_enricher=None,
+    profile: SystemProfile | None = None,
 ) -> CompiledStateGraph:
-    """Build production orchestrator as LangGraph StateGraph."""
+    """Build production orchestrator as LangGraph StateGraph.
+
+    ``profile`` is the DERIVED system identity (persona, scope, boundaries) built
+    from the enabled agents. When omitted it is derived here with default settings,
+    so the assistant's personality always matches whichever agents are active.
+    """
+
+    if profile is None:
+        from security_intel.config import Settings
+        profile = build_system_profile(registry, Settings())
+
+    # Persona + scope rendered ONCE from the derived identity, then reused by the
+    # chitchat and synthesis nodes. Enable a different agent set -> different persona.
+    persona = render_persona(profile)
+    assistant_desc = profile.assistant_descriptor()
+
+    # Per-agent capability lines for the graceful capability_redirect terminal. Built
+    # from the live registry so the redirect always advertises the ENABLED agents.
+    def _capability_block() -> str:
+        lines = []
+        for aid in registry.agent_ids:
+            spec = registry.get_spec(aid)
+            if spec:
+                caps = "; ".join(spec.capabilities[:3]) if spec.capabilities else spec.description
+                lines.append(f"- {spec.display_name}: {caps}")
+        return "\n".join(lines) if lines else f"- {profile.domains}"
+
+    capability_block = _capability_block()
 
     planner_tools = registry.build_planner_tools()
     planner_prompt = registry.build_planner_system_prompt()
 
     # Rich agent catalog (full description + capabilities) — shared by the router
     # and planner so routing is never decided on truncated agent info.
-    agent_catalog = registry.build_agent_catalog()
+    agent_catalog = profile.catalog
 
     # Structured-output router: guarantees a schema-valid decision on backends that
     # support function calling. Built once; _route_query falls back to text parsing
@@ -172,7 +203,7 @@ def build_orchestrator(
 
         try:
             result = await asyncio.wait_for(
-                input_guardrail_node(state, config, llm=llm),
+                input_guardrail_node(state, config, llm=llm, assistant_desc=assistant_desc),
                 timeout=SECURITY_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -241,6 +272,8 @@ def build_orchestrator(
                 question=question,
                 context=context or "(new conversation)",
                 agents=agent_catalog,
+                name=profile.name,
+                domains=profile.domains,
             ))
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning(f"Router failed ({e}), defaulting to SIMPLE")
@@ -248,20 +281,52 @@ def build_orchestrator(
 
         action = parsed.get("action", "SIMPLE").upper()
         confidence = float(parsed.get("confidence", 0.8) or 0.8)
+        agent_ids = registry.agent_ids
+        n = len(agent_ids)
 
-        if action in ("DIRECT", "REFUSE"):
-            # REFUSE = out-of-scope (code generation, general knowledge, off-topic).
-            # Routed through chitchat, which regenerates a firm, on-brand refusal.
-            logger.info(f"Query routed: {action} (no agents needed, conf={confidence:.2f})")
+        # There is NO cold-reject path. Any legacy/text-parsed REFUSE is downgraded to a
+        # graceful CLARIFY (the capability_redirect terminal), never a flat decline.
+        if action == "REFUSE":
+            action = "CLARIFY"
+
+        # Empty registry — nothing to route to. Go straight to the graceful redirect
+        # (which explains there are no active capabilities) instead of crashing/declining.
+        if n == 0:
+            return {"is_complex": False, "is_chitchat": False, "needs_clarification": True}
+
+        if action == "DIRECT":
+            logger.info(f"Query routed: DIRECT (no agents needed, conf={confidence:.2f})")
             return {
                 "is_complex": False,
                 "is_chitchat": True,
+                "needs_clarification": False,
                 "direct_response": parsed.get("response", ""),
             }
 
+        # Deterministic backstop: with exactly one enabled agent, a substantive query
+        # must never CLARIFY or reject — attempt that agent. Its own "no results" is the
+        # graceful miss. This is the exact fix for the Atlas-only cold-reject.
+        def _attempt_sole_agent() -> dict:
+            logger.info(f"Backstop: single agent — attempting '{agent_ids[0]}'")
+            return {
+                "is_complex": False,
+                "is_chitchat": False,
+                "needs_clarification": False,
+                "plan": ExecutionPlan(
+                    steps=[PlanStep(agent=agent_ids[0], task=state["user_query"], depends_on=[])],
+                    synthesis_goal="Answer the user's question directly from the findings.",
+                ),
+            }
+
+        if action == "CLARIFY":
+            if n == 1:
+                return _attempt_sole_agent()
+            logger.info("Query routed: CLARIFY → capability redirect")
+            return {"is_complex": False, "is_chitchat": False, "needs_clarification": True}
+
         if action == "SIMPLE" and parsed.get("agent") and parsed.get("task"):
             agent_id = parsed["agent"]
-            if agent_id in registry.agent_ids:
+            if agent_id in agent_ids:
                 logger.info(
                     f"Query routed: SIMPLE → {agent_id} (planner bypassed, conf={confidence:.2f})"
                 )
@@ -269,13 +334,23 @@ def build_orchestrator(
                     steps=[PlanStep(agent=agent_id, task=parsed["task"], depends_on=[])],
                     synthesis_goal="Return findings directly.",
                 )
-                return {"is_complex": False, "is_chitchat": False, "plan": plan}
+                return {"is_complex": False, "is_chitchat": False, "needs_clarification": False, "plan": plan}
             else:
-                logger.warning(f"Router picked unknown agent '{agent_id}', falling through to planner")
+                logger.warning(f"Router picked unknown agent '{agent_id}', applying backstop")
+
+        # SIMPLE without a usable agent, or COMPLEX, or a low-confidence route.
+        # One agent -> attempt it (no planner overhead, no clarify). Multiple agents
+        # with a low-confidence unroutable query -> clarify rather than guess wrong.
+        if n == 1:
+            return _attempt_sole_agent()
+
+        if action != "COMPLEX" and confidence < 0.5 and not parsed.get("agent"):
+            logger.info("Low-confidence unroutable query → capability redirect")
+            return {"is_complex": False, "is_chitchat": False, "needs_clarification": True}
 
         is_complex = action == "COMPLEX"
         logger.info(f"Query routed: {action} → planner (conf={confidence:.2f})")
-        return {"is_complex": is_complex, "is_chitchat": False}
+        return {"is_complex": is_complex, "is_chitchat": False, "needs_clarification": False}
 
     async def plan_node(state: OrchestratorState, config: RunnableConfig) -> dict:
         """Invoke planner agent with full conversation context."""
@@ -408,17 +483,21 @@ def build_orchestrator(
         return {"agent_results": results}
 
     def after_dispatch(state: OrchestratorState) -> str:
-        """Reflection gate: if NO agent returned productive content, escalate to the
-        planner once (a mis-routed SIMPLE query gets a second, fuller decision).
+        """Reflection gate + graceful degradation.
 
-        Bounded to a single re-plan (retry_count) so latency is capped. Only fires
-        when more than one agent exists (else there's nowhere better to route).
+        Productive results -> synthesize. No productive results and multiple agents and
+        no prior retry -> re-plan once (a different agent may help). Otherwise (a single-
+        agent miss, or retries exhausted) -> the capability_redirect terminal, so an
+        unproductive turn ends with "here's what I can do" — never a cold dead-end.
+        Bounded by retry_count so latency is capped.
         """
         results = state.get("agent_results", [])
         productive = [r for r in results if not _is_unproductive(r["findings"])]
-        if not productive and state.get("retry_count", 0) < 1 and len(registry.agent_ids) > 1:
+        if productive:
+            return "synthesize"
+        if len(registry.agent_ids) > 1 and state.get("retry_count", 0) < 1:
             return "replan"
-        return "synthesize"
+        return "clarify"
 
     async def replan_node(state: OrchestratorState, config: RunnableConfig) -> dict:
         """Escalate an unproductive turn to the planner for a fuller re-route."""
@@ -440,7 +519,7 @@ def build_orchestrator(
             friendly_empty = (
                 "I wasn't able to retrieve results for that just now. This can happen "
                 "when a query is very broad or a source is slow to respond. Could you try:\n"
-                "- Being more specific (e.g., a CVE ID, report ID, asset name, or date range)\n"
+                "- Being more specific (name the exact feature, page, ID, or term)\n"
                 "- Rephrasing your question\n"
                 "- Asking again in a moment"
             )
@@ -474,7 +553,7 @@ def build_orchestrator(
             response = await asyncio.wait_for(
                 llm.ainvoke(
                     [
-                        SystemMessage(content=SYNTHESIS_PROMPT.format(persona=ORCHESTRATOR_PERSONA)),
+                        SystemMessage(content=SYNTHESIS_PROMPT.format(persona=persona)),
                         HumanMessage(content=prompt),
                     ],
                     config=config,
@@ -526,7 +605,7 @@ def build_orchestrator(
 
         # Include prior-turn context so meta-questions ("what were we discussing?",
         # "tell me more") and follow-ups are answered with real conversation memory.
-        llm_messages = [SystemMessage(content=CHITCHAT_PROMPT.format(persona=ORCHESTRATOR_PERSONA))]
+        llm_messages = [SystemMessage(content=CHITCHAT_PROMPT.format(persona=persona))]
         if summary:
             llm_messages.append(SystemMessage(content=f"Earlier conversation summary: {summary}"))
         llm_messages.extend(history[-MAX_RECENT_MESSAGES:])
@@ -541,8 +620,54 @@ def build_orchestrator(
         except Exception as e:
             logger.warning(f"Chitchat generation failed ({e}), using router draft")
             answer = fallback or (
-                "Hello! I'm your Security Intelligence Assistant. Ask me about "
-                "threats, CVEs, attack surface, or security reports."
+                f"Hi! I'm {profile.name}. I can help you with {profile.domains}. "
+                "What would you like to know?"
+            )
+
+        return {
+            "final_answer": answer,
+            "citations": [],
+            "agent_results": [],
+            "messages": [AIMessage(content=answer)],
+        }
+
+    async def capability_redirect_node(state: OrchestratorState, config: RunnableConfig) -> dict:
+        """Graceful, streaming terminal for every non-answer path.
+
+        Reached on CLARIFY, low-confidence-unroutable, or when agents returned nothing
+        productive. It NEVER cold-rejects — it names what the assistant CAN do (from the
+        live enabled agents) and invites the user to rephrase or pick an example. This is
+        the structural guarantee that a non-empty deployment can't dead-end a benign turn.
+
+        Rendered from domains/capabilities only (never the PERSONA_TEMPLATE block), so its
+        output doesn't trip the prompt-leak backstop.
+        """
+        user_query = state["user_query"]
+        history = state.get("history", [])
+        summary = state.get("summary", "")
+
+        llm_messages = [
+            SystemMessage(content=CAPABILITY_REDIRECT_PROMPT.format(
+                name=profile.name, capabilities=capability_block,
+            ))
+        ]
+        if summary:
+            llm_messages.append(SystemMessage(content=f"Earlier conversation summary: {summary}"))
+        llm_messages.extend(history[-MAX_RECENT_MESSAGES:])
+        llm_messages.append(HumanMessage(content=user_query))
+
+        try:
+            response = await asyncio.wait_for(
+                lane_router.standard.ainvoke(llm_messages, config=config),
+                timeout=SYNTHESIS_TIMEOUT,
+            )
+            answer = response.content
+        except Exception as e:
+            logger.warning(f"Capability redirect generation failed ({e}), using static fallback")
+            answer = (
+                f"I'm {profile.name}. I'm not sure I can help with that exact request, but "
+                f"I can help you with {profile.domains}. Could you rephrase, or tell me which "
+                "of those you're interested in?"
             )
 
         return {
@@ -553,9 +678,13 @@ def build_orchestrator(
         }
 
     async def output_guardrail_node(state: OrchestratorState, config: RunnableConfig) -> dict:
-        """PII redaction on output via Presidio."""
+        """PII redaction on output via Presidio + prompt-leak backstop.
+
+        Passes the derived domains so the leak-backstop refusal names THIS
+        deployment's real capabilities, not a hardcoded security persona.
+        """
         from security_intel.security.guardrails import output_guardrail_node as guard
-        return await guard(state, config)
+        return await guard(state, config, domains=profile.domains)
 
     async def persist_node(state: OrchestratorState, config: RunnableConfig) -> dict:
         """Persist turn to Postgres + roll summary if needed."""
@@ -620,6 +749,7 @@ def build_orchestrator(
     graph.add_node("security_gate", security_gate_node)
     graph.add_node("context_and_classify", context_and_classify_node)
     graph.add_node("chitchat", chitchat_node)
+    graph.add_node("capability_redirect", capability_redirect_node)
     graph.add_node("plan", plan_node)
     graph.add_node("validate_plan", validate_plan_node)
     graph.add_node("dispatch", dispatch_node)
@@ -640,12 +770,21 @@ def build_orchestrator(
     graph.add_conditional_edges(
         "route",
         lambda s: "blocked" if s.get("blocked")
-        else ("chitchat" if s.get("is_chitchat") else ("dispatch" if s.get("plan") else "plan")),
-        {"blocked": END, "chitchat": "chitchat", "plan": "plan", "dispatch": "dispatch"},
+        else ("chitchat" if s.get("is_chitchat")
+        else ("clarify" if s.get("needs_clarification")
+        else ("dispatch" if s.get("plan") else "plan"))),
+        {
+            "blocked": END,
+            "chitchat": "chitchat",
+            "clarify": "capability_redirect",
+            "plan": "plan",
+            "dispatch": "dispatch",
+        },
     )
-    # Route chitchat/DIRECT/REFUSE through the output guard too, so its answers
-    # also get the prompt-leak backstop and PII redaction (not just the agent path).
+    # Route chitchat + capability_redirect through the output guard too, so their
+    # answers also get the prompt-leak backstop and PII redaction (not just the agent path).
     graph.add_edge("chitchat", "output_guardrail")
+    graph.add_edge("capability_redirect", "output_guardrail")
     graph.add_edge("plan", "validate_plan")
     graph.add_edge("validate_plan", "dispatch")
     # Reflection gate: unproductive results escalate to the planner ONCE (re-route a
@@ -653,7 +792,7 @@ def build_orchestrator(
     graph.add_conditional_edges(
         "dispatch",
         after_dispatch,
-        {"replan": "replan", "synthesize": "synthesize"},
+        {"replan": "replan", "synthesize": "synthesize", "clarify": "capability_redirect"},
     )
     graph.add_edge("replan", "plan")
     graph.add_edge("synthesize", "output_guardrail")

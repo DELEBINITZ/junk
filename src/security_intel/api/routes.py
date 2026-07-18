@@ -49,6 +49,37 @@ async def health(request: Request):
     return checks
 
 
+@router.get("/meta")
+async def meta(request: Request):
+    """Derived assistant identity — so clients render the persona that matches the
+    ENABLED agents instead of hardcoding one. Powers dynamic title/blurb/suggestions.
+    """
+    profile = getattr(request.app.state, "profile", None)
+    registry = getattr(request.app.state, "registry", None)
+    if not profile:
+        return {"name": "Assistant", "tagline": "", "domains": "", "agents": []}
+
+    agents = []
+    if registry:
+        for aid in registry.agent_ids:
+            spec = registry.get_spec(aid)
+            if spec:
+                agents.append({
+                    "id": aid,
+                    "name": spec.display_name,
+                    "description": " ".join((spec.description or "").split()),
+                    "capabilities": spec.capabilities,
+                })
+
+    return {
+        "name": profile.name,
+        "tagline": profile.tagline,
+        "domains": profile.domains,
+        "scope": profile.scope,
+        "agents": agents,
+    }
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     body: ChatRequest,
@@ -92,6 +123,7 @@ async def chat(
         "session_id": session_id,
         "is_complex": False,
         "is_chitchat": False,
+        "needs_clarification": False,
         "direct_response": "",
         "plan": None,
         "agent_results": [],
@@ -152,6 +184,7 @@ async def chat_stream(
         "session_id": sid,
         "is_complex": False,
         "is_chitchat": False,
+        "needs_clarification": False,
         "direct_response": "",
         "plan": None,
         "agent_results": [],

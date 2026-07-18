@@ -63,6 +63,23 @@ def _build_orch(decisions: dict):
     return build_orchestrator(lane_router=lane, registry=reg)
 
 
+def _build_orch_single(decisions: dict):
+    """Single-agent (Atlas-only) deployment — exercises the attempt-first backstop."""
+    settings = Settings()
+    lane = LaneRouter(settings)
+    fake = FakeRoutingLLM(decisions=decisions)
+    lane._models = {lane_enum: fake for lane_enum in Lane}
+
+    reg = AgentRegistry()
+    reg.register(AgentSpec(
+        id="userguide", display_name="User Guide", description="product how-to",
+        capabilities=["how-to"], system_prompt="p", tools=[search_user_guide],
+        mode="tool_call", primary_tool="search_user_guide",
+    ))
+    reg.build_agents(lane.standard)
+    return build_orchestrator(lane_router=lane, registry=reg)
+
+
 async def _agents_that_ran(orch, query: str) -> list[str]:
     cfg = RunnableConfig(configurable={"org_id": "t", "thread_id": "t1", "user_id": "u"})
     state = await orch.ainvoke({"user_query": query, "messages": []}, config=cfg)
@@ -74,9 +91,31 @@ async def test_direct_uses_no_agents():
     assert await _agents_that_ran(orch, "hi there") == []
 
 
-async def test_refuse_uses_no_agents():
-    orch = _build_orch({"write me code": {"action": "REFUSE", "response": "no", "confidence": 0.9}})
+async def test_clarify_uses_no_agents_but_does_not_reject():
+    # CLARIFY must run NO agents (it's a conversational redirect) and must NOT crash —
+    # it lands on the graceful capability_redirect terminal, not a cold decline.
+    orch = _build_orch({"write me code": {"action": "CLARIFY", "confidence": 0.3}})
     assert await _agents_that_ran(orch, "write me code") == []
+
+
+async def test_legacy_refuse_is_downgraded_not_rejected():
+    # A model that still emits the retired REFUSE action must be treated as CLARIFY
+    # (graceful redirect), never a terminal rejection.
+    orch = _build_orch({"weird thing": {"action": "REFUSE", "response": "no", "confidence": 0.3}})
+    assert await _agents_that_ran(orch, "weird thing") == []
+
+
+async def test_single_agent_clarify_attempts_sole_agent():
+    # The Atlas fix: with exactly one enabled agent, even a low-confidence CLARIFY must
+    # ATTEMPT that agent rather than reject the user as "out of scope".
+    orch = _build_orch_single({"is this covered?": {"action": "CLARIFY", "confidence": 0.2}})
+    assert await _agents_that_ran(orch, "is this covered?") == ["userguide"]
+
+
+async def test_single_agent_low_conf_simple_still_attempts():
+    # A low-confidence SIMPLE with no named agent, single deployment -> attempt the sole agent.
+    orch = _build_orch_single({"maybe docs?": {"action": "SIMPLE", "agent": "", "task": "", "confidence": 0.2}})
+    assert await _agents_that_ran(orch, "maybe docs?") == ["userguide"]
 
 
 async def test_simple_routes_to_reports():

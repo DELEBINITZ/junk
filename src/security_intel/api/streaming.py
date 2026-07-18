@@ -32,7 +32,7 @@ async def stream_agent_events(
     yield _sse("session", {"session_id": session_id})
 
     # Only stream LLM tokens from these nodes to the user
-    _STREAMABLE_NODES = {"synthesize", "chitchat"}
+    _STREAMABLE_NODES = {"synthesize", "chitchat", "capability_redirect"}
 
     try:
         final_answer = ""
@@ -94,6 +94,7 @@ async def stream_agent_events(
                     "plan",
                     "dispatch",
                     "synthesize",
+                    "capability_redirect",
                     "security_gate",
                     "output_guardrail",
                 ):
@@ -119,8 +120,8 @@ async def stream_agent_events(
                         {
                             "answer": (
                                 "I can't help with that request — it was flagged by our "
-                                "security policy. Try rephrasing it as a security "
-                                "intelligence question (threats, CVEs, assets, or reports)."
+                                "security policy. Please try rephrasing it as a normal "
+                                "question about what I can help you with."
                             ),
                             "session_id": session_id,
                             "citations": [],
@@ -179,6 +180,7 @@ def _friendly_stage(node_name: str) -> str:
         "validate_plan": "Validating plan...",
         "dispatch": "Running specialist agents...",
         "synthesize": "Synthesizing answer...",
+        "capability_redirect": "Thinking...",
         "output_guardrail": "Finalizing...",
     }
     return stages.get(node_name, node_name)

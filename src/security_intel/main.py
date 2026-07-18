@@ -38,6 +38,7 @@ from security_intel.observability.tracing import get_langfuse_handler
 from security_intel.prompts.easm import EASM_SYSTEM_PROMPT
 from security_intel.prompts.reports import REPORTS_SYSTEM_PROMPT
 from security_intel.prompts.userguide import USER_GUIDE_SYSTEM_PROMPT
+from security_intel.tools.mcp_loader import load_mcp_tools_for_agent, mcp_agent_ids
 from security_intel.tools.query_enrichment import QueryEnricher
 
 
@@ -72,50 +73,74 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
     """
     logger = get_logger("registry")
 
-    # Query enricher for RAG optimization (uses fast LLM for expansion)
-    enricher = None
-    if settings.query_enrichment_enabled and lane_router:
-        enricher = QueryEnricher(lane_router.fast)
+    # Capability gating — the supported way to run "only some agents" WITHOUT editing
+    # code. ENABLED_AGENTS is an allowlist of agent ids; blank means "every agent that
+    # is otherwise available". The orchestrator then DERIVES its whole persona from
+    # whatever ends up registered (see agents/identity.py), so a userguide-only
+    # deployment presents as a product guide, not a security tool.
+    allowlist = set(settings.enabled_agents_list)
+    if allowlist:
+        logger.info(f"ENABLED_AGENTS allowlist active: {sorted(allowlist)}")
+
+    def _enabled(agent_id: str) -> bool:
+        return not allowlist or agent_id in allowlist
+
+    def _enricher(domain: str):
+        """Per-agent query enricher, labeled with the agent's corpus domain so RAG
+        expansions stay on-topic (a docs query is not expanded like a threat query)."""
+        if settings.query_enrichment_enabled and lane_router:
+            return QueryEnricher(lane_router.fast, domain=domain)
+        return None
 
     # Reports Agent
-    reports_tools = get_reports_tools(settings, enricher=enricher)
-    registry.register(
-        AgentSpec(
-            id="reports",
-            display_name="Security Reports Agent",
-            description="Searches security reports corpus (threat intel, ai generated reports and more). ",
-            capabilities=[
-                "Semantic search over security reports",
-                "Filter by threat type, TLP level, report type",
-                "Get report metadata and details",
-            ],
-            system_prompt=REPORTS_SYSTEM_PROMPT,
-            tools=reports_tools,
-            # tool_call: single-pass semantic search, no ReAct loop (cheaper/faster).
-            # TRADEOFF: this narrows the reports agent to search_reports at runtime —
-            # the by-ID (get_report_content) and filter (search_reports_by_filter)
-            # paths are NOT exercised in tool_call mode. If "summarize report <id>" or
-            # "show all TLP:RED reports" style queries matter, set mode="react" here.
-            mode="tool_call",
-            primary_tool="search_reports",
+    if _enabled("reports"):
+        reports_tools = get_reports_tools(settings, enricher=_enricher("security reports corpus"))
+        registry.register(
+            AgentSpec(
+                id="reports",
+                display_name="Security Reports Agent",
+                description="Searches security reports corpus (threat intel, ai generated reports and more). ",
+                capabilities=[
+                    "Semantic search over security reports",
+                    "Filter by threat type, TLP level, report type",
+                    "Get report metadata and details",
+                ],
+                system_prompt=REPORTS_SYSTEM_PROMPT,
+                tools=reports_tools,
+                # tool_call: single-pass semantic search, no ReAct loop (cheaper/faster).
+                # TRADEOFF: this narrows the reports agent to search_reports at runtime —
+                # the by-ID (get_report_content) and filter (search_reports_by_filter)
+                # paths are NOT exercised in tool_call mode. If "summarize report <id>" or
+                # "show all TLP:RED reports" style queries matter, set mode="react" here.
+                mode="tool_call",
+                primary_tool="search_reports",
+            )
         )
-    )
+    else:
+        logger.info("Reports agent disabled by ENABLED_AGENTS allowlist.")
 
     # User Guide Agent — answers product how-to / dashboard-walkthrough / navigation
     # questions from the FortiRecon documentation corpus (Qdrant: user_guide_collection).
     # Registered only when that collection has been ingested (services/userguide-ingest),
     # so we never route users to an empty docs corpus.
-    if await _user_guide_corpus_ready(settings):
-        user_guide_tools = get_user_guide_tools(settings, enricher=enricher)
+    if not _enabled("userguide"):
+        logger.info("User Guide agent disabled by ENABLED_AGENTS allowlist.")
+    elif await _user_guide_corpus_ready(settings):
+        user_guide_tools = get_user_guide_tools(
+            settings, enricher=_enricher("product user guide / documentation")
+        )
         registry.register(
             AgentSpec(
+                # id stays "userguide" (internal capability key, tied to the docs corpus).
+                # display_name is a CAPABILITY of Atlas, phrased as such — Atlas is the
+                # agent; helping with the product/user guide is one thing it can do.
                 id="userguide",
-                display_name="FortiRecon User Guide Agent",
+                display_name="FortiRecon Product Guide",
                 description=(
-                    "Answers product how-to, navigation, and dashboard-walkthrough questions "
-                    "from the FortiRecon user guide. Use for 'how do I…', 'where do I find…', "
-                    "'walk me through…', feature explanations, and configuration steps about "
-                    "using the FortiRecon platform itself (NOT threat-report content)."
+                    "Helps you use the FortiRecon platform: step-by-step how-to, navigation, "
+                    "dashboards, features, and configuration — answered from the product "
+                    "documentation. Use for 'how do I…', 'where do I find…', 'walk me "
+                    "through…', feature explanations, and configuration steps (NOT threat-report content)."
                 ),
                 capabilities=[
                     "Explain FortiRecon dashboards, menus, and features",
@@ -124,10 +149,11 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
                 ],
                 system_prompt=USER_GUIDE_SYSTEM_PROMPT,
                 tools=user_guide_tools,
-                # tool_call: single-pass doc search, no ReAct loop. Clean fit — the
-                # agent's job is "run one user-guide search and return".
-                mode="tool_call",
-                primary_tool="search_user_guide",
+                # react: the agent REASONS over retrieval — it can run search_user_guide,
+                # then follow up with get_user_guide_page(<doc_id>) to pull a full page for
+                # a complete walkthrough (its system prompt directs exactly this). tool_call
+                # mode would fire a single search and stop, truncating multi-step how-tos.
+                mode="react",
             )
         )
     else:
@@ -139,40 +165,75 @@ async def _register_agents(registry: AgentRegistry, settings: Settings, lane_rou
 
     # EASM Agent — only registered when a real MCP server provides tools.
     # No stubs: without tools the agent is omitted rather than serving fake data.
-    easm_tools = await get_easm_tools(settings)
-    if not easm_tools:
-        logger.warning("EASM agent not registered — no MCP tools available.")
+    if not _enabled("easm"):
+        logger.info("EASM agent disabled by ENABLED_AGENTS allowlist.")
     else:
+        easm_tools = await get_easm_tools(settings)
+        if not easm_tools:
+            logger.warning("EASM agent not registered — no MCP tools available.")
+        else:
+            registry.register(
+                AgentSpec(
+                    id="easm",
+                    display_name="EASM Agent",
+                    description="Queries external attack surface (assets, exposures, changes, rescans). "
+                    "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
+                    capabilities=[
+                        "Query external-facing assets (domains, IPs, services)",
+                        "Get current exposures and security findings",
+                        "Track attack surface changes over time",
+                        "Trigger asset rescans (requires approval)",
+                    ],
+                    system_prompt=EASM_SYSTEM_PROMPT,
+                    tools=easm_tools,
+                    side_effecting_tools={"trigger_rescan"},
+                )
+            )
+
+    # --- Config-driven MCP agents (add a new agent with NO code changes) ---
+    # Any server declared in MCP_SERVERS (or the EASM shortcut) that isn't already
+    # registered above is auto-registered here as a react agent: its tools are
+    # discovered from the server, its identity/capabilities come from the config (or are
+    # derived from the tool names), and it gets a generated system prompt. The router,
+    # planner, and derived persona pick it up automatically — no orchestrator edits.
+    #
+    #   MCP_SERVERS='{"brand": {"url": "https://brand-mcp/…", "transport": "streamable_http",
+    #                           "api_key": "…", "display_name": "Brand Protection Agent",
+    #                           "description": "Monitors brand abuse, phishing, typosquatting.",
+    #                           "capabilities": ["Detect impersonation", "Track phishing domains"]}}'
+    for agent_id in mcp_agent_ids(settings):
+        if agent_id in registry.specs:
+            continue  # already registered explicitly above (e.g. easm)
+        if not _enabled(agent_id):
+            logger.info(f"MCP agent '{agent_id}' disabled by ENABLED_AGENTS allowlist.")
+            continue
+        server_cfg = settings.mcp_servers_config.get(agent_id, {})
+        tools = await load_mcp_tools_for_agent(agent_id, settings)
+        if not tools:
+            logger.warning(
+                f"MCP agent '{agent_id}' not registered — its server returned no tools "
+                "(unreachable or misconfigured)."
+            )
+            continue
+        display_name = server_cfg.get("display_name") or f"{agent_id.replace('_', ' ').title()} Agent"
+        description = server_cfg.get("description") or (
+            f"Tools from the {agent_id} service: " + ", ".join(t.name for t in tools) + "."
+        )
+        capabilities = server_cfg.get("capabilities") or [t.name for t in tools]
         registry.register(
             AgentSpec(
-                id="easm",
-                display_name="EASM Agent",
-                description="Queries external attack surface (assets, exposures, changes, rescans). "
-                "Use for exposed infrastructure, asset inventory, misconfigurations, surface changes.",
-                capabilities=[
-                    "Query external-facing assets (domains, IPs, services)",
-                    "Get current exposures and security findings",
-                    "Track attack surface changes over time",
-                    "Trigger asset rescans (requires approval)",
-                ],
-                system_prompt=EASM_SYSTEM_PROMPT,
-                tools=easm_tools,
-                side_effecting_tools={"trigger_rescan"},
+                id=agent_id,
+                display_name=display_name,
+                description=description,
+                capabilities=capabilities,
+                tools=tools,
+                # react + no primary_tool: MCP tool names are only known at runtime, so
+                # hand all server tools to the ReAct loop rather than pinning one.
+                mode="react",
+                side_effecting_tools=set(server_cfg.get("side_effecting_tools", [])),
             )
         )
-
-    # --- ADD NEW AGENTS HERE ---
-    # Example: Brand Protection Agent
-    # brand_tools = await load_mcp_tools_for_agent("brand", settings)
-    # if brand_tools:
-    #     registry.register(AgentSpec(
-    #         id="brand",
-    #         display_name="Brand Protection Agent",
-    #         description="Monitors brand abuse, phishing sites, typosquatting...",
-    #         capabilities=["Detect brand impersonation", "Track phishing domains", ...],
-    #         system_prompt="...",
-    #         tools=brand_tools,
-    #     ))
+        logger.info(f"Auto-registered MCP agent '{agent_id}' ({len(tools)} tools)")
 
 
 @asynccontextmanager
@@ -184,7 +245,7 @@ async def lifespan(app: FastAPI):
     # Structured logging
     setup_logging(settings)
     logger = get_logger("startup")
-    logger.info("Starting Security Intelligence Platform v2.0.0")
+    logger.info("Starting agentic assistant platform v2.0.0 (identity derived from enabled agents)")
 
     # Database
     db = None
@@ -232,10 +293,19 @@ async def lifespan(app: FastAPI):
     registry.build_agents(lane_router.standard)
     app.state.registry = registry
 
-    # Query enricher for orchestrator-level task enrichment
+    # Derive the assistant identity from whatever agents actually built. This is what
+    # makes the persona/scope/boundaries follow the enabled agent set instead of a
+    # hardcoded security persona.
+    from security_intel.agents.identity import build_system_profile
+    profile = build_system_profile(registry, settings)
+    app.state.profile = profile
+    logger.info(f"System identity: '{profile.name}' — scope: {profile.domains}")
+
+    # Query enricher for orchestrator-level task enrichment (neutral domain — it spans
+    # whatever agents are active).
     orchestrator_enricher = None
     if settings.query_enrichment_enabled:
-        orchestrator_enricher = QueryEnricher(lane_router.fast)
+        orchestrator_enricher = QueryEnricher(lane_router.fast, domain="knowledge base")
 
     # Build orchestrator (main LangGraph StateGraph)
     orchestrator = build_orchestrator(
@@ -245,6 +315,7 @@ async def lifespan(app: FastAPI):
         summarizer=summarizer,
         checkpointer=checkpointer,
         query_enricher=orchestrator_enricher,
+        profile=profile,
     )
     app.state.orchestrator = orchestrator
     logger.info(f"Orchestrator ready. Agents: {registry.agent_ids}")
@@ -273,10 +344,15 @@ def create_app() -> FastAPI:
     """Application factory."""
     settings = Settings()
 
+    # Title honors the operator's assistant name when set; otherwise a neutral default.
+    # (The chat PERSONA is derived per-request from the enabled agents; this is only the
+    # HTTP/OpenAPI label, which exists before the registry/profile do.)
+    app_title = settings.assistant_name or "Agentic Assistant Platform"
+
     app = FastAPI(
-        title="Security Intelligence Platform",
+        title=app_title,
         version="2.0.0",
-        description="Multi-agent security intelligence powered by LangGraph",
+        description="Multi-agent assistant powered by LangGraph; capabilities depend on the enabled agents.",
         lifespan=lifespan,
     )
 

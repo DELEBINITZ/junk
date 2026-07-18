@@ -36,6 +36,10 @@ class OrchestratorState(TypedDict):
     session_id: str
     is_complex: bool
     is_chitchat: bool
+    # True -> route to the graceful capability_redirect terminal (CLARIFY / low
+    # confidence / no productive results). Never a cold refusal; always shows the
+    # user what the assistant CAN do and invites them to continue.
+    needs_clarification: bool
     direct_response: str
     plan: ExecutionPlan | None
     agent_results: list[AgentResult]
